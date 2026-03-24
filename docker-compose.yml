@@ -1,0 +1,67 @@
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_MODULE=${APP_MODULE:-api.main:app}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - SEARXNG_URL=http://searxng:8080
+      - SEARXNG_BASE_URL=http://searxng:8080
+      - BRAVE_SEARCH_KEY=${BRAVE_SEARCH_KEY}
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - EXA_API_KEY=${EXA_API_KEY}
+      - EXA_SEARCH_TYPE=${EXA_SEARCH_TYPE:-auto}
+      - EXA_TEXT_MAX_CHARACTERS=${EXA_TEXT_MAX_CHARACTERS:-20000}
+      - DOCKER_SANDBOX_MODE=${DOCKER_SANDBOX_MODE:-dedicated}
+      - DOCKER_SANDBOX_IMAGE=${DOCKER_SANDBOX_IMAGE:-agent-sandbox:latest}
+      - DOCKER_SANDBOX_CONTAINER_NAME=${DOCKER_SANDBOX_CONTAINER_NAME:-agent-sandbox-exec}
+      - DOCKER_SANDBOX_WORKDIR=${DOCKER_SANDBOX_WORKDIR:-/workspace}
+      - DOCKER_SANDBOX_NETWORK=${DOCKER_SANDBOX_NETWORK:-none}
+    volumes:
+      - ./agents.db:/app/agents.db
+      - ./chroma_db:/app/chroma_db
+      - ./agent_sandbox:/app/agent_sandbox
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - agent-network
+    depends_on:
+      - searxng
+      - agent-sandbox
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000
+    networks:
+      - agent-network
+
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./searxng:/etc/searxng
+    networks:
+      - agent-network
+
+  agent-sandbox:
+    build:
+      context: .
+      dockerfile: docker/agent-sandbox.Dockerfile
+    image: agent-sandbox:latest
+    container_name: ${DOCKER_SANDBOX_CONTAINER_NAME:-agent-sandbox-exec}
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./agent_sandbox:/workspace
+    mem_limit: ${DOCKER_SANDBOX_MEMORY:-512m}
+    pids_limit: ${DOCKER_SANDBOX_PIDS_LIMIT:-128}
+    network_mode: ${DOCKER_SANDBOX_NETWORK:-none}
+    restart: unless-stopped
+
+networks:
+  agent-network:
+    driver: bridge

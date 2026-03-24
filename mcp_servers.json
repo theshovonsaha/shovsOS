@@ -1,0 +1,69 @@
+{
+  "_comment": "MCP Server Configuration for Shovs Agent Platform",
+  "_docs": "https://github.com/modelcontextprotocol",
+  "servers": [
+    {
+      "id": "filesystem",
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "./agent_sandbox"],
+      "env": {},
+      "_note": "Gives agent structured filesystem access within sandbox"
+    },
+    {
+      "id": "github",
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "YOUR_TOKEN_HERE"
+      },
+      "_note": "GitHub issues, PRs, repos, code search"
+    },
+    {
+      "id": "postgres",
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "env": {
+        "POSTGRES_CONNECTION_STRING": "postgresql://localhost/mydb"
+      },
+      "_note": "SQL queries against your Postgres database"
+    },
+    {
+      "id": "slack",
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-slack"],
+      "env": {
+        "SLACK_BOT_TOKEN": "xoxb-YOUR-TOKEN",
+        "SLACK_TEAM_ID": "YOUR_TEAM_ID"
+      },
+      "_note": "Read/write Slack channels and messages"
+    },
+    {
+      "id": "brave-search",
+      "enabled": false,
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-brave-search"],
+      "env": {
+        "BRAVE_API_KEY": "YOUR_KEY_HERE"
+      },
+      "_note": "Brave web search via MCP protocol"
+    },
+    {
+      "id": "exa",
+      "enabled": true,
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.exa.ai/mcp?exaApiKey=${EXA_API_KEY}&tools=web_search_exa,get_code_context_exa,company_research_exa"
+      ],
+      "env": {
+        "EXA_API_KEY": "${EXA_API_KEY}"
+      },
+      "_note": "Exa MCP remote tools (web_search_exa, get_code_context_exa, company_research_exa)"
+    }
+  ]
+}

@@ -1,0 +1,339 @@
+.options-panel {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+    font-size: 13px;
+    min-height: 0;
+}
+
+.options-tabs {
+    display: flex;
+    border-bottom: 1px solid var(--border);
+    padding: 0 8px;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.options-tab {
+    flex: 1;
+    background: none;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 10px 8px;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    transition: all 0.15s;
+}
+
+.options-tab:hover {
+    color: var(--text);
+}
+
+.options-tab.active {
+    color: var(--primary);
+    border-bottom-color: var(--primary);
+}
+
+.tab-badge {
+    background: var(--primary);
+    color: var(--bg);
+    font-size: 9px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 10px;
+    line-height: 1.4;
+}
+
+.options-section {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 10px;
+    gap: 8px;
+    min-height: 0;
+}
+
+/* Memory Search */
+.memory-search-row {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+}
+
+.memory-search-input {
+    flex: 1;
+    background: #0a0a0a;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    color: var(--text);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s;
+}
+
+.memory-search-input:focus {
+    border-color: var(--primary);
+}
+
+.memory-search-btn,
+.memory-clear-search {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 14px;
+    transition: border-color 0.15s;
+}
+
+.memory-search-btn:hover,
+.memory-clear-search:hover {
+    border-color: var(--primary);
+}
+
+.memory-search-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    padding: 0 2px;
+}
+
+/* Memory List */
+.memory-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.memory-empty {
+    color: var(--text-dim);
+    text-align: center;
+    padding: 24px 16px;
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.memory-card {
+    background: #0a0a0a;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    transition: border-color 0.15s;
+}
+
+.memory-card:hover {
+    border-color: var(--primary);
+}
+
+.memory-triplet {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.memory-subject {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--primary);
+}
+
+.memory-predicate {
+    font-size: 10px;
+    color: var(--text-dim);
+    padding-left: 6px;
+}
+
+.memory-object {
+    font-size: 12px;
+    padding-left: 6px;
+}
+
+.memory-footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.memory-date {
+    font-size: 10px;
+    color: var(--text-dim);
+}
+
+.memory-delete-btn {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: all 0.15s;
+}
+
+.memory-delete-btn:hover {
+    background: rgba(255, 68, 68, 0.1);
+    color: #ff4444;
+}
+
+/* Actions */
+.memory-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.memory-refresh-btn {
+    flex: 1;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-dim);
+    padding: 7px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: center;
+    transition: all 0.15s;
+}
+
+.memory-refresh-btn:hover {
+    border-color: var(--primary);
+    color: var(--text);
+}
+
+.memory-clear-btn {
+    flex: 1;
+    background: rgba(255, 68, 68, 0.06);
+    border: 1px solid rgba(255, 68, 68, 0.2);
+    border-radius: 6px;
+    color: #ff6666;
+    padding: 7px;
+    cursor: pointer;
+    font-size: 12px;
+    text-align: center;
+    transition: all 0.15s;
+}
+
+.memory-clear-btn:hover,
+.memory-clear-btn.confirm {
+    background: rgba(255, 68, 68, 0.15);
+    border-color: #ff4444;
+}
+
+.storage-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.storage-card {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    background: #0a0a0a;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px;
+    cursor: pointer;
+}
+
+.storage-card.active {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 1px rgba(0, 209, 255, 0.15);
+}
+
+.storage-card input {
+    margin-top: 2px;
+}
+
+.storage-card-title {
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: capitalize;
+}
+
+.storage-card-meta {
+    color: var(--text-dim);
+    font-size: 10px;
+    line-height: 1.4;
+}
+
+.storage-toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text);
+    font-size: 12px;
+    margin-top: 10px;
+}
+
+.storage-status-note,
+.storage-path-note {
+    color: var(--text-dim);
+    font-size: 11px;
+    line-height: 1.5;
+    margin-top: 10px;
+    word-break: break-word;
+}
+
+.storage-backup-list {
+    margin-top: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+@media (max-width: 640px) {
+    .storage-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Context Viewer */
+.context-meta {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.context-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.context-line {
+    font-size: 12px;
+    padding: 6px 10px;
+    background: #0a0a0a;
+    border-radius: 6px;
+    border-left: 2px solid var(--border);
+    color: var(--text-dim);
+    line-height: 1.5;
+    word-break: break-word;
+}
+
+.context-line:hover {
+    border-left-color: var(--primary);
+    color: var(--text);
+}

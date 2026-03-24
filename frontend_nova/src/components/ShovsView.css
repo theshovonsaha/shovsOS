@@ -1,0 +1,383 @@
+.shovs-container {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 9999;
+    color: white;
+    font-family: 'Inter', sans-serif;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    background: #000;
+}
+
+/* Scenic Backgrounds */
+.scenic-background {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    overflow: hidden;
+}
+
+.bg-glow {
+    position: absolute;
+    width: 150%;
+    height: 150%;
+    top: -25%;
+    left: -25%;
+    filter: blur(80px);
+    opacity: 0.6;
+    transition: background 1s ease;
+}
+
+/* nebula flavor */
+.flavor-nebula .bg-glow {
+    background: radial-gradient(circle at center, #2e1065 0%, #1e1b4b 40%, #000 70%);
+}
+
+.flavor-nebula .bg-particles {
+    background-image: radial-gradient(circle at 2px 2px, rgba(139, 92, 246, 0.3) 1px, transparent 0);
+    background-size: 40px 40px;
+    position: absolute;
+    inset: 0;
+    animation: pan 60s linear infinite;
+}
+
+/* ocean flavor */
+.flavor-ocean .bg-glow {
+    background: radial-gradient(circle at center, #164e63 0%, #083344 40%, #000 70%);
+}
+
+.flavor-ocean .bg-particles {
+    background-image: radial-gradient(circle at 2px 2px, rgba(6, 182, 212, 0.3) 1px, transparent 0);
+    background-size: 30px 30px;
+}
+
+/* midnight flavor */
+.flavor-midnight .bg-glow {
+    background: radial-gradient(circle at center, #111 0%, #000 100%);
+}
+
+@keyframes pan {
+    from {
+        background-position: 0 0;
+    }
+
+    to {
+        background-position: 1000px 1000px;
+    }
+}
+
+/* Navigation */
+.shovs-nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 30px 40px;
+    z-index: 10;
+}
+
+.shovs-exit {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    padding: 8px 16px;
+    border-radius: 8px;
+    color: white;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    font-size: 13px;
+    transition: all 0.2s;
+}
+
+.shovs-exit:hover {
+    background: rgba(255, 0, 0, 0.2);
+    border-color: rgba(255, 0, 0, 0.4);
+}
+
+.shovs-flavor-picker {
+    display: flex;
+    gap: 10px;
+}
+
+.shovs-flavor-picker button {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: rgba(255, 255, 255, 0.6);
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.shovs-flavor-picker button.active {
+    background: white;
+    color: black;
+    border-color: white;
+}
+
+/* Voice Core Orb */
+.voice-core-wrap {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    position: relative;
+    margin-bottom: 100px;
+}
+
+.core-orb {
+    position: relative;
+    width: 200px;
+    height: 200px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.orb-inner {
+    width: 80px;
+    height: 80px;
+    background: white;
+    border-radius: 50%;
+    box-shadow: 0 0 40px white;
+    z-index: 2;
+    transition: all 0.3s;
+}
+
+.orb-ring {
+    position: absolute;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+}
+
+.r1 {
+    width: 140px;
+    height: 140px;
+    animation: rotate 10s linear infinite;
+}
+
+.r2 {
+    width: 180px;
+    height: 180px;
+    animation: rotate 15s linear reverse infinite;
+    border-style: dashed;
+}
+
+.orb-pulse {
+    position: absolute;
+    width: 100%;
+    height: 100%;
+    border: 2px solid white;
+    border-radius: 50%;
+    opacity: 0;
+}
+
+/* Animations based on state */
+.listening .orb-inner {
+    background: #3b82f6;
+    box-shadow: 0 0 60px #3b82f6;
+    width: 100px;
+    height: 100px;
+}
+
+.listening .orb-pulse {
+    animation: ripple 2s ease-out infinite;
+    border-color: #3b82f6;
+}
+
+.thinking .orb-inner {
+    animation: breathe 1.5s ease-in-out infinite;
+    background: #8b5cf6;
+    box-shadow: 0 0 60px #8b5cf6;
+}
+
+.speaking .orb-inner {
+    transform: scale(1.1);
+    background: #10b981;
+    box-shadow: 0 0 60px #10b981;
+    animation: jitter 0.1s infinite;
+}
+
+@keyframes rotate {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes ripple {
+    0% {
+        transform: scale(0.5);
+        opacity: 1;
+    }
+
+    100% {
+        transform: scale(2.5);
+        opacity: 0;
+    }
+}
+
+@keyframes breathe {
+
+    0%,
+    100% {
+        transform: scale(1);
+    }
+
+    50% {
+        transform: scale(1.2);
+    }
+}
+
+@keyframes jitter {
+    0% {
+        transform: translate(0, 0) scale(1.1);
+    }
+
+    50% {
+        transform: translate(1px, -1px) scale(1.12);
+    }
+
+    100% {
+        transform: translate(-1px, 1px) scale(1.1);
+    }
+}
+
+.core-label {
+    margin-top: 40px;
+    font-size: 14px;
+    font-weight: 300;
+    letter-spacing: 4px;
+    text-transform: uppercase;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+/* HUD Displays */
+.shovs-hud {
+    position: absolute;
+    bottom: 120px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 80%;
+    max-width: 800px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    pointer-events: none;
+}
+
+.user-stt-overlay {
+    font-size: 24px;
+    font-weight: 200;
+    color: rgba(255, 255, 255, 0.4);
+    text-align: center;
+    opacity: 0;
+    transform: translateY(10px);
+    transition: all 0.4s;
+}
+
+.user-stt-overlay.visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.stt-prefix {
+    color: #3b82f6;
+    margin-right: 10px;
+}
+
+.agent-response-hud {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    backdrop-filter: blur(20px);
+    padding: 30px;
+    border-radius: 20px;
+    max-height: 300px;
+    overflow-y: auto;
+    opacity: 0;
+    transform: translateY(20px);
+    transition: all 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+}
+
+.agent-response-hud.visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+/* Custom scrollbar for HUD */
+.agent-response-hud::-webkit-scrollbar {
+    width: 4px;
+}
+
+.agent-response-hud::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.agent-response-hud::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 10px;
+}
+
+/* Footer Controls */
+.shovs-footer {
+    padding: 40px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 15px;
+    z-index: 10;
+}
+
+.shovs-mic-btn {
+    width: 80px;
+    height: 80px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    cursor: pointer;
+    position: relative;
+    transition: all 0.3s;
+}
+
+.shovs-mic-btn:hover {
+    background: rgba(255, 255, 255, 0.15);
+    border-color: rgba(255, 255, 255, 0.4);
+}
+
+.shovs-mic-btn.active {
+    background: #3b82f6;
+    border-color: #60a5fa;
+    box-shadow: 0 0 30px rgba(59, 130, 246, 0.5);
+}
+
+.shovs-mic-btn.processing {
+    background: #10b981;
+    border-color: #34d399;
+    box-shadow: 0 0 30px rgba(16, 185, 129, 0.5);
+}
+
+.mic-icon {
+    font-size: 32px;
+    z-index: 2;
+}
+
+.shovs-hint {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+}

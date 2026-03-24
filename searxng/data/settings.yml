@@ -1,0 +1,30 @@
+# SearXNG settings
+
+use_default_settings: true
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "ff9ec33bffec80b36f4dd3931cae469831b5e2165a7518455d57dee8154844cd"
+  base_url: http://localhost:8080/
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: w
+  - name: brave
+    engine: brave
+    shortcut: br
