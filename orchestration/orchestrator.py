@@ -41,7 +41,7 @@ Return ONLY JSON (no markdown). Preferred format:
 {{
   "strategy": "one-line plan",
   "tools": [
-    {{"name": "tool_name", "priority": "high|medium|low", "reason": "short reason"}}
+    {{"name": "tool_name", "priority": "high|medium|low", "reason": "short reason", "target_argument_clue": "specific clue for the executor to use (e.g. exact URL or search terms)"}}
   ],
   "force_memory": true/false,
   "memory_topic": "topic or empty",
@@ -347,10 +347,12 @@ class AgenticOrchestrator:
                         name = entry
                         priority = "medium"
                         reason = "Planner-selected tool"
+                        clue = ""
                     elif isinstance(entry, dict):
                         name = entry.get("name")
                         priority = str(entry.get("priority", "medium")).lower()
                         reason = str(entry.get("reason", "Planner-selected tool"))
+                        clue = str(entry.get("target_argument_clue", "")).strip()
                     else:
                         continue
                     if not isinstance(name, str) or name not in known_tools or name in failed_set:
@@ -358,7 +360,7 @@ class AgenticOrchestrator:
                     if priority not in {"high", "medium", "low"}:
                         log("orch", "plan", f"Invalid planner priority '{priority}' for tool '{name}'. Using medium.", level="warn")
                         priority = "medium"
-                    normalized.append({"name": name, "priority": priority, "reason": reason})
+                    normalized.append({"name": name, "priority": priority, "reason": reason, "target_argument_clue": clue})
                 priority_rank = {"high": 0, "medium": 1, "low": 2}
                 normalized.sort(key=lambda item: (priority_rank[item["priority"]], item["name"]))
                 return normalized

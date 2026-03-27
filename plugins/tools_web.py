@@ -43,7 +43,7 @@ import hashlib
 import ipaddress
 from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-from typing import Optional
+from typing import Optional, Any
 
 import httpx
 from groq import AsyncGroq
@@ -275,14 +275,14 @@ def _curate_results(raw_results: list[dict], num_results: int) -> tuple[list[dic
         if source and not source.endswith("-error"):
             signal_score += SOURCE_SIGNAL_WEIGHT
 
-        curated = {"title": title, "url": url, "snippet": snippet}
+        curated: dict[str, Any] = {"title": title, "url": url, "snippet": snippet}
         if source:
             curated["source"] = source
         if item.get("published"):
             curated["published"] = item.get("published")
         if "score" in item:
             curated["score"] = item.get("score")
-        curated["_signal_score"] = signal_score
+        curated["_signal_score"] = float(signal_score)
         cleaned.append(curated)
 
     cleaned.sort(key=lambda r: r.get("_signal_score", 0), reverse=True)

@@ -1847,12 +1847,16 @@ class AgentCore:
                     if isinstance(maybe_structured, dict):
                         structured_plan = maybe_structured
 
+                clues: list[str] = []
                 if structured_plan is not None:
-                    planned_tools = [
-                        t.get("name")
-                        for t in structured_plan.get("tools", [])
-                        if isinstance(t, dict) and isinstance(t.get("name"), str)
-                    ]
+                    planned_tools = []
+                    for t in structured_plan.get("tools", []):
+                        if isinstance(t, dict) and isinstance(t.get("name"), str):
+                            t_name = t.get("name")
+                            planned_tools.append(t_name)
+                            t_clue = str(t.get("target_argument_clue", "")).strip()
+                            if t_clue:
+                                clues.append(f"[{t_name} target: {t_clue}]")
                 else:
                     planned_tools = []
                     plan_fn = getattr(self.orch, "plan", None)
@@ -1875,6 +1879,8 @@ class AgentCore:
                         has_tasks=task_tracker.has_tasks(sid),
                     )
                     strategy = structured_plan.get("strategy") or f"Using {', '.join(planned_tools)} to resolve query."
+                    if clues:
+                        strategy += " | EXECUTION CLUES: " + " ".join(clues)
                     yield _emit(_ev("plan", strategy=strategy, tools=planned_tools, confidence=structured_plan.get("confidence")))
                     forced_tools = planned_tools
                 if structured_plan.get("force_memory"):

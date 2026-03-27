@@ -178,7 +178,15 @@ async def _web_search(query: str, num_results: int = 8, backend: str = None, sea
             engine = "duckduckgo"
             results = await _search_duckduckgo(query, num_results)
             
-        return _format_search_results(query, results, engine=engine, max_results=num_results) if results else f"No results found for: {query} via {engine}."
+        if not results:
+            return json.dumps({
+                "type": "web_search_results",
+                "query": query,
+                "results": [],
+                "engine": engine,
+                "error": f"No results found for: {query} via {engine}."
+            })
+        return _format_search_results(query, results, engine=engine, max_results=num_results)
     except Exception as e:
         return f"web_search ({engine}) error: {e}"
 
