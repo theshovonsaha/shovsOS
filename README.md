@@ -28,7 +28,7 @@ The core idea is:
 
 That is the basis of the "Language OS" claim.
 
-Read the public vision document: [documentation/public/VISION.md](/Users/theshovonsaha/Developer/Github/agent/documentation/public/VISION.md)
+Read the public vision document: [documentation/public/VISION.md](documentation/public/VISION.md)
 
 ## Current Runtime Model
 
@@ -206,7 +206,7 @@ graph TB
 ### Install
 
 ```bash
-git clone https://github.com/theshovonsaha/shovsOS.git
+git clone https://github.com//shovsOS.git
 cd shovsOS
 
 python3 -m venv venv
@@ -316,11 +316,11 @@ If the runtime can make small models coherent, larger models benefit even more.
 
 ## Public Docs
 
-- [Setup](/Users/theshovonsaha/Developer/Github/agent/documentation/public/SETUP.md)
-- [Developer Guide](/Users/theshovonsaha/Developer/Github/agent/documentation/public/DEVELOPER_GUIDE.md)
-- [Features and Roadmap](/Users/theshovonsaha/Developer/Github/agent/documentation/public/FEATURES_AND_ROADMAP.md)
-- [Contributing](/Users/theshovonsaha/Developer/Github/agent/documentation/public/CONTRIBUTING.md)
-- [Security](/Users/theshovonsaha/Developer/Github/agent/documentation/public/SECURITY.md)
+- [Setup](/Users//Developer/Github/agent/documentation/public/SETUP.md)
+- [Developer Guide](/Users//Developer/Github/agent/documentation/public/DEVELOPER_GUIDE.md)
+- [Features and Roadmap](/Users//Developer/Github/agent/documentation/public/FEATURES_AND_ROADMAP.md)
+- [Contributing](/Users//Developer/Github/agent/documentation/public/CONTRIBUTING.md)
+- [Security](/Users//Developer/Github/agent/documentation/public/SECURITY.md)
 
 ## Project Status
 
