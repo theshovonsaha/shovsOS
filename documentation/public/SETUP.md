@@ -255,6 +255,31 @@ Then move to `auto` or `managed` once the baseline is stable.
 
 If you are testing semantic memory too, confirm `EMBED_MODEL` points at a reachable embedding model for the same provider family you are using.
 
+## `shovs-memory`
+
+If you only want the memory layer, you can use the installable wedge from this repo:
+
+```bash
+pip install -e .
+```
+
+```python
+from orchestration.session_manager import SessionManager
+from shovs_memory import ShovsMemory
+
+sessions = SessionManager()
+memory = ShovsMemory(session_id="demo-user", owner_id="demo-owner", session_manager=sessions)
+
+memory.apply_user_message("My name is Shovon. I use Cursor. My timezone is EST.", turn=1)
+memory.apply_user_message("Actually, I moved to Berlin.", turn=2)
+
+print(memory.current_facts())
+print(memory.fact_timeline())
+print(memory.inspect())
+```
+
+Use `shovs-memory` when you want deterministic fact writes, correction-aware temporal memory, semantic retrieval, and an inspectable memory-state surface without adopting the full runtime loop.
+
 ## Troubleshooting
 
 ### Local model runs but the turn fails with context overflow
@@ -273,6 +298,14 @@ Recommended:
 - reduce complexity of the request
 - keep tool budgets low
 - prefer exact-domain product research prompts over vague search tasks
+
+### The agent creates a file and then cannot open it
+
+The file tools operate inside the sandbox root. Current behavior accepts both:
+- `report.html`
+- `/sandbox/report.html`
+
+If you see this class of issue again, it is a tool-path bug, not a memory or model-intelligence issue.
 
 ### Memory storage fails with Ollama embedding errors
 

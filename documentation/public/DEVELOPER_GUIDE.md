@@ -65,6 +65,10 @@ The runtime already supports:
 - [memory/vector_engine.py](/Users/theshovonsaha/Developer/Github/agent/memory/vector_engine.py)
 - [memory/session_rag.py](/Users/theshovonsaha/Developer/Github/agent/memory/session_rag.py)
 - [memory/task_tracker.py](/Users/theshovonsaha/Developer/Github/agent/memory/task_tracker.py)
+- [engine/deterministic_facts.py](/Users/theshovonsaha/Developer/Github/agent/engine/deterministic_facts.py)
+- [engine/direct_fact_policy.py](/Users/theshovonsaha/Developer/Github/agent/engine/direct_fact_policy.py)
+- [engine/compression_fact_policy.py](/Users/theshovonsaha/Developer/Github/agent/engine/compression_fact_policy.py)
+- [shovs_memory/memory.py](/Users/theshovonsaha/Developer/Github/agent/shovs_memory/memory.py)
 
 ### Tools
 
@@ -142,6 +146,16 @@ Do not write code that allows:
 
 to become hard truth without grounding.
 
+Current deterministic coverage includes explicit user statements for:
+- preferred name
+- location
+- timezone
+- preferred editor
+- package manager
+- primary language
+
+Direct-fact queries over these fields can now answer from trusted memory without unnecessary tool use when the fact is already present.
+
 ### Candidate Signals
 
 Weak or unverified signals should be downgraded, not promoted.
@@ -150,6 +164,10 @@ That means:
 - use candidate context
 - keep it visible for planning or verification
 - do not treat it as truth
+
+Compression-side alias noise should also be blocked. Example:
+- keep `User location = Vancouver`
+- block `Shovon lives in Vancouver` from becoming a second hard fact when it is only a paraphrase of the trusted user lane
 
 ## Memory and Embedding Plumbing
 
@@ -264,6 +282,9 @@ Useful test areas:
 - model-profile budget selection
 - run/checkpoint persistence
 - fact guard behavior
+- deterministic fact extraction and correction handling
+- direct-fact no-tool answers from trusted memory
+- sandbox file tool path compatibility
 - managed loop traces
 - follow-up sanitation after tool execution
 - memory provider and embedding transport compatibility

@@ -408,6 +408,23 @@ async def test_file_create_and_view():
 
 
 @pytest.mark.asyncio
+async def test_file_view_accepts_sandbox_prefixed_path():
+    """file_view should accept the /sandbox/... path returned by file_create previews."""
+    from plugins.tools import _file_create, _file_view, SANDBOX_DIR
+
+    fname = f"prefixed_{uuid.uuid4().hex[:6]}.txt"
+    content = "Sandbox-prefixed path should resolve"
+
+    await _file_create(path=fname, content=content)
+    view_result = await _file_view(path=f"/sandbox/{fname}")
+
+    assert content in view_result, f"Sandbox-prefixed path did not resolve: {view_result}"
+
+    (SANDBOX_DIR / fname).unlink(missing_ok=True)
+    print(f"\n✓ file_view accepts /sandbox path for {fname}")
+
+
+@pytest.mark.asyncio
 async def test_file_str_replace():
     """file_str_replace should do exact-match replacement."""
     from plugins.tools import _file_create, _file_str_replace, _file_view

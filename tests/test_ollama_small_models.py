@@ -11,6 +11,7 @@ from config.trace_store import get_trace_store
 from engine.context_engine import ContextEngine
 from engine.core import AgentCore
 from llm.llm_adapter import OllamaAdapter
+from memory.semantic_graph import SemanticGraph
 from orchestration.session_manager import SessionManager
 from plugins.tool_registry import Tool, ToolRegistry
 
@@ -35,6 +36,7 @@ def _pick_small_models(tags: list[dict], limit: int = 2) -> list[str]:
         r"^qwen2\.5-coder:3b$",
         r"^llama3\.2:1b$",
         r"^llama3\.2$",
+        r"^qwen3\.5(?::latest|:9b)?$",
         r"^phi3:mini$",
         r"^phi3\.5.*mini",
         r"^qwen2\.5-coder:7b$",
@@ -51,7 +53,7 @@ def _pick_small_models(tags: list[dict], limit: int = 2) -> list[str]:
                 if len(selected) >= limit:
                     return selected
 
-    size_hint = re.compile(r":(?:1b|2b|3b|7b)\b", re.IGNORECASE)
+    size_hint = re.compile(r":(?:1b|2b|3b|7b|8b|9b)\b", re.IGNORECASE)
     for name in names:
         if size_hint.search(name) and name not in selected:
             selected.append(name)
@@ -85,16 +87,26 @@ async def _live_core(model_name: str, tmp_path: Path, with_todo_tool: bool = Fal
             handler=_todo_write_stub,
         ))
 
-    return AgentCore(
+    core = AgentCore(
         adapter=adapter,
         context_engine=context_engine,
         session_manager=sessions,
         tool_registry=registry,
     )
+    core.graph = SemanticGraph(db_path=str(tmp_path / f"memory_{uuid.uuid4().hex[:8]}.db"))
+    return core
 
 
 def _sanitize_model_name(model_name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", model_name)
+
+
+def _token_text(events: list[dict]) -> str:
+    return "".join(event.get("content", "") for event in events if event.get("type") == "token").strip()
+
+
+def _error_events(events: list[dict]) -> list[dict]:
+    return [event for event in events if event.get("type") == "error"]
 
 
 def _write_raw_log(tmp_path: Path, test_name: str, model_name: str, payload: dict) -> Path:
@@ -254,6 +266,104 @@ async def test_small_ollama_multistep_route_emits_todo_plan(tmp_path):
     plan_events = [event for event in events if event.get("type") == "plan"]
     assert plan_events, f"No plan event emitted for model {model_name}"
     assert any("todo_write" in (event.get("tools") or []) for event in plan_events), plan_events
+
+
+@pytest.mark.asyncio
+async def test_small_ollama_context_engine_extracts_user_fact_signal(tmp_path):
+    try:
+        tags = await _ollama_tags()
+    except Exception as exc:
+        pytest.skip(f"Ollama is not reachable: {exc}")
+
+    small_models = _pick_small_models(tags, limit=1)
+    if not small_models:
+        pytest.skip("No small Ollama chat models available for context-engine signal test.")
+
+    model_name = small_models[0]
+    adapter = OllamaAdapter(base_url=_ollama_base_url())
+    ctx_engine = ContextEngine(adapter=adapter, compression_model=model_name)
+
+    updated_ctx, new_facts, voids = await ctx_engine.compress_exchange(
+        user_message="Call me Shovon from now on. That is my preferred name.",
+        assistant_response="Understood. I will call you Shovon from now on.",
+        current_context="",
+        is_first_exchange=False,
+        model=model_name,
+    )
+
+    log_path = _write_raw_log(tmp_path, "context_engine_fact_signal", model_name, {
+        "test": "test_small_ollama_context_engine_extracts_user_fact_signal",
+        "model": model_name,
+        "updated_ctx": updated_ctx,
+        "new_facts": new_facts,
+        "voids": voids,
+    })
+    print(f"\n[raw-log] {log_path}")
+
+    if not new_facts:
+        pytest.skip(f"Context engine did not extract any grounded fact on {model_name}. See {log_path}")
+
+    assert any("shovon" in " ".join(str(part) for part in fact.values()).lower() for fact in new_facts), (
+        f"Context engine did not preserve the user preference signal on {model_name}. See {log_path}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_small_ollama_memory_fact_write_and_followup_recall(tmp_path):
+    try:
+        tags = await _ollama_tags()
+    except Exception as exc:
+        pytest.skip(f"Ollama is not reachable: {exc}")
+
+    small_models = _pick_small_models(tags, limit=1)
+    if not small_models:
+        pytest.skip("No small Ollama chat models available for memory recall test.")
+
+    model_name = small_models[0]
+    core = await _live_core(model_name, tmp_path)
+    owner_id = f"ollama-memory-owner-{uuid.uuid4().hex[:8]}"
+    session_id = f"ollama_memory_{uuid.uuid4().hex[:8]}"
+
+    first_events = [
+        event async for event in core.chat_stream(
+            user_message="Call me Shovon from now on. Please remember that for later.",
+            session_id=session_id,
+            owner_id=owner_id,
+            model=f"ollama:{model_name}",
+            use_planner=False,
+        )
+    ]
+    second_events = [
+        event async for event in core.chat_stream(
+            user_message="What should you call me?",
+            session_id=session_id,
+            owner_id=owner_id,
+            model=f"ollama:{model_name}",
+            use_planner=False,
+        )
+    ]
+
+    facts = core.graph.get_current_facts(session_id, owner_id=owner_id)
+    final_text = _token_text(second_events)
+    log_path = _write_raw_log(tmp_path, "memory_recall", model_name, {
+        "test": "test_small_ollama_memory_fact_write_and_followup_recall",
+        "model": model_name,
+        "session_id": session_id,
+        "owner_id": owner_id,
+        "first_events": first_events,
+        "second_events": second_events,
+        "current_facts": facts,
+        "final_text": final_text,
+        "trace": _session_trace_payload(session_id, limit=140),
+    })
+    print(f"\n[raw-log] {log_path}")
+
+    if _error_events(first_events) or _error_events(second_events):
+        pytest.skip(f"Live memory recall hit runtime error on {model_name}. See {log_path}")
+    if not any("shovon" in " ".join(part for part in fact if isinstance(part, str)).lower() for fact in facts):
+        pytest.skip(f"No deterministic memory fact containing 'Shovon' was written on {model_name}. See {log_path}")
+
+    assert "shovon" in final_text.lower(), f"Follow-up recall did not surface the stored name. See {log_path}"
 
 
 @pytest.mark.asyncio

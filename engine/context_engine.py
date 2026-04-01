@@ -14,6 +14,7 @@ Changes vs v1:
 """
 
 import re
+from typing import Optional
 from llm.base_adapter import BaseLLMAdapter
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from engine.fact_guard import is_grounded_fact_record
@@ -87,7 +88,7 @@ class ContextEngine:
     def __init__(
         self,
         adapter: BaseLLMAdapter,
-        compression_model: str = "llama3.2",
+        compression_model: Optional[str] = None,
     ):
         self.adapter           = adapter
         self.compression_model = compression_model
@@ -170,19 +171,24 @@ class ContextEngine:
         keyed_facts = []
         voids = []
 
+        void_re = re.compile(r"\[\s*VOIDS\s*:(.*?)\]", re.IGNORECASE)
+        fact_re = re.compile(r"\[\s*FACT\s*:(.*?)\]", re.IGNORECASE)
+
         for line in compressed.split("\n"):
             line = line.strip()
 
             # 1) Parse VOIDS
-            if line.startswith("[VOIDS:") and line.endswith("]"):
-                parts = [p.strip() for p in line[7:-1].split("|")]
+            void_match = void_re.search(line)
+            if void_match:
+                parts = [p.strip() for p in void_match.group(1).split("|")]
                 if len(parts) >= 2:
                     voids.append({"subject": parts[0], "predicate": parts[1]})
                 continue
 
             # 2) Parse FACT
-            if line.startswith("[FACT:") and line.endswith("]"):
-                parts = [p.strip() for p in line[6:-1].split("|")]
+            fact_match = fact_re.search(line)
+            if fact_match:
+                parts = [p.strip() for p in fact_match.group(1).split("|")]
                 if len(parts) >= 2:
                     subj = parts[0]
                     pred = parts[1]

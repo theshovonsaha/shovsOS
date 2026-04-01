@@ -125,6 +125,142 @@ async def test_chat_stream_allows_user_grounded_fact_into_deterministic_memory(t
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_deterministically_extracts_preferred_name_without_llm_fact(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Plain response."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+    context_engine.set_adapter = MagicMock()
+
+    session_manager = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    core = AgentCore(
+        adapter=adapter,
+        context_engine=context_engine,
+        session_manager=session_manager,
+        tool_registry=ToolRegistry(),
+        orchestrator=None,
+    )
+    core.graph = SemanticGraph(db_path=str(tmp_path / "memory.db"))
+
+    owner_id = "owner-state-integrity"
+    session_id = "state-integrity-3"
+    events = [
+        event
+        async for event in core.chat_stream(
+            "Call me Shovon from now on.",
+            session_id=session_id,
+            owner_id=owner_id,
+            use_planner=False,
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
+    assert ("User", "preferred_name", "Shovon") in core.graph.get_current_facts(session_id, owner_id=owner_id)
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_deterministically_voids_old_location_on_explicit_correction(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Plain response."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+    context_engine.set_adapter = MagicMock()
+
+    session_manager = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    core = AgentCore(
+        adapter=adapter,
+        context_engine=context_engine,
+        session_manager=session_manager,
+        tool_registry=ToolRegistry(),
+        orchestrator=None,
+    )
+    core.graph = SemanticGraph(db_path=str(tmp_path / "memory.db"))
+
+    owner_id = "owner-state-integrity"
+    session_id = "state-integrity-4"
+    session_manager.get_or_create(session_id=session_id, model="llama3.2", system_prompt="sys", owner_id=owner_id)
+    core.graph.add_temporal_fact(session_id, "User", "location", "Vancouver", turn=1, owner_id=owner_id)
+
+    events = [
+        event
+        async for event in core.chat_stream(
+            "Actually, I live in Toronto now.",
+            session_id=session_id,
+            owner_id=owner_id,
+            use_planner=False,
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
+    current_facts = core.graph.get_current_facts(session_id, owner_id=owner_id)
+    assert ("User", "location", "Toronto") in current_facts
+    assert ("User", "location", "Vancouver") not in current_facts
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_filters_named_subject_alias_facts_from_compression(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Plain response."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=(
+        "ctx",
+        [
+            {
+                "subject": "Shovon",
+                "predicate": "lives in",
+                "object": "Vancouver",
+                "fact": "Shovon lives in Vancouver",
+                "key": "Shovon lives in",
+            },
+            {
+                "subject": "Shovon",
+                "predicate": "is the user's name",
+                "object": "Shovon",
+                "fact": "Shovon is the user's name Shovon",
+                "key": "Shovon is the user's name",
+            },
+        ],
+        [],
+    ))
+    context_engine.set_adapter = MagicMock()
+
+    session_manager = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    core = AgentCore(
+        adapter=adapter,
+        context_engine=context_engine,
+        session_manager=session_manager,
+        tool_registry=ToolRegistry(),
+        orchestrator=None,
+    )
+    core.graph = SemanticGraph(db_path=str(tmp_path / "memory.db"))
+
+    owner_id = "owner-state-integrity"
+    session_id = "state-integrity-alias-filter"
+    events = [
+        event
+        async for event in core.chat_stream(
+            "Call me Shovon. I live in Vancouver.",
+            session_id=session_id,
+            owner_id=owner_id,
+            use_planner=False,
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
+    current_facts = core.graph.get_current_facts(session_id, owner_id=owner_id)
+    assert ("User", "preferred_name", "Shovon") in current_facts
+    assert ("User", "location", "Vancouver") in current_facts
+    assert ("Shovon", "lives in", "Vancouver") not in current_facts
+    assert ("Shovon", "is the user's name", "Shovon") not in current_facts
+
+
+@pytest.mark.asyncio
 async def test_manifest_parser_blocks_ungrounded_fact_and_allows_grounded_fact(monkeypatch):
     fake_graph = MagicMock()
     fake_graph.get_current_facts.return_value = set()

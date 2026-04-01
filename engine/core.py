@@ -21,7 +21,14 @@ from engine.context_engine_v2 import ContextEngineV2
 from engine.context_engine_v3 import ContextEngineV3
 from engine.context_compiler import compile_context_items
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
-from engine.fact_guard import filter_grounded_fact_records
+from engine.compression_fact_policy import finalize_compression_fact_records
+from engine.direct_fact_policy import should_answer_direct_fact_from_memory
+from engine.deterministic_facts import (
+    extract_user_stated_fact_updates,
+    is_redundant_user_alias_text,
+    merge_fact_records,
+    merge_void_records,
+)
 from orchestration.session_manager import SessionManager
 from orchestration.run_store import LoopCheckpoint, get_run_store
 from plugins.tool_registry   import ToolRegistry
@@ -606,6 +613,7 @@ def _build_retrieval_policy(route_type: str, force_memory: bool = False) -> dict
             "use_session_rag": False,
         })
     return policy
+
 
 def _should_index_tool_result(tool_name: str, content: str) -> bool:
     if len((content or "").strip()) < 120:
@@ -1498,8 +1506,7 @@ class AgentCore:
 
         # Memory-first bias for ongoing conversations.
         if (
-            (session_has_history or current_fact_count > 0)
-            and bool(MEMORY_QUERY_RE.search(query))
+            bool(MEMORY_QUERY_RE.search(query))
             and "query_memory" in available
             and "query_memory" not in failed
         ):
@@ -1510,11 +1517,14 @@ class AgentCore:
                 suggestions.append("web_fetch")
         elif (
             re.search(r"\b[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\b", q)
-            and re.search(r"\b(research|investigate|evaluate|assess|pricing|price|plan|cost|review|good|trust|trustworthy|recommend)\b", q)
+            and re.search(r"\b(research|investigate|evaluate|assess|pricing|price|plan|cost|review|good|trust|trustworthy|recommend|intel|report)\b", q)
         ):
             for candidate in ("web_search", "web_fetch"):
                 if candidate in available and candidate not in failed:
                     suggestions.append(candidate)
+        elif re.search(r"\b(research|gather intel|intel|investigate|analyze|analysis|assess|evaluate|compare|deep[- ]?dive|report)\b", q):
+            if "web_search" in available and "web_search" not in failed:
+                suggestions.append("web_search")
         elif re.search(r"\b(news|latest|current|today|who is|what is|when is|where is)\b", q):
             if "web_search" in available and "web_search" not in failed:
                 suggestions.append("web_search")
@@ -1622,7 +1632,7 @@ class AgentCore:
         # New: Layer settings (passed via kwargs or extracted from request)
         use_planner    = _to_bool(kw.get("use_planner", True))
         planner_model  = kw.get("planner_model")
-        context_model  = kw.get("context_model", "deepseek-r1:8b")
+        context_model  = kw.get("context_model") or getattr(cfg, "CONTEXT_MODEL", None) or model
         requested_loop_mode = kw.get("loop_mode", "auto")
         max_tool_calls = _normalize_optional_limit(kw.get("max_tool_calls"), minimum=1, maximum=24)
         max_turns = _normalize_optional_limit(kw.get("max_turns"), minimum=2, maximum=12)
@@ -1695,6 +1705,10 @@ class AgentCore:
             is_correction_turn = _is_correction_turn(user_message)
 
             current_facts = self.graph.get_current_facts(sid, owner_id=owner_id)
+            anticipated_deterministic_facts, anticipated_deterministic_voids = extract_user_stated_fact_updates(
+                user_message,
+                current_facts=current_facts,
+            )
             failed_tools = self.circuit_breaker.get_failed_tools(sid)
             task_tracker = get_session_task_tracker()
             task_bootstrap_done = task_tracker.has_tasks(sid)
@@ -1705,6 +1719,13 @@ class AgentCore:
                 current_fact_count=len(current_facts),
                 active_task_count=task_summary.get("active_count", 0),
             ) if bool(getattr(cfg, "ENABLE_DETERMINISTIC_ROUTING", True)) else "open_ended"
+            direct_fact_memory_only = (
+                route_type == "direct_fact"
+                and should_answer_direct_fact_from_memory(user_message, current_facts)
+            )
+            blocked_tools_for_turn: set[str] = set()
+            if anticipated_deterministic_facts or anticipated_deterministic_voids:
+                blocked_tools_for_turn.add("store_memory")
             retrieval_policy = _build_retrieval_policy(route_type, force_memory=force_memory)
             task_state = ""
             requested_loop_mode, effective_loop_mode = _normalize_loop_mode(
@@ -1730,6 +1751,11 @@ class AgentCore:
                 "query": user_message[:200],
             })
             trace_event("retrieval_policy", retrieval_policy)
+            trace_event("direct_fact_memory_guard", {
+                "enabled": direct_fact_memory_only,
+                "fact_count": len(current_facts),
+                "query": user_message[:200],
+            })
             trace_event("runtime_loop_mode", {
                 "requested": requested_loop_mode,
                 "effective": effective_loop_mode,
@@ -1822,6 +1848,7 @@ class AgentCore:
                     current_facts=current_facts,
                     task_state=task_state,
                     candidate_context=session.candidate_context,
+                    direct_fact_memory_only=direct_fact_memory_only,
                     loop_checkpoint=loop_checkpoint,
                     correction_turn=is_correction_turn,
                     route_type=route_type,
@@ -1968,6 +1995,7 @@ class AgentCore:
                     current_facts=current_facts,
                     task_state=task_state,
                     candidate_context=session.candidate_context,
+                    direct_fact_memory_only=direct_fact_memory_only,
                     loop_checkpoint=loop_checkpoint,
                     correction_turn=is_correction_turn,
                     route_type=route_type,
@@ -2081,6 +2109,7 @@ class AgentCore:
                 current_facts=current_facts,
                 task_state=task_state,
                 candidate_context=session.candidate_context,
+                direct_fact_memory_only=direct_fact_memory_only,
                 loop_checkpoint=loop_checkpoint,
                 correction_turn=is_correction_turn,
                 route_type=route_type,
@@ -2150,6 +2179,8 @@ class AgentCore:
                     max_llm_turns=max_turns,
                     prior_tool_results=all_tool_results,
                     model_profile=model_profile,
+                    suppress_tools=direct_fact_memory_only,
+                    blocked_tools=blocked_tools_for_turn,
                 ):
                     yield _emit(event)
                     if event["type"] == "token":
@@ -2348,6 +2379,7 @@ class AgentCore:
                 current_facts=current_facts,
                 task_state=task_state,
                 candidate_context=session.candidate_context,
+                direct_fact_memory_only=direct_fact_memory_only,
                 loop_checkpoint=loop_checkpoint,
                 correction_turn=is_correction_turn,
                 route_type=route_type,
@@ -2471,6 +2503,7 @@ class AgentCore:
             current_facts=current_facts,
             task_state=task_state,
             candidate_context=session.candidate_context,
+            direct_fact_memory_only=direct_fact_memory_only,
             loop_checkpoint=loop_checkpoint,
             correction_turn=is_correction_turn,
             route_type=route_type,
@@ -2488,6 +2521,20 @@ class AgentCore:
         })
 
         should_compress = (not is_trivial_turn) and (not incomplete_turn) and _should_compress_exchange(session, is_first_exchange)
+        deterministic_keyed_facts, deterministic_voids = anticipated_deterministic_facts, anticipated_deterministic_voids
+        trace_event("deterministic_fact_extractor", {
+            "fact_count": len(deterministic_keyed_facts),
+            "void_count": len(deterministic_voids),
+            "facts": [
+                {
+                    "subject": item.get("subject"),
+                    "predicate": item.get("predicate"),
+                    "object": item.get("object"),
+                }
+                for item in deterministic_keyed_facts
+            ],
+            "voids": deterministic_voids,
+        })
         memory_commit_context = self._compile_phase_context(
             phase=ContextPhase.MEMORY_COMMIT,
             system_prompt=session.system_prompt,
@@ -2501,6 +2548,7 @@ class AgentCore:
             current_facts=current_facts,
             task_state=task_state,
             candidate_context=session.candidate_context,
+            direct_fact_memory_only=direct_fact_memory_only,
             loop_checkpoint=loop_checkpoint,
             correction_turn=is_correction_turn,
             route_type=route_type,
@@ -2509,6 +2557,9 @@ class AgentCore:
         )
         trace_event("phase_context", memory_commit_context)
         trace_phase(ContextPhase.MEMORY_COMMIT, "start", should_compress=should_compress)
+        keyed_facts = list(deterministic_keyed_facts)
+        voids = list(deterministic_voids)
+        blocked_keyed_facts: list[dict] = []
         if should_compress:
             yield _emit(_ev("compressing"))
             try:
@@ -2528,7 +2579,7 @@ class AgentCore:
                     compression_target = model or default_fallback
             
                 log("ctx", sid, f"Compressing exchange with {compression_target} (adapter: {adapter_name})...")
-                updated_ctx, keyed_facts, voids = await ctx_eng.compress_exchange(
+                updated_ctx, compression_keyed_facts, compression_voids = await ctx_eng.compress_exchange(
                     user_message=user_message,
                     assistant_response=clean_response,
                     current_context=session.compressed_context,
@@ -2536,11 +2587,15 @@ class AgentCore:
                     model=compression_target,
                     grounding_text="\n".join(successful_tool_evidence),
                 )
-                keyed_facts, blocked_keyed_facts = filter_grounded_fact_records(
-                    keyed_facts,
+                compression_keyed_facts, blocked_keyed_facts = finalize_compression_fact_records(
+                    compression_keyed_facts,
                     user_message=user_message,
                     grounding_text="\n".join(successful_tool_evidence),
+                    deterministic_facts=deterministic_keyed_facts,
+                    current_facts=current_facts,
                 )
+                keyed_facts = merge_fact_records(deterministic_keyed_facts, compression_keyed_facts)
+                voids = merge_void_records(deterministic_voids, compression_voids)
                 self.sessions.update_context(sid, updated_ctx)
                 lines = _count_context_items(updated_ctx)
                 log("ctx", sid, f"Context updated · {lines} lines · {len(keyed_facts)} new facts, {len(voids)} voids", level="ok")
@@ -2586,52 +2641,62 @@ class AgentCore:
                         "candidate_context_lines": len([line for line in candidate_context.splitlines() if line.strip()]),
                     })
 
-                try:
-                    sg = self.graph
-                    for void in voids:
-                        sg.void_temporal_fact(
-                            sid,
-                            void["subject"],
-                            void["predicate"],
-                            session.message_count,
-                            owner_id=owner_id,
-                        )
-                        log("ctx", sid, f"Voided fact: {void['subject']} | {void['predicate']}", level="ok")
-                    for item in keyed_facts:
-                        if item.get("subject") and item.get("predicate") and item.get("subject") != "General":
-                            sg.add_temporal_fact(
-                                sid,
-                                item["subject"],
-                                item["predicate"],
-                                item.get("object", ""),
-                                session.message_count,
-                                owner_id=owner_id,
-                                run_id=run_id,
-                            )
-                except Exception as e:
-                    log("ctx", sid, f"Database deterministic facts error: {e}", level="error")
-
-                if keyed_facts:
-                    ve = VectorEngine(sid, agent_id=session.agent_id, owner_id=owner_id)
-                    anchor_text = f"User: {user_message}\nAssistant: {clean_response}"
-                    for item in keyed_facts:
-                        await ve.index(
-                            key=item["key"],
-                            anchor=anchor_text,
-                            metadata={"fact": item["fact"], "run_id": run_id, "owner_id": owner_id or ""},
-                        )
-                    log("rag", sid, f"Indexed {len(keyed_facts)} facts into vector store", level="ok")
-
-                    trace_event("facts_indexed", {
-                        "facts": [f["key"] for f in keyed_facts],
-                        "context_lines": lines,
-                    })
             except Exception as e:
                 log("ctx", sid, f"Compression/indexing error: {e}", level="error")
                 lines = 0
         else:
             lines = _count_context_items(session.compressed_context)
             log("ctx", sid, "Skipping compression for this turn")
+            keyed_facts = merge_fact_records(deterministic_keyed_facts)
+            voids = merge_void_records(deterministic_voids)
+
+        if (keyed_facts or voids) and not should_compress:
+            log("ctx", sid, f"Persisting deterministic facts without compression · {len(keyed_facts)} facts, {len(voids)} voids")
+
+        if keyed_facts or voids:
+            try:
+                sg = self.graph
+                for void in voids:
+                    sg.void_temporal_fact(
+                        sid,
+                        void["subject"],
+                        void["predicate"],
+                        session.message_count,
+                        owner_id=owner_id,
+                    )
+                    log("ctx", sid, f"Voided fact: {void['subject']} | {void['predicate']}", level="ok")
+                for item in keyed_facts:
+                    if item.get("subject") and item.get("predicate") and item.get("subject") != "General":
+                        sg.add_temporal_fact(
+                            sid,
+                            item["subject"],
+                            item["predicate"],
+                            item.get("object", ""),
+                            session.message_count,
+                            owner_id=owner_id,
+                            run_id=run_id,
+                        )
+            except Exception as e:
+                log("ctx", sid, f"Database deterministic facts error: {e}", level="error")
+
+        if keyed_facts:
+            try:
+                ve = VectorEngine(sid, agent_id=session.agent_id, owner_id=owner_id)
+                anchor_text = f"User: {user_message}\nAssistant: {clean_response}"
+                for item in keyed_facts:
+                    await ve.index(
+                        key=item["key"],
+                        anchor=anchor_text,
+                        metadata={"fact": item["fact"], "run_id": run_id, "owner_id": owner_id or ""},
+                    )
+                log("rag", sid, f"Indexed {len(keyed_facts)} facts into vector store", level="ok")
+
+                trace_event("facts_indexed", {
+                    "facts": [f["key"] for f in keyed_facts],
+                    "context_lines": lines,
+                })
+            except Exception as e:
+                log("rag", sid, f"Fact indexing error: {e}", level="error")
         save_loop_checkpoint(
             "commit",
             tool_turn=loop_checkpoint.tool_turn if loop_checkpoint else 0,
@@ -2844,6 +2909,23 @@ class AgentCore:
             deduped.append(r)
             seen_fingerprints.add(fingerprint)
 
+        current_facts = self.graph.get_current_facts(session_id, owner_id=owner_id)
+        deduped = [
+            item
+            for item in deduped
+            if not is_redundant_user_alias_text(
+                " ".join(
+                    part for part in (
+                        str(item.get("text") or "").strip(),
+                        str(item.get("key") or "").strip(),
+                        str(item.get("anchor") or "").strip(),
+                    )
+                    if part
+                ),
+                current_facts=current_facts,
+            )
+        ]
+
         ranked_retrieval = [items for items in (vector_results, bm25_results) if items]
         if ranked_retrieval:
             try:
@@ -2887,6 +2969,8 @@ class AgentCore:
         max_llm_turns:  Optional[int] = None,
         prior_tool_results: Optional[list[dict[str, Any]]] = None,
         model_profile: str = "frontier_standard",
+        suppress_tools: bool = False,
+        blocked_tools: Optional[set[str]] = None,
     ) -> AsyncIterator[dict]:
         tool_turn = 0
         llm_turn = 0
@@ -2913,10 +2997,15 @@ class AgentCore:
         )
         if max_llm_turns is None:
             max_llm_turns = max_tool_turns + 1
-        tools_enabled = self.tools.has_tools()
+        tools_enabled = self.tools.has_tools() and not suppress_tools
         budget_exhausted = False
         task_bootstrap_done = get_session_task_tracker().has_tasks(sid)
         accumulated_tool_results: list[dict[str, Any]] = list(prior_tool_results or [])
+        blocked_tools = {
+            str(name or "").strip().lower()
+            for name in (blocked_tools or set())
+            if str(name or "").strip()
+        }
 
         while True:
             # ── INTERRUPT CHECK ──────────────────────────────────────────────
@@ -3084,6 +3173,34 @@ class AgentCore:
             llm_turn += 1
 
             calls = self.tools.detect_tool_calls(turn_buffer)
+            if blocked_tools and calls:
+                blocked_calls = [call for call in calls if call.tool_name.lower() in blocked_tools]
+                if blocked_calls:
+                    clean = self._strip_detected_tool_json(turn_buffer, calls)
+                    yield _ev("retract_last_tokens")
+                    yield {"type": "_retract_response", "clean_response": clean}
+                    if clean:
+                        messages.append({"role": "assistant", "content": clean})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"Do not call these tools on this turn: {', '.join(sorted({call.tool_name for call in blocked_calls}))}. "
+                            "The runtime will handle deterministic memory updates automatically for explicit user-stated facts and corrections. "
+                            "Answer directly if you can, or choose a different substantive tool."
+                        ),
+                    })
+                    _trace(
+                        agent_id or "default",
+                        sid,
+                        "blocked_tool_call_suppressed",
+                        {
+                            "turn": llm_turn,
+                            "blocked_tools": sorted({call.tool_name for call in blocked_calls}),
+                        },
+                        run_id=run_id,
+                        owner_id=owner_id,
+                    )
+                    continue
             if tool_turn >= max_tool_turns:
                 if calls and not budget_exhausted:
                     log("agent", sid, f"Max tool turns ({max_tool_turns}) reached", level="warn")
@@ -3839,6 +3956,7 @@ class AgentCore:
         loop_checkpoint: Optional[LoopCheckpoint] = None,
         correction_turn: bool = False,
         route_type: str = "open_ended",
+        direct_fact_memory_only: bool = False,
         ctx_engine: Optional[ContextEngine] = None,
         model_profile: str = "frontier_standard",
     ) -> list[ContextItem]:
@@ -4151,6 +4269,29 @@ class AgentCore:
                 )
             )
 
+        if direct_fact_memory_only:
+            items.append(
+                ContextItem(
+                    item_id="direct_fact_memory_only",
+                    kind=ContextKind.OBJECTIVE,
+                    title="Trusted Fact Answer",
+                    content=(
+                        "This direct fact question is already answerable from the trusted deterministic facts in context. "
+                        "Answer from those facts only. Do not call web_search, web_fetch, query_memory, or any other tool for this turn."
+                    ),
+                    source="direct_fact_memory_only",
+                    priority=24,
+                    max_chars=420,
+                    phase_visibility=frozenset({
+                        ContextPhase.ACTING,
+                        ContextPhase.RESPONSE,
+                        ContextPhase.VERIFICATION,
+                    }),
+                    trace_id="objective:direct_fact_memory_only",
+                    provenance={"route_type": route_type},
+                )
+            )
+
         if first_message is not None:
             total_turns = max(1, (message_count + 1) // 2)
             items.append(
@@ -4394,6 +4535,7 @@ class AgentCore:
         loop_checkpoint:    Optional[LoopCheckpoint] = None,
         correction_turn:    bool = False,
         route_type:         str = "open_ended",
+        direct_fact_memory_only: bool = False,
         ctx_engine:         Optional[ContextEngine] = None,
         phase:             ContextPhase = ContextPhase.ACTING,
         model_profile:     str = "frontier_standard",
@@ -4413,6 +4555,7 @@ class AgentCore:
             loop_checkpoint=loop_checkpoint,
             correction_turn=correction_turn,
             route_type=route_type,
+            direct_fact_memory_only=direct_fact_memory_only,
             ctx_engine=ctx_engine,
             model_profile=model_profile,
         )
@@ -4480,6 +4623,7 @@ class AgentCore:
         loop_checkpoint: Optional[LoopCheckpoint] = None,
         correction_turn: bool = False,
         route_type: str = "open_ended",
+        direct_fact_memory_only: bool = False,
         ctx_engine: Optional[ContextEngine] = None,
         model_profile: str = "frontier_standard",
     ) -> dict:
@@ -4498,6 +4642,7 @@ class AgentCore:
             loop_checkpoint=loop_checkpoint,
             correction_turn=correction_turn,
             route_type=route_type,
+            direct_fact_memory_only=direct_fact_memory_only,
             ctx_engine=ctx_engine,
             model_profile=model_profile,
         )

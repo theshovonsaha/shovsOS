@@ -223,7 +223,7 @@ export function useAgent() {
     const [maxToolCalls, setMaxToolCalls] = useState<string>(localStorage.getItem('shovs_max_tool_calls') || '');
     const [maxTurns, setMaxTurns] = useState<string>(localStorage.getItem('shovs_max_turns') || '');
     const [plannerModel, setPlannerModel] = useState<string>(localStorage.getItem('shovs_planner_model') || '');
-    const [contextModel, setContextModel] = useState<string>(localStorage.getItem('shovs_context_model') || 'deepseek-r1:8b');
+    const [contextModel, setContextModel] = useState<string>(localStorage.getItem('shovs_context_model') || '');
     const [embedModel, setEmbedModel] = useState<string>(localStorage.getItem('shovs_embed_model') || 'ollama:nomic-embed-text');
 
     // Voice / Jarvis States

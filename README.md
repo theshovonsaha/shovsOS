@@ -30,6 +30,46 @@ That is the basis of the "Language OS" claim.
 
 Read the public vision document: [documentation/public/VISION.md](documentation/public/VISION.md)
 
+Memory wedge: [documentation/public/SHOVS_MEMORY.md](documentation/public/SHOVS_MEMORY.md)
+
+## What `shovs-memory` Is
+
+`shovs-memory` is the smallest adoptable surface of this repo.
+
+Use it when you want:
+- deterministic user fact writes
+- correction-aware temporal memory
+- semantic retrieval
+- an inspectable memory state view
+
+Use the full runtime when you also want:
+- loop orchestration
+- tool execution
+- traces, checkpoints, artifacts, and full session runtime control
+
+Minimal shape:
+
+```python
+from orchestration.session_manager import SessionManager
+from shovs_memory import ShovsMemory
+
+sessions = SessionManager()
+memory = ShovsMemory(session_id="user-123", owner_id="owner-123", session_manager=sessions)
+
+memory.apply_user_message("My name is Shovon. I use Cursor.", turn=1)
+memory.apply_user_message("Actually, I moved to Berlin.", turn=2)
+
+print(memory.current_facts())
+print(memory.fact_timeline())
+print(memory.inspect())
+```
+
+What makes it different:
+- explicit user facts harden deterministically instead of relying only on compression LLM output
+- newer facts supersede older ones through temporal invalidation
+- trusted facts are kept separate from candidate signals
+- the memory state is inspectable, not opaque
+
 ## Current Runtime Model
 
 The backend supports two execution modes:
@@ -78,6 +118,7 @@ Each turn can produce:
 - vector memory
 - session RAG
 - task tracker
+- `shovs-memory` facade for deterministic fact writes, semantic retrieval, and inspectable memory state
 - runtime embed-model propagation into memory tools
 - provider-aware embedding transport for Ollama, LM Studio, llama.cpp, and OpenAI-compatible runners
 - context-engine variants:

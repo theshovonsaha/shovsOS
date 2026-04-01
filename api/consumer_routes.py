@@ -12,7 +12,10 @@ from orchestration.session_manager import SessionManager
 from engine.file_processor import FileProcessor
 from llm.adapter_factory import create_adapter
 from plugins.tool_registry import ToolRegistry
+from api.memory_inspector import build_session_memory_payload
 from services.consumer_store import ConsumerStoreService, ConsumerStoreSelection
+
+CONSUMER_AGENT_ID = "consumer"
 
 
 class ConsumerOptionsPayload(BaseModel):
@@ -118,10 +121,10 @@ def make_consumer_router(
         s = sessions.create(
             model=model,
             system_prompt="",
-            agent_id="default",
+            agent_id=CONSUMER_AGENT_ID,
             owner_id=owner_id,
         )
-        return {"id": s.id, "model": s.model, "created_at": s.created_at}
+        return {"id": s.id, "model": s.model, "agent_id": s.agent_id, "created_at": s.created_at}
 
     @router.post("/chat/stream")
     async def consumer_chat_stream(
@@ -150,13 +153,13 @@ def make_consumer_router(
             full_message = f"{text_injection}\n\n{message}" if text_injection else message
             yield f"data: {json.dumps({'type': 'phase', 'phase': 'thinking'})}\n\n"
 
-            agent = agent_manager.get_agent_instance("default", owner_id=owner_id)
+            agent = agent_manager.get_agent_instance(CONSUMER_AGENT_ID, owner_id=owner_id)
             tool_events = 0
             sid = session_id
             async for event in agent.chat_stream(
                 user_message=full_message,
                 session_id=session_id,
-                agent_id="default",
+                agent_id=CONSUMER_AGENT_ID,
                 model=active_model,
                 use_planner=False,
                 loop_mode="single",
@@ -194,6 +197,18 @@ def make_consumer_router(
             generate(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
+
+    @router.get("/sessions/{session_id}/memory-state")
+    async def consumer_session_memory_state(session_id: str, owner_id: str):
+        owner_id = _require_owner_id(owner_id)
+        session = sessions.get(session_id, owner_id=owner_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return build_session_memory_payload(
+            session=session,
+            owner_id=owner_id,
+            context_preview=lambda raw: [line for line in (raw or "").splitlines() if line.strip()],
         )
 
     @router.get("/tools")

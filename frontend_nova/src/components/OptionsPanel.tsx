@@ -12,6 +12,39 @@ interface Memory {
     similarity?: number;
 }
 
+interface MemoryStateFact {
+    subject: string;
+    predicate: string;
+    object: string;
+    status: 'current' | 'superseded';
+    valid_from?: number | null;
+    valid_to?: number | null;
+    created_at?: string | null;
+}
+
+interface MemorySignal {
+    event_type: string;
+    label: string;
+    summary: string;
+    created_at?: string;
+}
+
+interface SessionMemoryState {
+    summary: {
+        deterministic_fact_count: number;
+        superseded_fact_count: number;
+        candidate_signal_count: number;
+        context_line_count: number;
+        memory_signal_count: number;
+    };
+    deterministic_facts: MemoryStateFact[];
+    superseded_facts: MemoryStateFact[];
+    candidate_signals: Array<{ text: string; reason: string }>;
+    context_preview: string[];
+    recent_memory_signals: MemorySignal[];
+    explanation: string[];
+}
+
 interface OptionsPanelProps {
     sessionId: string | null;
     contextLines: number;
@@ -120,6 +153,7 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
     const [isSearching, setIsSearching] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [sessionContext, setSessionContext] = useState<string[]>([]);
+    const [sessionMemoryState, setSessionMemoryState] = useState<SessionMemoryState | null>(null);
     const [activeTab, setActiveTab] = useState<'settings' | 'memory' | 'context'>('settings');
     const [confirmClear, setConfirmClear] = useState(false);
     const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
@@ -161,6 +195,19 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
         }
     }, [sessionId]);
 
+    const loadMemoryState = useCallback(async () => {
+        if (!sessionId) {
+            setSessionMemoryState(null);
+            return;
+        }
+        try {
+            const data = await fetch(withOwnerQuery(`/api/sessions/${sessionId}/memory-state`)).then(r => r.json());
+            setSessionMemoryState(data);
+        } catch (e) {
+            console.error('Failed to load session memory state', e);
+        }
+    }, [sessionId]);
+
     useEffect(() => {
         loadMemories();
     }, [loadMemories]);
@@ -168,6 +215,10 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
     useEffect(() => {
         if (activeTab === 'context') loadContext();
     }, [activeTab, loadContext]);
+
+    useEffect(() => {
+        if (activeTab === 'context') loadMemoryState();
+    }, [activeTab, loadMemoryState]);
 
     const loadStorage = useCallback(async () => {
         setStorageLoading(true);
@@ -702,20 +753,90 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                     <h4 className="section-title" style={{ fontSize: '13px', borderBottom: '1px solid var(--border-color)', paddingBottom: '4px', marginBottom: '10px' }}>Context Window</h4>
                     {!sessionId ? (
                         <div className="memory-empty">No active session. Start a chat first.</div>
-                    ) : sessionContext.length === 0 ? (
-                        <div className="memory-empty">Context is empty for this session.</div>
                     ) : (
                         <>
+                            {sessionMemoryState && (
+                                <div style={{ marginBottom: '14px', display: 'grid', gap: '10px' }}>
+                                    <div className="memory-card">
+                                        <div className="memory-footer" style={{ marginBottom: '8px' }}>
+                                            <span className="memory-date">Trusted facts: {sessionMemoryState.summary.deterministic_fact_count}</span>
+                                            <span className="memory-date">Candidates: {sessionMemoryState.summary.candidate_signal_count}</span>
+                                        </div>
+                                        {sessionMemoryState.deterministic_facts.length === 0 ? (
+                                            <div className="memory-empty" style={{ minHeight: 'unset', padding: '0', textAlign: 'left' }}>
+                                                No trusted facts for this session yet.
+                                            </div>
+                                        ) : (
+                                            sessionMemoryState.deterministic_facts.map((fact, index) => (
+                                                <div key={`${fact.subject}-${fact.predicate}-${fact.object}-${index}`} className="memory-triplet" style={{ marginBottom: '8px' }}>
+                                                    <span className="memory-subject">{fact.subject}</span>
+                                                    <span className="memory-predicate">{fact.predicate}</span>
+                                                    <span className="memory-object">{fact.object}</span>
+                                                </div>
+                                            ))
+                                        )}
+                                    </div>
+
+                                    {sessionMemoryState.superseded_facts.length > 0 && (
+                                        <div className="memory-card">
+                                            <div className="memory-footer" style={{ marginBottom: '8px' }}>
+                                                <span className="memory-date">Superseded facts</span>
+                                            </div>
+                                            {sessionMemoryState.superseded_facts.slice(0, 4).map((fact, index) => (
+                                                <div key={`${fact.subject}-${fact.predicate}-${fact.object}-${index}`} className="memory-triplet" style={{ marginBottom: '8px', opacity: 0.72 }}>
+                                                    <span className="memory-subject">{fact.subject}</span>
+                                                    <span className="memory-predicate">{fact.predicate}</span>
+                                                    <span className="memory-object">{fact.object}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+
+                                    {sessionMemoryState.candidate_signals.length > 0 && (
+                                        <div className="memory-card">
+                                            <div className="memory-footer" style={{ marginBottom: '8px' }}>
+                                                <span className="memory-date">Candidate signals under review</span>
+                                            </div>
+                                            {sessionMemoryState.candidate_signals.slice(0, 4).map((signal, index) => (
+                                                <div key={`${signal.text}-${index}`} className="context-line" style={{ marginBottom: '6px' }}>
+                                                    {signal.text}
+                                                    <span style={{ opacity: 0.55 }}> · {signal.reason}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+
+                                    {sessionMemoryState.recent_memory_signals.length > 0 && (
+                                        <div className="memory-card">
+                                            <div className="memory-footer" style={{ marginBottom: '8px' }}>
+                                                <span className="memory-date">Why the system changed memory</span>
+                                            </div>
+                                            {sessionMemoryState.recent_memory_signals.slice(0, 4).map((signal, index) => (
+                                                <div key={`${signal.event_type}-${index}`} className="context-line" style={{ marginBottom: '8px' }}>
+                                                    <strong style={{ color: 'var(--text)' }}>{signal.label}:</strong> {signal.summary}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {sessionContext.length === 0 ? (
+                                <div className="memory-empty">Context is empty for this session.</div>
+                            ) : (
+                                <>
                             <div className="context-meta">{sessionContext.length} context lines</div>
                             <div className="context-list">
                                 {sessionContext.map((line, i) => (
                                     <div key={i} className="context-line">{line}</div>
                                 ))}
                             </div>
+                                </>
+                            )}
                         </>
                     )}
                     {sessionId && (
-                        <button className="memory-refresh-btn" style={{ marginTop: '8px' }} onClick={loadContext}>↺ Refresh</button>
+                        <button className="memory-refresh-btn" style={{ marginTop: '8px' }} onClick={() => { loadMemoryState(); loadContext(); }}>↺ Refresh</button>
                     )}
                 </div>
             )}

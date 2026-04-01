@@ -2,10 +2,14 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+from engine.compression_fact_policy import finalize_compression_fact_records
 from engine import core as core_mod
+from engine.direct_fact_policy import should_answer_direct_fact_from_memory
+from engine.deterministic_facts import extract_user_stated_fact_updates, is_redundant_user_alias_text
 from engine.core import AgentCore, DEFAULT_SYSTEM_PROMPT, _classify_route, _enforce_total_budget
 from engine.context_engine_v2 import ContextEngineV2
 from orchestration.orchestrator import AgenticOrchestrator
+from plugins.tool_registry import Tool, ToolRegistry
 
 
 @pytest.mark.asyncio
@@ -36,6 +40,95 @@ async def test_orchestrator_only_injects_query_memory_on_memory_signal():
         current_fact_count=3,
     )
     assert any(t["name"] == "query_memory" for t in explicit_memory["tools"])
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_memory_recall_route_queries_memory_even_without_active_history():
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value='{"tools": []}')
+    orch = AgenticOrchestrator(adapter=adapter)
+
+    result = await orch.plan_with_context(
+        query="Do you remember me?",
+        tools_list=[
+            {"name": "query_memory", "description": "Query prior conversation context"},
+            {"name": "web_search", "description": "Search web"},
+        ],
+        model="llama3.2",
+        session_has_history=False,
+        current_fact_count=0,
+    )
+
+    assert result["route_type"] == "memory_recall"
+    assert result["should_plan"] is False
+    assert [tool["name"] for tool in result["tools"]] == ["query_memory"]
+    adapter.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_returns_no_tools_for_conversational_greeting():
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value='{"tools": [{"name": "web_search"}]}')
+    orch = AgenticOrchestrator(adapter=adapter)
+
+    tools_list = [
+        {"name": "web_search", "description": "Search web"},
+        {"name": "weather_fetch", "description": "Get weather"},
+    ]
+
+    result = await orch.plan_with_context(
+        query="Hello, how are you today?",
+        tools_list=tools_list,
+        model="llama3.2",
+        session_has_history=False,
+        current_fact_count=0,
+    )
+
+    assert result["route_type"] == "trivial_chat"
+    assert result["tools"] == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_research_report_prefers_evidence_before_file_creation():
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value='{"strategy":"Create report","tools":[{"name":"file_create","priority":"high","reason":"Need report file"}]}')
+    orch = AgenticOrchestrator(adapter=adapter)
+
+    result = await orch.plan_with_context(
+        query="Research OpenClaw properly and write a report",
+        tools_list=[
+            {"name": "web_search", "description": "Search web"},
+            {"name": "file_create", "description": "Create file"},
+        ],
+        model="llama3.2",
+        session_has_history=False,
+        current_fact_count=0,
+    )
+
+    tool_names = [tool["name"] for tool in result["tools"]]
+    assert tool_names[0] == "web_search"
+    assert "file_create" not in tool_names
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_gather_intel_falls_back_to_web_search():
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value='{"tools": []}')
+    orch = AgenticOrchestrator(adapter=adapter)
+
+    result = await orch.plan_with_context(
+        query="What do you know about OpenClaw, can you gather intel?",
+        tools_list=[
+            {"name": "web_search", "description": "Search web"},
+            {"name": "file_create", "description": "Create file"},
+        ],
+        model="llama3.2",
+        session_has_history=False,
+        current_fact_count=0,
+    )
+
+    assert result["route_type"] == "multi_step"
+    assert [tool["name"] for tool in result["tools"]] == ["web_search"]
 
 
 def test_total_budget_preserves_tool_result_messages():
@@ -113,6 +206,85 @@ def test_context_v2_protected_modules_are_not_voided():
     assert "User preferred name" in ctx._modules
     assert "Temp detail" not in ctx._modules
     assert void_records == [{"subject": "Temp detail", "predicate": "requires"}]
+
+
+def test_direct_fact_memory_guard_prefers_trusted_facts_over_tools():
+    assert should_answer_direct_fact_from_memory(
+        "What is my preferred name and current location?",
+        [
+            ("User", "preferred_name", "Shovon"),
+            ("User", "location", "Toronto"),
+        ],
+    ) is True
+
+    assert should_answer_direct_fact_from_memory(
+        "What is my preferred name and current location?",
+        [("User", "preferred_name", "Shovon")],
+    ) is False
+
+
+def test_deterministic_fact_extractor_supports_more_user_preferences():
+    facts, voids = extract_user_stated_fact_updates(
+        "My timezone is EST. I use Cursor. My package manager is pnpm. My primary language is TypeScript."
+    )
+
+    assert voids == []
+    pairs = {(item["predicate"], item["object"]) for item in facts}
+    assert ("timezone", "EST") in pairs
+    assert ("preferred_editor", "Cursor") in pairs
+    assert ("package_manager", "pnpm") in pairs
+    assert ("primary_language", "TypeScript") in pairs
+
+
+def test_direct_fact_memory_guard_supports_preference_queries_beyond_name_and_location():
+    current_facts = [
+        ("User", "timezone", "EST"),
+        ("User", "preferred_editor", "Cursor"),
+        ("User", "package_manager", "pnpm"),
+        ("User", "primary_language", "TypeScript"),
+    ]
+
+    assert should_answer_direct_fact_from_memory("What is my timezone?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("Which editor do I use?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What package manager do I use?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What is my primary language?", current_facts) is True
+
+
+def test_finalize_compression_fact_records_blocks_alias_noise_after_grounding():
+    allowed, blocked = finalize_compression_fact_records(
+        [
+            {"subject": "Shovon", "predicate": "lives_in", "object": "Vancouver", "fact": "Shovon lives in Vancouver"},
+            {"subject": "Tool", "predicate": "source", "object": "SEC filing", "fact": "Tool source SEC filing"},
+        ],
+        user_message="My name is Shovon and I live in Vancouver.",
+        grounding_text="Company facts from SEC filing",
+        deterministic_facts=[
+            {"subject": "User", "predicate": "preferred_name", "object": "Shovon"},
+            {"subject": "User", "predicate": "location", "object": "Vancouver"},
+        ],
+        current_facts=[("User", "preferred_name", "Shovon"), ("User", "location", "Vancouver")],
+    )
+
+    assert any(item["subject"] == "Tool" for item in allowed)
+    assert any(item["fact"] == "Shovon lives in Vancouver" for item in blocked)
+
+
+def test_retrieval_alias_text_filter_blocks_named_subject_redundancy():
+    assert is_redundant_user_alias_text(
+        "Shovon lives in Vancouver",
+        current_facts=[
+            ("User", "preferred_name", "Shovon"),
+            ("User", "location", "Vancouver"),
+        ],
+    ) is True
+
+    assert is_redundant_user_alias_text(
+        "Tool source SEC filing",
+        current_facts=[
+            ("User", "preferred_name", "Shovon"),
+            ("User", "location", "Vancouver"),
+        ],
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -215,6 +387,64 @@ async def test_chat_stream_resolves_context_engine_per_request_without_mutating_
     assert core.ctx_eng is original_ctx
     resolved_ctx.set_adapter.assert_called_once()
     resolved_ctx.compress_exchange.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_blocks_store_memory_on_deterministic_fact_turn():
+    class AsyncIter:
+        def __init__(self, chunks):
+            self._iter = iter(chunks)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self._iter)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    adapter = MagicMock()
+    adapter.stream = MagicMock(side_effect=[
+        AsyncIter(['{"tool":"store_memory","arguments":{"subject":"User","predicate":"location","object_":"Berlin"}}']),
+        AsyncIter(["Your current location is Berlin."]),
+    ])
+
+    registry = ToolRegistry()
+    blocked_handler = AsyncMock(return_value="should not run")
+    registry.register(
+        Tool(
+            name="store_memory",
+            description="Store memory",
+            parameters={"type": "object", "properties": {"subject": {"type": "string"}}},
+            handler=blocked_handler,
+        )
+    )
+
+    core = AgentCore(
+        adapter=adapter,
+        context_engine=MagicMock(),
+        session_manager=MagicMock(),
+        tool_registry=registry,
+        orchestrator=None,
+    )
+
+    events = [
+        event
+        async for event in core._agent_loop(
+            model="llama3.2",
+            messages=[{"role": "system", "content": "sys"}, {"role": "user", "content": "I moved to Berlin."}],
+            adapter=adapter,
+            session_id="blocked-store-memory",
+            route_type="open_ended",
+            user_message="I moved to Berlin.",
+            blocked_tools={"store_memory"},
+        )
+    ]
+
+    assert not any(event.get("type") == "tool_call" and event.get("tool_name") == "store_memory" for event in events)
+    assert blocked_handler.await_count == 0
+    assert any(event.get("type") == "token" for event in events)
 
 
 def test_build_messages_enforces_system_prompt_budget():

@@ -136,7 +136,7 @@ TRIVIAL_SIGNAL = re.compile(
 )
 URL_SIGNAL = re.compile(r"https?://", re.IGNORECASE)
 MULTISTEP_SIGNAL = re.compile(
-    r"\b(then|after that|afterwards|step by step|plan|research|summarize|save|write|create|build|compare|analyze)\b",
+    r"\b(then|after that|afterwards|step by step|plan|research|summarize|save|write|create|build|compare|analyze|intel|report)\b",
     re.IGNORECASE,
 )
 CURRENT_INFO_SIGNAL = re.compile(
@@ -148,6 +148,34 @@ PRICING_SIGNAL = re.compile(r"\b(price|pricing|cost|costs|plan|plans|tier|tiers)
 TRUST_SIGNAL = re.compile(r"\b(trust|trustworthy|legit|legitimate|safe|secure|privacy|security)\b", re.IGNORECASE)
 COMPARISON_SIGNAL = re.compile(r"\b(compare|comparison|competitor|competitors|alternative|alternatives|vs)\b", re.IGNORECASE)
 PRODUCT_RESEARCH_SIGNAL = re.compile(r"\b(research|investigate|evaluate|assess|recommend|good|worth it)\b", re.IGNORECASE)
+RESEARCH_SIGNAL = re.compile(
+    r"\b(research|gather intel|intel|investigate|analyze|analysis|assess|evaluate|compare|deep[- ]?dive|report)\b",
+    re.IGNORECASE,
+)
+ARTIFACT_SIGNAL = re.compile(
+    r"\b(write|save|create|generate|export|report|html|markdown|file|notes?)\b",
+    re.IGNORECASE,
+)
+IDENTITY_MEMORY_SIGNAL = re.compile(
+    r"\b(do you remember me|who am i|what do you know about me)\b",
+    re.IGNORECASE,
+)
+CONVERSATIONAL_QUERY_SIGNAL = re.compile(
+    r"^(?:"
+    r"(?:hi|hello|hey|yo)(?:\s+\w{1,20}){0,2}"
+    r"|(?:hi|hello|hey|yo)[,.!\s]+(?:how are you(?: today)?|what s up|whats up)"
+    r"|how are you(?: today)?"
+    r"|what s up"
+    r"|whats up"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def _normalize_query_text(text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (text or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 def _extract_exact_domains(text: str) -> List[str]:
@@ -159,6 +187,84 @@ def _extract_exact_domains(text: str) -> List[str]:
             ordered.append(normalized)
             seen.add(normalized)
     return ordered
+
+
+def _query_needs_research_evidence(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    return bool(RESEARCH_SIGNAL.search(q)) or (
+        bool(ARTIFACT_SIGNAL.search(q))
+        and bool(re.search(r"\b(summarize|summary|report|tldr|tl;dr|findings)\b", q))
+    )
+
+
+def _choose_initial_evidence_tool(
+    query: str,
+    *,
+    known_tools: set[str],
+    failed_tools: set[str],
+) -> Optional[dict[str, str]]:
+    q = (query or "").strip()
+    lowered = q.lower()
+    if URL_SIGNAL.search(q):
+        if "web_fetch" in known_tools and "web_fetch" not in failed_tools:
+            return {"name": "web_fetch", "priority": "high", "reason": "Direct URL detected for evidence gathering."}
+    if DOMAIN_SIGNAL.search(q):
+        if "web_search" in known_tools and "web_search" not in failed_tools:
+            return {"name": "web_search", "priority": "high", "reason": "Research should start by locating exact first-party evidence."}
+        if "web_fetch" in known_tools and "web_fetch" not in failed_tools:
+            return {"name": "web_fetch", "priority": "medium", "reason": "Research should start with first-party evidence."}
+    if "web_search" in known_tools and "web_search" not in failed_tools:
+        return {"name": "web_search", "priority": "high", "reason": "Research request needs an evidence-producing first step."}
+    if "query_memory" in known_tools and "query_memory" not in failed_tools:
+        return {"name": "query_memory", "priority": "medium", "reason": "Check existing memory before synthesizing a report."}
+    return None
+
+
+def _apply_initial_tool_policy(
+    *,
+    query: str,
+    route_type: str,
+    tools: List[Dict[str, str]],
+    known_tools: set[str],
+    failed_tools: set[str],
+) -> List[Dict[str, str]]:
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in tools:
+        name = str(item.get("name") or "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(item)
+
+    if route_type == "memory_recall":
+        if "query_memory" in known_tools and "query_memory" not in failed_tools:
+            normalized = [item for item in normalized if item.get("name") != "query_memory"]
+            normalized.insert(0, {
+                "name": "query_memory",
+                "priority": "high",
+                "reason": "Memory recall queries should inspect existing memory first.",
+            })
+        return normalized
+
+    if not _query_needs_research_evidence(query):
+        return normalized
+
+    evidence_tools = {"web_search", "web_fetch", "rag_search", "query_memory"}
+    artifact_tools = {"file_create", "file_str_replace", "generate_app"}
+    has_evidence_tool = any(item.get("name") in evidence_tools for item in normalized)
+    if not has_evidence_tool:
+        normalized = [item for item in normalized if item.get("name") not in artifact_tools]
+        initial_tool = _choose_initial_evidence_tool(
+            query,
+            known_tools=known_tools,
+            failed_tools=failed_tools,
+        )
+        if initial_tool and initial_tool["name"] not in {item.get("name") for item in normalized}:
+            normalized.insert(0, initial_tool)
+    return normalized
 
 
 def _tool_result_mentions(item: Dict[str, Any], needle: str) -> bool:
@@ -257,13 +363,14 @@ class AgenticOrchestrator:
 
     def classify_route(self, query: str, session_has_history: bool = False, current_fact_count: int = 0) -> str:
         q = (query or "").strip()
+        query_norm = _normalize_query_text(q)
         if not q:
             return "trivial_chat"
-        if TRIVIAL_SIGNAL.fullmatch(q):
+        if TRIVIAL_SIGNAL.fullmatch(q) or CONVERSATIONAL_QUERY_SIGNAL.fullmatch(query_norm):
             return "trivial_chat"
         if URL_SIGNAL.search(q):
             return "url_fetch"
-        if MEMORY_SIGNAL.search(q) and (session_has_history or current_fact_count > 0):
+        if MEMORY_SIGNAL.search(q) or IDENTITY_MEMORY_SIGNAL.search(q):
             return "memory_recall"
         if MULTISTEP_SIGNAL.search(q):
             return "multi_step"
@@ -309,7 +416,7 @@ class AgenticOrchestrator:
         elif route_type == "direct_fact" and "web_search" in known_tools and "web_search" not in failed_set:
             deterministic_tools.append({"name": "web_search", "priority": "high", "reason": "Deterministic factual/current query route."})
 
-        if deterministic_tools and route_type in {"url_fetch", "direct_fact"}:
+        if deterministic_tools and route_type in {"url_fetch", "direct_fact", "memory_recall"}:
             return {
                 "strategy": "Use deterministic route-selected tools before final answer.",
                 "tools": deterministic_tools,
@@ -380,20 +487,9 @@ class AgenticOrchestrator:
 
             tools = _normalize_tools(payload.get("tools", []))
 
-            query_norm = re.sub(r"[^a-z0-9\s]", " ", query.lower())
-            query_norm = re.sub(r"\s+", " ", query_norm).strip()
+            query_norm = _normalize_query_text(query)
 
-            greeting_set = {
-                "hi",
-                "hello",
-                "hey",
-                "yo",
-                "how are you",
-                "how are you today",
-                "hello how are you",
-                "hello how are you today",
-            }
-            if query_norm in greeting_set:
+            if CONVERSATIONAL_QUERY_SIGNAL.fullmatch(query_norm):
                 tools = []
 
             if (
@@ -413,7 +509,7 @@ class AgenticOrchestrator:
                 and "web_search" in known_tools
                 and "web_search" not in failed_set
                 and re.search(r"\b(current|latest|news|price|best|top|what|who|when|where|which)\b", query_norm)
-                and query_norm not in greeting_set
+                and not CONVERSATIONAL_QUERY_SIGNAL.fullmatch(query_norm)
             ):
                 tools.append({
                     "name": "web_search",
@@ -433,6 +529,14 @@ class AgenticOrchestrator:
                         "priority": "high",
                         "reason": "Query signals memory dependency.",
                     })
+
+            tools = _apply_initial_tool_policy(
+                query=query,
+                route_type=route_type,
+                tools=tools,
+                known_tools=known_tools,
+                failed_tools=failed_set,
+            )
 
             structured = {
                 "strategy": str(payload.get("strategy", "Use selected tools to gather evidence before final answer.")),

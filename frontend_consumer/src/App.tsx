@@ -3,7 +3,7 @@ import {
 } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import AgentOrb from './AgentOrb'
-import { appendOwnerId } from './owner'
+import { appendOwnerId, getOwnerId } from './owner'
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -22,6 +22,35 @@ type StreamEvent =
 
 type StorageStatus = {
   stores: Record<string, { exists: boolean; size_bytes: number; path: string }>
+}
+
+type MemoryStateFact = {
+  subject: string
+  predicate: string
+  object: string
+  status: 'current' | 'superseded'
+}
+
+type MemorySignal = {
+  event_type: string
+  label: string
+  summary: string
+  created_at?: string
+}
+
+type SessionMemoryState = {
+  summary: {
+    deterministic_fact_count: number
+    superseded_fact_count: number
+    candidate_signal_count: number
+    context_line_count: number
+    memory_signal_count: number
+  }
+  deterministic_facts: MemoryStateFact[]
+  superseded_facts: MemoryStateFact[]
+  candidate_signals: Array<{ text: string; reason: string }>
+  context_preview: string[]
+  recent_memory_signals: MemorySignal[]
 }
 
 type Message = { id: number; role: 'user' | 'assistant'; content: string }
@@ -54,6 +83,8 @@ export default function App() {
   const [model, setModel] = useState('')
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [storage, setStorage] = useState<StorageStatus | null>(null)
+  const [memoryState, setMemoryState] = useState<SessionMemoryState | null>(null)
+  const [memoryLoading, setMemoryLoading] = useState(false)
 
   // Layout: centered = fresh start, chat = has history
   const [layout, setLayout] = useState<LayoutMode>('centered')
@@ -246,6 +277,25 @@ export default function App() {
     setStorage(await fetch('/api/consumer/storage/status').then(r => r.json()))
   }, [])
 
+  const refreshMemoryState = useCallback(async (targetSessionId?: string | null) => {
+    const sid = targetSessionId ?? sessionId
+    if (!sid) {
+      setMemoryState(null)
+      return
+    }
+    setMemoryLoading(true)
+    try {
+      const ownerId = getOwnerId()
+      const url = `/api/consumer/sessions/${sid}/memory-state?owner_id=${encodeURIComponent(ownerId)}`
+      const data = await fetch(url).then(r => r.json())
+      setMemoryState(data)
+    } catch {
+      setMemoryState(null)
+    } finally {
+      setMemoryLoading(false)
+    }
+  }, [sessionId])
+
   const backup = useCallback(async () => {
     await fetch('/api/consumer/storage/backup', { method: 'POST' })
     await refreshStorage()
@@ -261,9 +311,16 @@ export default function App() {
     setMessages([])
     setStreaming('')
     setLayout('centered')
+    setMemoryState(null)
     setResetConfirm(false)
     await refreshStorage()
   }, [refreshStorage])
+
+  useEffect(() => {
+    if (optionsOpen && sessionId) {
+      void refreshMemoryState(sessionId)
+    }
+  }, [optionsOpen, sessionId, messages.length, refreshMemoryState])
 
   const toggleActivity = useCallback((id: number) => {
     setActivities(prev => prev.map(a => a.id === id ? { ...a, expanded: !a.expanded } : a))
@@ -585,6 +642,94 @@ export default function App() {
                       }}>Clear</button>
                     )}
                   </div>
+                </section>
+
+                <section className="opt-sec">
+                  <label className="opt-lbl">Memory State</label>
+                  {!sessionId ? (
+                    <span className="opt-muted">Start a chat to inspect memory.</span>
+                  ) : memoryLoading ? (
+                    <span className="opt-muted">Loading memory state…</span>
+                  ) : !memoryState ? (
+                    <span className="opt-muted">Memory state unavailable.</span>
+                  ) : (
+                    <>
+                      <div className="memory-summary-grid">
+                        <div className="memory-stat-card">
+                          <span className="memory-stat-label">Trusted</span>
+                          <strong>{memoryState.summary.deterministic_fact_count}</strong>
+                        </div>
+                        <div className="memory-stat-card">
+                          <span className="memory-stat-label">Superseded</span>
+                          <strong>{memoryState.summary.superseded_fact_count}</strong>
+                        </div>
+                        <div className="memory-stat-card">
+                          <span className="memory-stat-label">Candidates</span>
+                          <strong>{memoryState.summary.candidate_signal_count}</strong>
+                        </div>
+                        <div className="memory-stat-card">
+                          <span className="memory-stat-label">Context</span>
+                          <strong>{memoryState.summary.context_line_count}</strong>
+                        </div>
+                      </div>
+
+                      <div className="memory-panel-card">
+                        <div className="memory-panel-title">Trusted now</div>
+                        {memoryState.deterministic_facts.length === 0 ? (
+                          <div className="memory-panel-empty">No trusted facts yet.</div>
+                        ) : (
+                          memoryState.deterministic_facts.slice(0, 4).map((fact, index) => (
+                            <div key={`${fact.subject}-${fact.predicate}-${fact.object}-${index}`} className="memory-row">
+                              <span>{fact.subject}</span>
+                              <span>{fact.predicate}</span>
+                              <span>{fact.object}</span>
+                            </div>
+                          ))
+                        )}
+                      </div>
+
+                      {memoryState.superseded_facts.length > 0 && (
+                        <div className="memory-panel-card">
+                          <div className="memory-panel-title">Superseded</div>
+                          {memoryState.superseded_facts.slice(0, 3).map((fact, index) => (
+                            <div key={`${fact.subject}-${fact.predicate}-${fact.object}-${index}`} className="memory-row subdued">
+                              <span>{fact.subject}</span>
+                              <span>{fact.predicate}</span>
+                              <span>{fact.object}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {memoryState.candidate_signals.length > 0 && (
+                        <div className="memory-panel-card">
+                          <div className="memory-panel-title">Under review</div>
+                          {memoryState.candidate_signals.slice(0, 3).map((signal, index) => (
+                            <div key={`${signal.text}-${index}`} className="memory-note">
+                              {signal.text}
+                              <span>{signal.reason}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {memoryState.recent_memory_signals.length > 0 && (
+                        <div className="memory-panel-card">
+                          <div className="memory-panel-title">Why memory changed</div>
+                          {memoryState.recent_memory_signals.slice(0, 3).map((signal, index) => (
+                            <div key={`${signal.event_type}-${index}`} className="memory-note">
+                              {signal.label}
+                              <span>{signal.summary}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="opt-acts">
+                        <button className="opt-btn" onClick={() => void refreshMemoryState(sessionId)}>Refresh</button>
+                      </div>
+                    </>
+                  )}
                 </section>
 
                 <section className="opt-sec">

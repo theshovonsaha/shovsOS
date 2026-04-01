@@ -51,6 +51,7 @@ from api.log_routes import setup_log_routes
 from api.voice_endpoint import setup_voice_routes
 from api.rag_routes import make_rag_router            # ← NEW
 from api.consumer_routes import make_consumer_router
+from api.memory_inspector import build_session_memory_payload
 from services.storage_admin import StorageAdminService, StoreSelection
 from services.consumer_store import ConsumerStoreService
 
@@ -210,6 +211,21 @@ def _seed_standard_profiles():
                 "You are an expert programmer. Write clean, tested, working code. "
                 "Always run code with bash after writing it to verify it works."
             ),
+        ),
+        AgentProfile(
+            id="consumer",
+            name="Consumer Assistant",
+            description="Plain-language assistant for the consumer chat surface.",
+            model="groq:moonshotai/kimi-k2-instruct",
+            tools=["web_search", "web_fetch", "query_memory"],
+            system_prompt=(
+                "You are a clear, calm assistant for the consumer product surface. "
+                "Prefer plain text, avoid internal execution chatter, and only use tools when they materially improve accuracy or complete the task."
+            ),
+            default_use_planner=False,
+            default_loop_mode="auto",
+            default_context_mode="v2",
+            bootstrap_files=["IDENTITY.md", "SOUL.md"],
         ),
     ]
     for p in standard:
@@ -598,6 +614,18 @@ async def get_context(session_id: str, owner_id: str):
         raise HTTPException(404, "Session not found")
     lines = _context_preview(s.compressed_context)
     return {"session_id": session_id, "lines": len(lines), "context": lines, "raw": s.compressed_context}
+
+@app.get("/sessions/{session_id}/memory-state")
+async def get_session_memory_state(session_id: str, owner_id: str):
+    owner_id = _require_owner_id(owner_id)
+    s = session_manager.get(session_id, owner_id=owner_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+    return build_session_memory_payload(
+        session=s,
+        owner_id=owner_id,
+        context_preview=_context_preview,
+    )
 
 @app.get("/memory")
 async def list_memories(limit: int = 100, owner_id: Optional[str] = None):

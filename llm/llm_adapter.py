@@ -27,19 +27,34 @@ class OllamaAdapter(BaseLLMAdapter):
         self.base_url = base_url
         self.timeout  = timeout
         self._client: Optional[httpx.AsyncClient] = None
+        self._client_loop_id: Optional[int] = None
+
+    @staticmethod
+    def _current_loop_id() -> Optional[int]:
+        try:
+            return id(asyncio.get_running_loop())
+        except RuntimeError:
+            return None
 
     def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
+        current_loop_id = self._current_loop_id()
+        if (
+            self._client is None
+            or self._client.is_closed
+            or (current_loop_id is not None and self._client_loop_id not in (None, current_loop_id))
+        ):
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=self.timeout,
                 headers={"Content-Type": "application/json"}
             )
+            self._client_loop_id = current_loop_id
         return self._client
 
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+        self._client_loop_id = None
 
     async def _raise_for_status(self, response):
         """

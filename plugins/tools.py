@@ -495,7 +495,12 @@ BASH_TOOL = Tool(
 
 def _safe_path(path_str: str) -> Path:
     """Resolve path and ensure it stays inside SANDBOX_DIR."""
-    p = (SANDBOX_DIR / path_str).resolve()
+    normalized = str(path_str or "").strip()
+    if normalized.startswith("/sandbox/"):
+        normalized = normalized[len("/sandbox/"):]
+    elif normalized == "/sandbox":
+        normalized = "."
+    p = (SANDBOX_DIR / normalized).resolve()
     if not str(p).startswith(str(SANDBOX_DIR)):
         raise ValueError(f"Path '{path_str}' escapes sandbox — refused")
     return p
