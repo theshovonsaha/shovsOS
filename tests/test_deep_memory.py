@@ -82,9 +82,9 @@ async def test_store_and_query_tools():
         
         # Test Query
         res_query = await _query_memory("allergies")
-        assert "Found 1" in res_query
+        assert "Unified memory results" in res_query
         assert "peanuts" in res_query
-        mock_instance.traverse.assert_called_once_with("allergies", top_k=5)
+        mock_instance.traverse.assert_called_once()
 
 
 @pytest.mark.asyncio

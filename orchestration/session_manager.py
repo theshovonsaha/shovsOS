@@ -25,6 +25,7 @@ from typing import Optional
 
 
 from config.config import cfg
+from engine.candidate_signals import parse_candidate_context, render_candidate_signals
 
 MAX_SESSIONS        = cfg.MAX_SESSIONS
 SLIDING_WINDOW_SIZE = cfg.SLIDING_WINDOW_SIZE  # Centralized — no more mismatch
@@ -42,6 +43,7 @@ class Session:
     system_prompt:       str = ""
     compressed_context:  str = ""
     candidate_context:   str = ""
+    candidate_signals:   list[dict] = field(default_factory=list)
     sliding_window:      list[dict] = field(default_factory=list)
     full_history:        list[dict] = field(default_factory=list)
     title:               Optional[str] = None
@@ -77,6 +79,7 @@ class SessionManager:
                     system_prompt TEXT,
                     compressed_context TEXT,
                     candidate_context TEXT,
+                    candidate_signals_json TEXT,
                     sliding_window TEXT,
                     full_history TEXT,
                     title TEXT,
@@ -104,6 +107,9 @@ class SessionManager:
             try:
                 conn.execute("ALTER TABLE sessions ADD COLUMN candidate_context TEXT")
             except sqlite3.OperationalError: pass
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN candidate_signals_json TEXT")
+            except sqlite3.OperationalError: pass
             conn.commit()
 
     def _load_from_db(self):
@@ -126,6 +132,11 @@ class SessionManager:
             system_prompt=r["system_prompt"],
             compressed_context=r["compressed_context"] or "",
             candidate_context=r["candidate_context"] if "candidate_context" in r.keys() else "",
+            candidate_signals=(
+                json.loads(r["candidate_signals_json"])
+                if "candidate_signals_json" in r.keys() and r["candidate_signals_json"]
+                else parse_candidate_context(r["candidate_context"] if "candidate_context" in r.keys() else "")
+            ),
             sliding_window=json.loads(r["sliding_window"]),
             full_history=json.loads(r["full_history"]),
             title=r["title"],
@@ -140,12 +151,13 @@ class SessionManager:
             conn.execute('''
                 INSERT OR REPLACE INTO sessions
                 (id, agent_id, owner_id, created_at, updated_at, model, system_prompt, compressed_context,
-                 candidate_context, sliding_window, full_history, title, first_message, parent_id, message_count, context_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 candidate_context, candidate_signals_json, sliding_window, full_history, title, first_message, parent_id, message_count, context_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 s.id, s.agent_id, s.owner_id, s.created_at, s.updated_at, s.model, s.system_prompt,
                 s.compressed_context,
                 s.candidate_context,
+                json.dumps(s.candidate_signals),
                 json.dumps(s.sliding_window),
                 json.dumps(s.full_history),
                 s.title, s.first_message, s.parent_id, s.message_count, s.context_mode,
@@ -300,6 +312,14 @@ class SessionManager:
     def update_candidate_context(self, session_id: str, candidate_context: str):
         if s := self.get(session_id):
             s.candidate_context = candidate_context
+            s.candidate_signals = parse_candidate_context(candidate_context)
+            s.updated_at = datetime.now(timezone.utc).isoformat()
+            self._save_to_db(s)
+
+    def update_candidate_signals(self, session_id: str, candidate_signals: list[dict]):
+        if s := self.get(session_id):
+            s.candidate_signals = list(candidate_signals or [])
+            s.candidate_context = render_candidate_signals(s.candidate_signals)
             s.updated_at = datetime.now(timezone.utc).isoformat()
             self._save_to_db(s)
 

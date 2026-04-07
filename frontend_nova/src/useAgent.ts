@@ -62,6 +62,8 @@ interface AgentSettingsProfile {
     default_context_mode?: 'v1' | 'v2' | 'v3';
 }
 
+type RuntimePath = 'legacy' | 'run_engine';
+
 export interface Attachment {
     id: string;
     file: File;
@@ -69,7 +71,7 @@ export interface Attachment {
 }
 
 export interface MessageBlock {
-    type: 'text' | 'thought' | 'plan' | 'tool_call' | 'tool_result' | 'tool_error' | 'attachment_badge' | 'compressing';
+    type: 'text' | 'thought' | 'plan' | 'tension_hint' | 'tool_call' | 'tool_result' | 'tool_error' | 'attachment_badge' | 'compressing';
     content: string;
     tool?: string;
     id: string;
@@ -135,6 +137,19 @@ const summarizeReloadedToolResult = (event: SessionTraceEvent): string => {
     return data.content_preview || event.preview || 'tool result';
 };
 
+const summarizeConversationTension = (event: SessionTraceEvent | { data?: any; summary?: string; challenge_level?: string; conflict_count?: number; notes?: string; }): string => {
+    const data = event.data || event || {};
+    const summary = String(data.summary || '').trim();
+    const notes = String(data.notes || '').trim();
+    const challengeLevel = String(data.challenge_level || 'low').trim();
+    const conflictCount = Number(data.conflict_count || (Array.isArray(data.conflicting_facts) ? data.conflicting_facts.length : 0) || 0);
+    const parts = [summary || 'Conversation tension detected.'];
+    parts.push(`challenge=${challengeLevel}`);
+    if (conflictCount > 0) parts.push(`conflicts=${conflictCount}`);
+    if (notes) parts.push(notes);
+    return parts.join(' · ');
+};
+
 const resolveModelSelection = (
     current: string,
     groupedModels: Record<string, string[]>,
@@ -164,6 +179,13 @@ const buildAssistantBlockGroupsFromTrace = (events: SessionTraceEvent[]): Messag
         if (event.event_type === 'plan') {
             const strategy = String(data.strategy || event.preview || '').trim();
             if (strategy) pushBlock({ type: 'plan', content: strategy });
+            continue;
+        }
+        if (event.event_type === 'conversation_tension') {
+            pushBlock({
+                type: 'tension_hint',
+                content: summarizeConversationTension(event),
+            });
             continue;
         }
         if (event.event_type === 'tool_call') {
@@ -214,6 +236,9 @@ export function useAgent() {
     const [isStreaming, setIsStreaming] = useState(false);
     const [pendingFiles, setPendingFiles] = useState<Attachment[]>([]);
     const [forcedTools, setForcedTools] = useState<string[]>([]);
+    const [runtimePath, setRuntimePath] = useState<RuntimePath>(
+        (localStorage.getItem('shovs_runtime_path') as RuntimePath) || 'run_engine'
+    );
 
     // V10 Layer Controls
     const [usePlanner, setUsePlanner] = useState<boolean>(localStorage.getItem('shovs_use_planner') !== 'false');
@@ -255,10 +280,13 @@ export function useAgent() {
     useEffect(() => { fetchHealth(); fetchModels(); fetchTools(); }, []);
     useEffect(() => { fetchSessions(); }, [activeAgentId]);
     useEffect(() => {
+        let cancelled = false;
+
         const applyProfileDefaults = async () => {
-            if (!activeAgentId) return;
+            if (!activeAgentId || currentSessionId) return;
             try {
                 const profile: AgentSettingsProfile = await fetch(withOwnerQuery(`/api/agents/${activeAgentId}`)).then(r => r.json());
+                if (cancelled || currentSessionId) return;
                 if (profile.model) setCurrentModel(profile.model);
                 if (profile.embed_model) setEmbedModel(profile.embed_model);
                 setUsePlanner(profile.default_use_planner ?? true);
@@ -268,8 +296,12 @@ export function useAgent() {
                 console.error('Failed to load agent defaults', e);
             }
         };
+
         applyProfileDefaults();
-    }, [activeAgentId]);
+        return () => {
+            cancelled = true;
+        };
+    }, [activeAgentId, currentSessionId]);
 
     useEffect(() => {
         if (currentModel) localStorage.setItem('shovs_model', currentModel);
@@ -342,6 +374,10 @@ export function useAgent() {
         if (currentSessionId) localStorage.setItem('shovs_current_sid', currentSessionId);
         else localStorage.removeItem('shovs_current_sid');
     }, [currentSessionId]);
+
+    useEffect(() => {
+        localStorage.setItem('shovs_runtime_path', runtimePath);
+    }, [runtimePath]);
 
     // Auto-load session on first mount if SID exists
     useEffect(() => {
@@ -616,6 +652,7 @@ export function useAgent() {
             fd.append('context_model', contextModel);
             fd.append('context_mode', contextMode);
             fd.append('embed_model', embedModel);
+            fd.append('runtime_path', runtimePath);
             fd.append('use_planner', usePlanner.toString());
             fd.append('loop_mode', loopMode);
             if (maxToolCalls.trim()) fd.append('max_tool_calls', maxToolCalls.trim());
@@ -708,6 +745,13 @@ export function useAgent() {
                                 addBlock({
                                     type: 'plan',
                                     content: ev.strategy || 'Planning strategy...'
+                                });
+                                break;
+
+                            case 'conversation_tension':
+                                addBlock({
+                                    type: 'tension_hint',
+                                    content: summarizeConversationTension(ev),
                                 });
                                 break;
 
@@ -1088,6 +1132,8 @@ export function useAgent() {
         setShowActorThought,
         showObserverActivity,
         setShowObserverActivity,
+        runtimePath,
+        setRuntimePath,
         clearSessionContext,
         loadSession, newSession, deleteSession,
         addFiles, removeFile, sendMessage, stopExecution, bottomRef, conversationRef,

@@ -52,6 +52,10 @@ const AUTO_REFRESH_KEY = 'shovs_trace_auto';
 const BASE_EVENT_TYPES = [
   'story',
   'all',
+  'conversation_tension',
+  'stance_signals_extracted',
+  'phase_context',
+  'compiled_context',
   'llm_pass_start',
   'llm_prompt',
   'llm_pass_complete',
@@ -64,7 +68,11 @@ const BASE_EVENT_TYPES = [
 const IMPORTANT_EVENT_TYPES = new Set([
   'runtime_loop_mode',
   'route_decision',
+  'conversation_tension',
+  'stance_signals_extracted',
   'plan',
+  'phase_context',
+  'compiled_context',
   'tool_call',
   'tool_result',
   'manager_observation',
@@ -84,6 +92,10 @@ interface StoryGroup {
 }
 
 const HUMAN_EVENT_LABELS: Record<string, string> = {
+  conversation_tension: 'Conversation tension detected',
+  stance_signals_extracted: 'Stance candidates extracted',
+  phase_context: 'Phase packet compiled',
+  compiled_context: 'Message prompt compiled',
   llm_pass_start: 'Model pass started',
   llm_prompt: 'Prompt sent to model',
   llm_pass_complete: 'Model pass completed',
@@ -98,15 +110,77 @@ function humanizeEventType(eventType: string): string {
   return HUMAN_EVENT_LABELS[eventType] || eventType.replace(/_/g, ' ');
 }
 
+function summarizeIncludedItems(data: Record<string, any>): {
+  count: number;
+  hasTension: boolean;
+  preview: string;
+} {
+  const included = Array.isArray(data.included) ? data.included : [];
+  const itemIds = included
+    .map((item) =>
+      item && typeof item === 'object' ? String(item.item_id || '').trim() : '',
+    )
+    .filter(Boolean);
+  return {
+    count: itemIds.length,
+    hasTension: itemIds.includes('conversation_tension'),
+    preview: itemIds.slice(0, 4).join(', '),
+  };
+}
+
 function describeTraceEvent(event: TraceEventSummary): string {
-  const data = (event.data && typeof event.data === 'object' ? event.data : {}) as Record<string, any>;
+  const data = (
+    event.data && typeof event.data === 'object' ? event.data : {}
+  ) as Record<string, any>;
   switch (event.event_type) {
     case 'runtime_loop_mode':
       return `Loop mode: ${data.effective || data.requested || 'unknown'}`;
     case 'route_decision':
       return `Route: ${data.route_type || 'unknown'}`;
+    case 'conversation_tension': {
+      const summary = String(data.summary || event.preview || '').trim();
+      const challenge = String(data.challenge_level || 'low').trim();
+      const conflicts = Array.isArray(data.conflicting_facts)
+        ? data.conflicting_facts.length
+        : 0;
+      if (summary) {
+        return `Tension: ${summary} · challenge=${challenge}${conflicts ? ` · conflicts=${conflicts}` : ''}`;
+      }
+      return `Tension detected · challenge=${challenge}${conflicts ? ` · conflicts=${conflicts}` : ''}`;
+    }
+    case 'stance_signals_extracted': {
+      const count = Number(data.count || 0);
+      const signals = Array.isArray(data.signals) ? data.signals : [];
+      const preview = signals
+        .slice(0, 2)
+        .map((item) => String(item?.topic || item?.position || '').trim())
+        .filter(Boolean)
+        .join(', ');
+      return `Stance candidates: ${count || signals.length}${preview ? ` · ${preview}` : ''}`;
+    }
     case 'plan':
-      return String(data.strategy || event.preview || 'Planner issued a strategy.');
+      return String(
+        data.strategy || event.preview || 'Planner issued a strategy.',
+      );
+    case 'phase_context':
+    case 'compiled_context': {
+      const { count, hasTension, preview } = summarizeIncludedItems(data);
+      const phase = String(data.phase || 'unknown');
+      const scope = String(data.trace_scope || '').trim();
+      const label =
+        event.event_type === 'compiled_context'
+          ? 'message prompt'
+          : 'phase packet';
+      const suffix = [
+        `${count} item${count === 1 ? '' : 's'}`,
+        hasTension ? 'tension visible' : '',
+        preview ? `includes ${preview}` : '',
+        scope ? `scope=${scope}` : '',
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      return `${phase} ${label} compiled${suffix ? ` · ${suffix}` : ''}`;
+    }
     case 'tool_call':
       return `${data.tool_name || 'tool'}: ${data.arguments_summary || 'starting'}`;
     case 'tool_result':
@@ -134,8 +208,15 @@ function labelForStoryStage(eventType: string): string | null {
       return 'Loop';
     case 'route_decision':
       return 'Route';
+    case 'conversation_tension':
+      return 'Tension';
+    case 'stance_signals_extracted':
+      return 'Tension';
     case 'plan':
       return 'Plan';
+    case 'phase_context':
+    case 'compiled_context':
+      return 'Context';
     case 'tool_call':
       return 'Act';
     case 'tool_result':
@@ -160,7 +241,9 @@ function buildStoryGroups(events: TraceEventSummary[]): StoryGroup[] {
   const groups = new Map<string, TraceEventSummary[]>();
   for (const event of chronological) {
     const key =
-      typeof event.pass_index === 'number' ? `pass-${event.pass_index}` : `event-${event.id}`;
+      typeof event.pass_index === 'number'
+        ? `pass-${event.pass_index}`
+        : `event-${event.id}`;
     const bucket = groups.get(key) || [];
     bucket.push(event);
     groups.set(key, bucket);
@@ -168,7 +251,9 @@ function buildStoryGroups(events: TraceEventSummary[]): StoryGroup[] {
 
   return Array.from(groups.entries())
     .map(([key, bucket]) => {
-      const passIndex = bucket.find((event) => typeof event.pass_index === 'number')?.pass_index;
+      const passIndex = bucket.find(
+        (event) => typeof event.pass_index === 'number',
+      )?.pass_index;
       const stageLabels = Array.from(
         new Set(
           bucket
@@ -176,10 +261,16 @@ function buildStoryGroups(events: TraceEventSummary[]): StoryGroup[] {
             .filter((value): value is string => Boolean(value)),
         ),
       );
-      const lines = bucket.map((event) => describeTraceEvent(event)).filter(Boolean);
+      const lines = bucket
+        .map((event) => describeTraceEvent(event))
+        .filter(Boolean);
       const responseEvent =
-        [...bucket].reverse().find((event) => event.event_type === 'assistant_response') ||
-        [...bucket].reverse().find((event) => event.event_type === 'verification_warning') ||
+        [...bucket]
+          .reverse()
+          .find((event) => event.event_type === 'assistant_response') ||
+        [...bucket]
+          .reverse()
+          .find((event) => event.event_type === 'verification_warning') ||
         bucket[bucket.length - 1];
       return {
         id: key,
@@ -569,20 +660,30 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                     onClick={() => setSelectedId(group.dominantEventId)}
                   >
                     <div className='trace-story-top'>
-                      <span className='trace-story-pass'>{group.passLabel}</span>
-                      <span className='trace-story-time'>{formatTime(group.startedAt)}</span>
+                      <span className='trace-story-pass'>
+                        {group.passLabel}
+                      </span>
+                      <span className='trace-story-time'>
+                        {formatTime(group.startedAt)}
+                      </span>
                     </div>
                     <div className='trace-story-headline'>{group.headline}</div>
                     <div className='trace-story-badges'>
                       {group.stageLabels.map((label) => (
-                        <span key={`${group.id}-${label}`} className='trace-story-badge'>
+                        <span
+                          key={`${group.id}-${label}`}
+                          className='trace-story-badge'
+                        >
                           {label}
                         </span>
                       ))}
                     </div>
                     <div className='trace-story-lines'>
                       {group.lines.map((line, index) => (
-                        <div key={`${group.id}-line-${index}`} className='trace-story-line'>
+                        <div
+                          key={`${group.id}-line-${index}`}
+                          className='trace-story-line'
+                        >
                           {line}
                         </div>
                       ))}
@@ -596,7 +697,9 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                     onClick={() => setSelectedId(event.id)}
                   >
                     <div className='trace-row-top'>
-                      <span className='t-type'>{humanizeEventType(event.event_type)}</span>
+                      <span className='t-type'>
+                        {humanizeEventType(event.event_type)}
+                      </span>
                       <span className='t-time'>{formatTime(event.ts)}</span>
                     </div>
                     <div className='trace-row-meta'>
@@ -609,7 +712,9 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                       <span>{formatBytes(event.size_bytes || 0)}</span>
                       <span>{event.payload_ref ? 'blob' : 'inline'}</span>
                     </div>
-                    <div className='trace-row-preview'>{describeTraceEvent(event)}</div>
+                    <div className='trace-row-preview'>
+                      {describeTraceEvent(event)}
+                    </div>
                   </button>
                 ))}
           </div>

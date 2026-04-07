@@ -179,6 +179,26 @@ const PlanBlock = ({ content }: { content: string }) => {
   );
 };
 
+const TensionBlock = ({ content }: { content: string }) => {
+  const [expanded, setExpanded] = useState(true);
+  return (
+    <div className={`nova-plan expanded tension`}>
+      <button
+        className='nova-plan-head'
+        onClick={() => setExpanded((prev) => !prev)}
+      >
+        <span>Contradiction / Tension</span>
+        <span>{expanded ? '▴' : '▾'}</span>
+      </button>
+      {expanded ? (
+        <div className='nova-plan-body'>
+          <RichContentViewer content={content} />
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
 function App() {
   const agent = useAgent();
   const [inputText, setInputText] = useState('');
@@ -187,7 +207,9 @@ function App() {
     typeof window !== 'undefined' ? window.innerWidth <= 760 : false,
   );
   const [mobileUtilitiesOpen, setMobileUtilitiesOpen] = useState(false);
-  const [mobilePanel, setMobilePanel] = useState<'none' | 'sessions' | 'options'>('none');
+  const [mobilePanel, setMobilePanel] = useState<
+    'none' | 'sessions' | 'options'
+  >('none');
   const [workspaceView, setWorkspaceView] = useState<'chat' | 'monitor'>(() => {
     const saved = localStorage.getItem('nova_workspace_view');
     return saved === 'monitor' ? 'monitor' : 'chat';
@@ -298,7 +320,8 @@ function App() {
                   {session.title || 'New Chat'}
                 </span>
                 <span className='nova-session-meta'>
-                  {session.message_count} msg · {(session.model || '').split(':')[0]}
+                  {session.message_count} msg ·{' '}
+                  {(session.model || '').split(':')[0]}
                 </span>
               </div>
               <span
@@ -319,7 +342,9 @@ function App() {
         <div className='nova-stats-card'>
           <div className='nova-stats-row'>
             <span>Context</span>
-            <span>{agent.contextLines > 0 ? `${agent.contextLines} items` : 'cold'}</span>
+            <span>
+              {agent.contextLines > 0 ? `${agent.contextLines} items` : 'cold'}
+            </span>
           </div>
           <div className='nova-stats-row'>
             <span>Tools</span>
@@ -342,6 +367,8 @@ function App() {
       currentSearchEngine={agent.currentSearchEngine}
       setCurrentSearchEngine={agent.setCurrentSearchEngine}
       models={agent.models}
+      runtimePath={agent.runtimePath}
+      setRuntimePath={agent.setRuntimePath}
       usePlanner={agent.usePlanner}
       setUsePlanner={agent.setUsePlanner}
       loopMode={agent.loopMode}
@@ -423,7 +450,9 @@ function App() {
               />
               <button
                 className={`nova-ghost-btn ${agent.showActorThought ? 'active' : ''}`}
-                onClick={() => agent.setShowActorThought(!agent.showActorThought)}
+                onClick={() =>
+                  agent.setShowActorThought(!agent.showActorThought)
+                }
               >
                 {agent.showActorThought ? 'Reasoning On' : 'Reasoning Off'}
               </button>
@@ -446,7 +475,9 @@ function App() {
 
       {isMobile ? (
         <>
-          <div className={`nova-mobile-tray ${mobileUtilitiesOpen ? 'open' : ''}`}>
+          <div
+            className={`nova-mobile-tray ${mobileUtilitiesOpen ? 'open' : ''}`}
+          >
             <PremiumSelect
               value={agent.currentModel}
               options={agent.models}
@@ -456,7 +487,9 @@ function App() {
             <div className='nova-mobile-tray-actions'>
               <button
                 className={`nova-ghost-btn ${agent.showActorThought ? 'active' : ''}`}
-                onClick={() => agent.setShowActorThought(!agent.showActorThought)}
+                onClick={() =>
+                  agent.setShowActorThought(!agent.showActorThought)
+                }
               >
                 {agent.showActorThought ? 'Reasoning On' : 'Reasoning Off'}
               </button>
@@ -479,7 +512,9 @@ function App() {
               className={mobilePanel === 'sessions' ? 'active' : ''}
               onClick={() => {
                 setSidebarTab('sessions');
-                setMobilePanel((prev) => (prev === 'sessions' ? 'none' : 'sessions'));
+                setMobilePanel((prev) =>
+                  prev === 'sessions' ? 'none' : 'sessions',
+                );
               }}
             >
               Threads
@@ -488,7 +523,9 @@ function App() {
               className={mobilePanel === 'options' ? 'active' : ''}
               onClick={() => {
                 setSidebarTab('options');
-                setMobilePanel((prev) => (prev === 'options' ? 'none' : 'options'));
+                setMobilePanel((prev) =>
+                  prev === 'options' ? 'none' : 'options',
+                );
               }}
             >
               Controls
@@ -503,28 +540,24 @@ function App() {
 
       <div className='nova-body'>
         {!isMobile ? (
-        <aside className='nova-sidebar'>
-          <div className='nova-sidebar-tabs'>
-            <button
-              className={sidebarTab === 'sessions' ? 'active' : ''}
-              onClick={() => setSidebarTab('sessions')}
-            >
-              Sessions
-            </button>
-            <button
-              className={sidebarTab === 'options' ? 'active' : ''}
-              onClick={() => setSidebarTab('options')}
-            >
-              Controls
-            </button>
-          </div>
+          <aside className='nova-sidebar'>
+            <div className='nova-sidebar-tabs'>
+              <button
+                className={sidebarTab === 'sessions' ? 'active' : ''}
+                onClick={() => setSidebarTab('sessions')}
+              >
+                Sessions
+              </button>
+              <button
+                className={sidebarTab === 'options' ? 'active' : ''}
+                onClick={() => setSidebarTab('options')}
+              >
+                Controls
+              </button>
+            </div>
 
-          {sidebarTab === 'sessions' ? (
-            sessionSidebar
-          ) : (
-            controlsSidebar
-          )}
-        </aside>
+            {sidebarTab === 'sessions' ? sessionSidebar : controlsSidebar}
+          </aside>
         ) : null}
 
         <main className='nova-main'>
@@ -535,7 +568,10 @@ function App() {
             />
           ) : (
             <>
-              <section className='nova-conversation' ref={agent.conversationRef}>
+              <section
+                className='nova-conversation'
+                ref={agent.conversationRef}
+              >
                 {agent.messages.length === 0 ? (
                   <div className='nova-conversation-empty'>
                     <h2>Minimal surface, maximum visibility.</h2>
@@ -605,6 +641,13 @@ function App() {
                             case 'plan':
                               return agent.showPlannerLog ? (
                                 <PlanBlock
+                                  key={block.id}
+                                  content={block.content}
+                                />
+                              ) : null;
+                            case 'tension_hint':
+                              return agent.showObserverActivity ? (
+                                <TensionBlock
                                   key={block.id}
                                   content={block.content}
                                 />
@@ -778,7 +821,9 @@ function App() {
 
                   <button
                     className={`nova-send-btn ${agent.isStreaming ? 'nova-stop-btn' : ''}`}
-                    onClick={agent.isStreaming ? agent.stopExecution : handleSend}
+                    onClick={
+                      agent.isStreaming ? agent.stopExecution : handleSend
+                    }
                     disabled={
                       !agent.isStreaming &&
                       !inputText.trim() &&

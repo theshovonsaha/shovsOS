@@ -1,5 +1,6 @@
 from orchestration.agent_profiles import (
     AgentProfile,
+    DEFAULT_AGENT_TOOLS,
     GENERAL_SYSTEM_PROMPT,
     PLATINUM_SYSTEM_PROMPT,
     ProfileManager,
@@ -13,9 +14,13 @@ def test_default_profile_uses_general_prompt(tmp_path):
     default = pm.get("default")
 
     assert default is not None
-    assert default.runtime_kind == "native"
+    assert default.runtime_kind == "managed"
     assert default.system_prompt == GENERAL_SYSTEM_PROMPT
     assert default.system_prompt != PLATINUM_SYSTEM_PROMPT
+    assert default.tools == DEFAULT_AGENT_TOOLS
+    assert "web_search" in default.tools
+    assert "file_create" not in default.tools
+    assert "rag_search" not in default.tools
 
 
 def test_non_visual_profile_is_not_forced_to_platinum_prompt(tmp_path):
@@ -43,12 +48,29 @@ def test_profile_runtime_kind_round_trips(tmp_path):
     profile = AgentProfile(
         id="runtime_test",
         name="Runtime Test",
-        runtime_kind="native",
+        runtime_kind="managed",
         tools=["web_search"],
     )
     pm.create(profile)
 
     stored = pm.get("runtime_test")
+
+    assert stored is not None
+    assert stored.runtime_kind == "managed"
+
+
+def test_profile_runtime_kind_legacy_aliases_normalize(tmp_path):
+    db_path = tmp_path / "agents.db"
+    pm = ProfileManager(db_path=str(db_path))
+    profile = AgentProfile(
+        id="runtime_alias_test",
+        name="Runtime Alias Test",
+        runtime_kind="legacy",
+        tools=["web_search"],
+    )
+    pm.create(profile)
+
+    stored = pm.get("runtime_alias_test")
 
     assert stored is not None
     assert stored.runtime_kind == "native"

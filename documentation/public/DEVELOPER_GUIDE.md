@@ -27,13 +27,23 @@ The runtime already supports:
 
 ### Runtime
 
+- [run_engine/engine.py](/Users/theshovonsaha/Developer/Github/agent/run_engine/engine.py)
+  - managed runtime execution path
+  - phase packet flow, pass ledger writes, and verification-gated memory commit
+
 - [engine/core.py](/Users/theshovonsaha/Developer/Github/agent/engine/core.py)
-  - main execution kernel
+  - legacy/native execution kernel
   - prompt construction
   - loop control
   - tool execution
   - follow-up context sanitation
   - model execution profile shaping
+
+Current state:
+- managed runtime is canonical and default (`runtime_kind=managed`)
+- legacy/native runtime remains compatibility-only (`runtime_kind=native`)
+- `/chat/stream` legacy path is env-gated via `ALLOW_LEGACY_CHAT_RUNTIME=true`
+- publish-direction is one canonical runtime contract with legacy reliability preserved behind explicit compatibility controls
 
 - [engine/context_schema.py](/Users/theshovonsaha/Developer/Github/agent/engine/context_schema.py)
   - typed context item model
@@ -232,7 +242,7 @@ Keep them narrow:
 - model
 - tools
 - system prompt
-- runtime behavior
+- runtime behavior (`managed` default; `native` only for compatibility cases)
 - workspace bootstrap docs
 - default loop/context/planner behavior
 

@@ -13,20 +13,24 @@ from typing import Optional, List
 from pydantic import BaseModel, Field
 
 DB_PATH = "agents.db"
+DEFAULT_RUNTIME_KIND = "managed"
+RUNTIME_KIND_ALIASES = {
+    "managed": "managed",
+    "run_engine": "managed",
+    "native": "native",
+    "legacy": "native",
+    "agent_core": "native",
+    "agentcore": "native",
+}
 DEFAULT_AGENT_TOOLS = [
     "web_search",
     "web_fetch",
     "image_search",
-    "bash",
-    "file_create",
-    "file_view",
-    "file_str_replace",
     "weather_fetch",
     "places_search",
     "places_map",
     "store_memory",
     "query_memory",
-    "rag_search",
     "delegate_to_agent",
 ]
 
@@ -51,8 +55,11 @@ GENERAL_SYSTEM_PROMPT = (
     "Core behavior:\n"
     "- Default to clear, direct conversational help.\n"
     "- Use tools only when they materially improve accuracy or complete a concrete task.\n"
+    "- If a tool is listed for this agent, treat it as available in the current runtime. Do not claim you cannot browse, search, fetch, or access a tool when that tool is available.\n"
+    "- For current events, current prices, market moves, news, or anything phrased as latest/current/today, prefer web_search before giving a limitation-only answer.\n"
     "- Do not emit HTML, SVG, app fragments, faux system dashboards, or code blocks unless the user explicitly asks for a visual artifact, file, app, code, or markup.\n"
     "- For greetings, casual chat, and clarification turns, respond in normal plain text.\n"
+    "- Do not create files, scripts, or reports unless the user explicitly asks for a file or artifact.\n"
     "- Never fabricate tool results. Be explicit about uncertainty and limitations.\n"
 )
 
@@ -75,7 +82,7 @@ class AgentProfile(BaseModel):
     owner_id:      Optional[str] = None
     name:          str
     description:   str = ""
-    runtime_kind:  str = "native"
+    runtime_kind:  str = DEFAULT_RUNTIME_KIND
     model:         str = "llama3.2"  # Fallback only
     embed_model:   str = "nomic-embed-text"
     system_prompt: str = GENERAL_SYSTEM_PROMPT
@@ -105,7 +112,7 @@ class ProfileManager:
                     owner_id TEXT,
                     name TEXT,
                     description TEXT,
-                    runtime_kind TEXT DEFAULT 'native',
+                    runtime_kind TEXT DEFAULT 'managed',
                     model TEXT,
                     embed_model TEXT,
                     system_prompt TEXT,
@@ -136,7 +143,7 @@ class ProfileManager:
             except sqlite3.OperationalError:
                 pass
             try:
-                conn.execute("ALTER TABLE agent_profiles ADD COLUMN runtime_kind TEXT DEFAULT 'native'")
+                conn.execute("ALTER TABLE agent_profiles ADD COLUMN runtime_kind TEXT DEFAULT 'managed'")
             except sqlite3.OperationalError:
                 pass
             try:
@@ -163,6 +170,13 @@ class ProfileManager:
                 conn.execute("ALTER TABLE agent_profiles ADD COLUMN default_context_mode TEXT DEFAULT 'v2'")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute(
+                    "UPDATE agent_profiles SET runtime_kind = ? WHERE runtime_kind IS NULL OR TRIM(runtime_kind) = ''",
+                    (DEFAULT_RUNTIME_KIND,),
+                )
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
     def _ensure_default_agent(self):
@@ -182,18 +196,26 @@ class ProfileManager:
             for tool in DEFAULT_AGENT_TOOLS:
                 if tool not in merged_tools:
                     merged_tools.append(tool)
+            tools_changed = merged_tools != existing_default.tools
             prompt_needs_reset = existing_default.system_prompt in {
                 "",
                 "You are a specialized AI assistant.",
                 PLATINUM_SYSTEM_PROMPT,
             }
-            if merged_tools != existing_default.tools:
+            if tools_changed:
                 existing_default.tools = merged_tools
             if prompt_needs_reset:
                 existing_default.system_prompt = GENERAL_SYSTEM_PROMPT
                 if existing_default.name == "shovs Platinum Assistant":
                     existing_default.name = "shovs Assistant"
-            if merged_tools != existing_default.tools or prompt_needs_reset:
+            runtime_kind_changed = existing_default.runtime_kind != DEFAULT_RUNTIME_KIND
+            if runtime_kind_changed:
+                existing_default.runtime_kind = DEFAULT_RUNTIME_KIND
+            if (
+                tools_changed
+                or prompt_needs_reset
+                or runtime_kind_changed
+            ):
                 self.create(existing_default)
 
         # One-time cleanup for profiles that were previously force-upgraded to the app-builder prompt.
@@ -258,6 +280,9 @@ class ProfileManager:
         return p
 
     def _sanitize_profile(self, p: AgentProfile) -> AgentProfile:
+        raw_runtime_kind = str(getattr(p, "runtime_kind", "") or "").strip().lower()
+        runtime_kind = RUNTIME_KIND_ALIASES.get(raw_runtime_kind, DEFAULT_RUNTIME_KIND)
+
         tools = []
         seen_tools = set()
         for tool in p.tools or []:
@@ -302,6 +327,7 @@ class ProfileManager:
         return p.model_copy(update={
             "name": str(p.name or "").strip(),
             "description": str(p.description or "").strip(),
+            "runtime_kind": runtime_kind,
             "system_prompt": system_prompt,
             "tools": tools,
             "workspace_path": workspace_path,
@@ -384,7 +410,10 @@ class ProfileManager:
             owner_id=r["owner_id"] if "owner_id" in r.keys() else None,
             name=r["name"],
             description=r["description"],
-            runtime_kind=r["runtime_kind"] if "runtime_kind" in r.keys() and r["runtime_kind"] else "native",
+            runtime_kind=RUNTIME_KIND_ALIASES.get(
+                str(r["runtime_kind"]).strip().lower(),
+                DEFAULT_RUNTIME_KIND,
+            ) if "runtime_kind" in r.keys() and r["runtime_kind"] else DEFAULT_RUNTIME_KIND,
             model=r["model"],
             embed_model=r["embed_model"] if "embed_model" in r.keys() else "nomic-embed-text",
             system_prompt=r["system_prompt"],

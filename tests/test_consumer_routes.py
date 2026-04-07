@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from api.main import app, consumer_agent_manager, consumer_session_manager, profile_manager
+from api.main import app, consumer_run_engine, consumer_session_manager, profile_manager
 
 
 def test_consumer_profile_is_seeded_with_plain_language_defaults():
@@ -9,7 +9,7 @@ def test_consumer_profile_is_seeded_with_plain_language_defaults():
 
         assert profile is not None
         assert profile.id == "consumer"
-        assert profile.default_use_planner is False
+        assert profile.default_use_planner is True
         assert profile.default_loop_mode == "auto"
         assert "query_memory" in profile.tools
 
@@ -32,21 +32,19 @@ def test_consumer_session_route_creates_consumer_scoped_session():
     assert session.agent_id == "consumer"
 
 
-def test_consumer_chat_stream_uses_consumer_agent_contract(monkeypatch):
+def test_consumer_chat_stream_uses_managed_run_engine_contract(monkeypatch):
     seen: dict[str, object] = {}
 
-    class FakeAgent:
-        async def chat_stream(self, **kwargs):
-            seen.update(kwargs)
-            yield {"type": "session", "session_id": "consumer-session", "run_id": "run-1"}
-            yield {"type": "token", "content": "Hello from consumer."}
+    async def fake_stream(request):
+        seen["request"] = request
+        yield {"type": "session", "session_id": request.session_id, "run_id": "run-1"}
+        yield {"type": "plan", "strategy": "Use web search", "tools": ["web_search"], "confidence": 0.9}
+        yield {"type": "tool_call", "tool_name": "web_search", "arguments": {"query": "hello"}}
+        yield {"type": "tool_result", "tool_name": "web_search", "success": True, "content": "ok"}
+        yield {"type": "token", "content": "Hello from consumer."}
+        yield {"type": "done", "session_id": request.session_id, "run_id": "run-1"}
 
-    def fake_get_agent_instance(agent_id: str, owner_id: str | None = None):
-        seen["requested_agent_id"] = agent_id
-        seen["owner_id"] = owner_id
-        return FakeAgent()
-
-    monkeypatch.setattr(consumer_agent_manager, "get_agent_instance", fake_get_agent_instance)
+    monkeypatch.setattr(consumer_run_engine, "stream", fake_stream)
 
     client = TestClient(app)
     response = client.post(
@@ -55,9 +53,11 @@ def test_consumer_chat_stream_uses_consumer_agent_contract(monkeypatch):
     )
 
     assert response.status_code == 200
-    assert seen["requested_agent_id"] == "consumer"
-    assert seen["agent_id"] == "consumer"
-    assert seen["use_planner"] is False
-    assert seen["loop_mode"] == "single"
-    assert "consumer-session" in response.text
+    request = seen["request"]
+    assert request.agent_id == "consumer"
+    assert request.owner_id == "consumer-chat-owner"
+    assert request.use_planner is True
+    assert "query_memory" in request.allowed_tools
     assert "Hello from consumer." in response.text
+    assert '"phase": "working"' in response.text
+    assert '"type": "done"' in response.text

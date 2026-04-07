@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from config.trace_store import TraceStore, get_trace_store
+from engine.candidate_signals import parse_candidate_context
 from memory.semantic_graph import SemanticGraph
 
 
@@ -11,26 +12,8 @@ MEMORY_SIGNAL_TYPES = {
     "memory_fact_filter",
     "facts_indexed",
     "memory_write_policy",
+    "stance_signals_extracted",
 }
-
-
-def _candidate_signals(candidate_context: str) -> list[dict[str, str]]:
-    signals: list[dict[str, str]] = []
-    for raw_line in (candidate_context or "").splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        cleaned = line[2:] if line.startswith("- ") else line
-        reason = "under_review"
-        text = cleaned
-        if "(reason=" in cleaned and cleaned.endswith(")"):
-            text, _, reason_part = cleaned.rpartition("(reason=")
-            text = text.rstrip()
-            reason = reason_part[:-1].strip() or reason
-        if text.lower().startswith("candidate:"):
-            text = text[len("candidate:"):].strip()
-        signals.append({"text": text, "reason": reason})
-    return signals
 
 
 def _summarize_memory_signal(event: dict) -> Optional[dict[str, object]]:
@@ -84,6 +67,17 @@ def _summarize_memory_signal(event: dict) -> Optional[dict[str, object]]:
             ),
             "created_at": event.get("iso_ts"),
         }
+    if event_type == "stance_signals_extracted":
+        signals = list(data.get("signals") or [])[:6]
+        if not signals:
+            return None
+        return {
+            "event_type": event_type,
+            "label": "Stance extractor",
+            "summary": f"Captured {len(signals)} stance candidate{'s' if len(signals) != 1 else ''} for later drift checks.",
+            "signals": signals,
+            "created_at": event.get("iso_ts"),
+        }
     return None
 
 
@@ -101,7 +95,10 @@ def build_session_memory_payload(
     timeline = graph.list_temporal_facts(session.id, owner_id=owner_id, limit=40)
     current_facts = [item for item in timeline if item.get("status") == "current"]
     superseded_facts = [item for item in timeline if item.get("status") == "superseded"]
-    candidate_signals = _candidate_signals(getattr(session, "candidate_context", "") or "")
+    candidate_signals = list(getattr(session, "candidate_signals", []) or [])
+    if not candidate_signals:
+        candidate_signals = parse_candidate_context(getattr(session, "candidate_context", "") or "")
+    stance_signals = [item for item in candidate_signals if str(item.get("signal_type") or "") == "stance"]
 
     recent_events = trace_store.list_events(
         limit=160,
@@ -130,17 +127,20 @@ def build_session_memory_payload(
             "deterministic_fact_count": len(current_facts),
             "superseded_fact_count": len(superseded_facts),
             "candidate_signal_count": len(candidate_signals),
+            "stance_signal_count": len(stance_signals),
             "context_line_count": len(compressed_preview),
             "memory_signal_count": len(memory_signals),
         },
         "deterministic_facts": current_facts,
         "superseded_facts": superseded_facts,
         "candidate_signals": candidate_signals,
+        "stance_signals": stance_signals,
         "context_preview": compressed_preview,
         "recent_memory_signals": memory_signals,
         "explanation": [
             "Trusted facts are treated as true and override older memory.",
             "Superseded facts stay visible for audit, but they are no longer active.",
             "Candidate signals are stored separately until the system has stronger grounding.",
+            "Stance signals track durable user positions and can trigger drift checks without becoming hard facts automatically.",
         ],
     }

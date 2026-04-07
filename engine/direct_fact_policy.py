@@ -18,6 +18,12 @@ def direct_fact_predicates(query: str) -> set[str]:
         predicates.add("package_manager")
     if any(token in q for token in ("primary language", "main language", "language do i use", "what language")):
         predicates.add("primary_language")
+    if any(token in q for token in ("verbosity", "concise", "detailed", "brief response", "response style")):
+        predicates.add("response_verbosity")
+    if any(token in q for token in ("operating system", "os do i use", "what os", "windows", "linux", "macos", "mac")):
+        predicates.add("operating_system")
+    if any(token in q for token in ("pronouns", "my pronoun", "what pronouns do i use")):
+        predicates.add("pronouns")
     return predicates
 
 

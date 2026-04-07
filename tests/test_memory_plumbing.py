@@ -225,7 +225,8 @@ def test_direct_fact_memory_guard_prefers_trusted_facts_over_tools():
 
 def test_deterministic_fact_extractor_supports_more_user_preferences():
     facts, voids = extract_user_stated_fact_updates(
-        "My timezone is EST. I use Cursor. My package manager is pnpm. My primary language is TypeScript."
+        "My timezone is EST. I use Cursor. My package manager is pnpm. "
+        "My primary language is TypeScript. I prefer concise responses. I am on Linux. My pronouns are he/him."
     )
 
     assert voids == []
@@ -234,6 +235,9 @@ def test_deterministic_fact_extractor_supports_more_user_preferences():
     assert ("preferred_editor", "Cursor") in pairs
     assert ("package_manager", "pnpm") in pairs
     assert ("primary_language", "TypeScript") in pairs
+    assert ("response_verbosity", "concise") in pairs
+    assert ("operating_system", "Linux") in pairs
+    assert ("pronouns", "he/him") in pairs
 
 
 def test_direct_fact_memory_guard_supports_preference_queries_beyond_name_and_location():
@@ -242,12 +246,18 @@ def test_direct_fact_memory_guard_supports_preference_queries_beyond_name_and_lo
         ("User", "preferred_editor", "Cursor"),
         ("User", "package_manager", "pnpm"),
         ("User", "primary_language", "TypeScript"),
+        ("User", "response_verbosity", "concise"),
+        ("User", "operating_system", "Linux"),
+        ("User", "pronouns", "he/him"),
     ]
 
     assert should_answer_direct_fact_from_memory("What is my timezone?", current_facts) is True
     assert should_answer_direct_fact_from_memory("Which editor do I use?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What package manager do I use?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What is my primary language?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What response style do I prefer?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What operating system do I use?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What are my pronouns?", current_facts) is True
 
 
 def test_finalize_compression_fact_records_blocks_alias_noise_after_grounding():

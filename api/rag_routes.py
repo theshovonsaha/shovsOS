@@ -23,6 +23,7 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 
 from memory.session_rag import get_session_rag, cleanup_session_rag
+from api.owner import require_owner_id
 
 
 # ── Supported file types ───────────────────────────────────────────────────────
@@ -75,12 +76,7 @@ class SearchRequest(BaseModel):
 
 def make_rag_router() -> APIRouter:
     router = APIRouter(tags=["rag"])
-
-    def _require_owner_id(owner_id: Optional[str]) -> str:
-        normalized = (owner_id or "").strip()
-        if not normalized:
-            raise HTTPException(status_code=400, detail="owner_id is required")
-        return normalized
+    _require_owner_id = require_owner_id
 
     @router.post("/{session_id}/upload")
     async def upload_to_rag(

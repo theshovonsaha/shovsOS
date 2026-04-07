@@ -55,6 +55,28 @@ _LANGUAGE_PATTERNS = [
     re.compile(r"\bi primarily use (?P<value>[^.!?\n]+)(?:\s+for coding|\s+at work|\s*$|[.!?,])", re.IGNORECASE),
 ]
 
+_RESPONSE_VERBOSITY_PATTERNS = [
+    re.compile(
+        r"\b(?:i (?:prefer|want)|please keep|keep|be)\s+(?:your\s+)?(?:responses?|answers?)?\s*(?P<value>concise|brief|short|detailed|verbose|in depth|in-depth)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:i like)\s+(?P<value>concise|brief|short|detailed|verbose|in depth|in-depth)\s+(?:responses?|answers?)\b",
+        re.IGNORECASE,
+    ),
+]
+
+_OS_PATTERNS = [
+    re.compile(r"\bi use (?P<value>macos|mac os|os x|mac|windows|linux)\b", re.IGNORECASE),
+    re.compile(r"\bi(?:'m| am) on (?P<value>macos|mac os|os x|mac|windows|linux)\b", re.IGNORECASE),
+    re.compile(r"\bmy (?:os|operating system) is (?P<value>macos|mac os|os x|mac|windows|linux)\b", re.IGNORECASE),
+]
+
+_PRONOUN_PATTERNS = [
+    re.compile(r"\bmy pronouns are (?P<value>[a-z]+/[a-z]+(?:/[a-z]+)?)\b", re.IGNORECASE),
+    re.compile(r"\bi use (?P<value>[a-z]+/[a-z]+(?:/[a-z]+)?) pronouns\b", re.IGNORECASE),
+]
+
 _SPLIT_TRAILING_RE = re.compile(r"\b(?:but|and|because|so|what|where|who|please)\b", re.IGNORECASE)
 _TRAILING_LOCATION_NOISE_RE = re.compile(r"(?:\s+(?:now|currently|today|instead|actually|too))+$", re.IGNORECASE)
 _TRAILING_NAME_NOISE_RE = re.compile(r"(?:\s+(?:now|currently|today|instead|actually|too))+$", re.IGNORECASE)
@@ -138,6 +160,33 @@ def _clean_package_manager(raw: str) -> str:
 def _clean_language(raw: str) -> str:
     value = _clean_generic_value(raw).lower()
     return _LANGUAGE_NORMALIZATION.get(value, "")
+
+
+def _clean_response_verbosity(raw: str) -> str:
+    value = _clean_generic_value(raw).lower()
+    if value in {"concise", "brief", "short"}:
+        return "concise"
+    if value in {"detailed", "verbose", "in depth", "in-depth"}:
+        return "detailed"
+    return ""
+
+
+def _clean_operating_system(raw: str) -> str:
+    value = _clean_generic_value(raw).lower()
+    if value in {"macos", "mac os", "os x", "mac"}:
+        return "macOS"
+    if value == "windows":
+        return "Windows"
+    if value == "linux":
+        return "Linux"
+    return ""
+
+
+def _clean_pronouns(raw: str) -> str:
+    value = _clean_generic_value(raw).lower().replace(" ", "")
+    if re.fullmatch(r"[a-z]+/[a-z]+(?:/[a-z]+)?", value):
+        return value
+    return ""
 
 
 def _build_fact(subject: str, predicate: str, object_: str) -> dict:
@@ -244,6 +293,30 @@ def extract_user_stated_fact_updates(
             value = _clean_language(match.group("value"))
             if value:
                 extracted.append(_build_fact("User", "primary_language", value))
+            break
+
+    for pattern in _RESPONSE_VERBOSITY_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_response_verbosity(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "response_verbosity", value))
+            break
+
+    for pattern in _OS_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_operating_system(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "operating_system", value))
+            break
+
+    for pattern in _PRONOUN_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_pronouns(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "pronouns", value))
             break
 
     current_index: dict[tuple[str, str], set[str]] = {}

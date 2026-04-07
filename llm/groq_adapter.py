@@ -58,7 +58,24 @@ class GroqLLMAdapter(BaseLLMAdapter):
         for i, delay in enumerate(RETRY_DELAYS):
             try:
                 resp = await client.chat.completions.create(**kwargs)
-                return resp.choices[0].message.content or ""
+                msg = resp.choices[0].message
+                # When the model responds with native tool calls,
+                # serialize them so extract_tool_call() can parse downstream.
+                if msg.tool_calls:
+                    import json as _json
+                    normalized = []
+                    for tc in msg.tool_calls:
+                        fn = tc.function
+                        normalized.append({
+                            "type": "function",
+                            "function": {
+                                "name": fn.name or "",
+                                "arguments": fn.arguments or "{}",
+                            },
+                        })
+                    if normalized:
+                        return _json.dumps({"tool_calls": normalized})
+                return msg.content or ""
             except Exception as e:
                 last_err = e
                 if i < len(RETRY_DELAYS) - 1:

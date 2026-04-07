@@ -1,6 +1,6 @@
 # Shovs LLM OS
 
-Shovs LLM OS is a local-first, open-source Language OS for building and running stateful AI systems with explicit execution control.
+Shovs LLM OS is a local-first, open-source control center for autonomous agents.
 
 It is not just a chatbot shell or a prompt wrapper. It is a runtime with:
 - phase-aware context compilation
@@ -10,6 +10,22 @@ It is not just a chatbot shell or a prompt wrapper. It is a runtime with:
 - local and cloud model adapters
 - Nova and consumer planes on top of the same kernel
 - agent-builder controls for composing stronger agents without changing the kernel
+
+## Human Control Center + Agent Body
+
+Shovs is designed as:
+- a human control center (`frontend_nova`) for planning, inspection, intervention, and audits
+- a consumer plane (`frontend_consumer`) for clean end-user interaction
+- an autonomous agent body (runtime, tools, memory, and orchestration) that executes work
+
+The project currently runs with one canonical execution center:
+- managed path: `run_engine/engine.py` (default)
+
+Compatibility path (optional):
+- legacy-native path: `engine/core.py`
+- enabled only when `ALLOW_LEGACY_CHAT_RUNTIME=true` and `runtime_path=legacy`
+
+The open-source direction is explicit convergence to one canonical runtime contract while preserving proven reliability behaviors behind controlled compatibility flags.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)
@@ -26,7 +42,7 @@ The core idea is:
 - compile only the context needed for the current phase
 - serialize back into language only when the model actually needs it
 
-That is the basis of the "Language OS" claim.
+That is the basis of the "Language OS" claim and the control-center product direction.
 
 Read the public vision document: [documentation/public/VISION.md](documentation/public/VISION.md)
 
@@ -118,9 +134,11 @@ Each turn can produce:
 - vector memory
 - session RAG
 - task tracker
+- unified memory retrieval lane for semantic graph + deterministic session facts + vector anchors
 - `shovs-memory` facade for deterministic fact writes, semantic retrieval, and inspectable memory state
 - runtime embed-model propagation into memory tools
 - provider-aware embedding transport for Ollama, LM Studio, llama.cpp, and OpenAI-compatible runners
+- memory benchmark harness + owner-scoped benchmark snapshots (`/memory/benchmark/run`, `/memory/benchmark/latest`)
 - context-engine variants:
   - V1 linear durable memory
   - V2 convergent context
@@ -175,7 +193,8 @@ graph TB
     end
 
     subgraph OS["Shovs Runtime Kernel"]
-        CORE["AgentCore"]
+        RUNENGINE["RunEngine (Managed Runtime)"]
+        LEGACY["AgentCore (Legacy Runtime)"]
         ORCH["AgenticOrchestrator"]
         SESS["SessionManager"]
         RUNS["RunStore"]
@@ -211,6 +230,23 @@ graph TB
     OS --> LOOP
     LOOP --> STATE
     OS --> PROVIDERS
+```
+
+## Connection Map (ASCII)
+
+```text
+User/UI
+  --> FastAPI routes (`/chat/stream`, `/consumer/chat/stream`)
+    --> RunEngine (canonical runtime)
+      --> plan -> act -> observe -> verify -> commit
+      --> ToolRegistry {web_search|web_fetch|memory|delegate|...}
+      --> SessionManager + Semantic/Vector Memory
+      --> RunStore + TraceStore (checkpoints, artifacts, evals)
+      --> AdapterFactory (Ollama|LM Studio|OpenAI|Groq|...)
+
+Legacy compatibility (opt-in)
+  `/chat/stream` + `runtime_path=legacy`
+    --> AgentCore (`engine/core.py`)
 ```
 
 ## Repository Map
@@ -357,11 +393,28 @@ If the runtime can make small models coherent, larger models benefit even more.
 
 ## Public Docs
 
-- [Setup](/Users//Developer/Github/agent/documentation/public/SETUP.md)
-- [Developer Guide](/Users//Developer/Github/agent/documentation/public/DEVELOPER_GUIDE.md)
-- [Features and Roadmap](/Users//Developer/Github/agent/documentation/public/FEATURES_AND_ROADMAP.md)
-- [Contributing](/Users//Developer/Github/agent/documentation/public/CONTRIBUTING.md)
-- [Security](/Users//Developer/Github/agent/documentation/public/SECURITY.md)
+- [Setup](documentation/public/SETUP.md)
+- [Vision](documentation/public/VISION.md)
+- [Developer Guide](documentation/public/DEVELOPER_GUIDE.md)
+- [Features and Roadmap](documentation/public/FEATURES_AND_ROADMAP.md)
+- [Memory](documentation/public/SHOVS_MEMORY.md)
+- [Contributing](CONTRIBUTING.md)
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security](SECURITY.md)
+- [Support](SUPPORT.md)
+- [Architecture](ARCHITECTURE.md)
+- [Governance](GOVERNANCE.md)
+- [Roadmap](ROADMAP.md)
+- [Evaluation](EVALUATION.md)
+
+## Open Source Readiness
+
+This repository is being prepared for public scrutiny with:
+- explicit architecture and governance documents
+- contribution, conduct, support, and security policies at the repo root
+- issue and PR templates for reproducible collaboration
+- CI checks aligned to the real frontend/backend layout
+- a convergence roadmap that tracks runtime unification without rewriting history
 
 ## Project Status
 

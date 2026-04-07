@@ -20,9 +20,20 @@ from engine.context_engine  import ContextEngine
 from engine.context_engine_v2 import ContextEngineV2
 from engine.context_engine_v3 import ContextEngineV3
 from engine.context_compiler import compile_context_items
+from engine.candidate_signals import extract_stance_signals
+from engine.context_memory_items import build_context_engine_memory_items
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from engine.compression_fact_policy import finalize_compression_fact_records
+from engine.conversation_tension import ConversationTension, analyze_conversation_tension, render_conversation_tension
 from engine.direct_fact_policy import should_answer_direct_fact_from_memory
+from engine.tool_contract import (
+    canonical_tool_call,
+    clip_text,
+    is_retry_sensitive_tool as shared_is_retry_sensitive_tool,
+    summarize_arguments as summarize_tool_arguments,
+    summarize_tool_results,
+    tool_call_signature as shared_tool_call_signature,
+)
 from engine.deterministic_facts import (
     extract_user_stated_fact_updates,
     is_redundant_user_alias_text,
@@ -37,6 +48,16 @@ from memory.vector_engine   import VectorEngine
 from memory.semantic_graph  import SemanticGraph
 from llm.adapter_factory    import create_adapter, strip_provider_prefix
 from engine.circuit_breaker import CircuitBreaker
+from run_engine.evidence_lane import (
+    build_evidence_priority_reminder as shared_build_evidence_priority_reminder,
+    build_working_evidence_block,
+    build_working_evidence_snapshot,
+    extract_exact_query_targets as shared_extract_exact_query_targets,
+    select_working_evidence as shared_select_working_evidence,
+    tool_kind_priority as shared_tool_kind_priority,
+    tool_result_matches_exact_target as shared_tool_result_matches_exact_target,
+)
+from run_engine.memory_pipeline import apply_memory_commit, build_deterministic_memory_commit, plan_memory_commit
 from orchestration.orchestrator import AgenticOrchestrator
 from config.config          import cfg
 from config.logger          import log
@@ -81,7 +102,7 @@ MEMORY_QUERY_RE = re.compile(
 )
 URL_QUERY_RE = re.compile(r"https?://", re.IGNORECASE)
 MULTISTEP_QUERY_RE = re.compile(
-    r"\b(then|after that|afterwards|step by step|plan|research|summarize|save|write|create|build|compare|analyze|fix|implement)\b",
+    r"\b(then|after that|afterwards|step by step|plan|research|summarize|save|write|create|build|compare|analyze|fix|implement|search|fetch|look up|lookup|gather|find|investigate|intel)\b",
     re.IGNORECASE,
 )
 DIRECT_FACT_QUERY_RE = re.compile(
@@ -358,11 +379,14 @@ Core Directives:
 - CURRENT TURN FIRST: The latest user objective is the primary source of truth for this response. Use memory/history to support the current turn, not to override it.
 - EXECUTION DISCIPLINE: Either perform the next step or answer the user. Do not narrate hidden plans, packet names, schemas, or internal execution state.
 - TOOL CALLS: When a tool is materially needed, output ONLY one valid JSON tool call: {"tool": "<name>", "arguments": {<args>}}. No markdown. No preamble. No extra text.
+- TOOL REALITY: If a tool is present in the runtime or forced by policy, treat it as actually available. Do not claim you cannot browse, search, fetch, or use tools when the current turn allows those tools.
 - QUERY FIDELITY: Preserve exact entities, domains, URLs, file names, tickers, and user-supplied keywords unless verified evidence justifies a change. Do not silently rename or broaden the target.
 - RESPONSES: Default to normal plain text. Do not output HTML, SVG, app fragments, dashboards, faux logs, or code blocks unless the user explicitly asks for a visual artifact, file, app, code, or markup.
 - ACCURACY: Never fabricate tool results, files, searches, completed work, or prior execution.
 - EVIDENCE USE: If the runtime says evidence is already gathered or tools are disabled, synthesize directly from that evidence. Do not mention internal packets, reminders, planner strategy, or observation state.
+- CURRENT INFO RULE: For latest/current/today/news/prices/stocks/market questions, prefer web_search when available before falling back to a limitation-only answer.
 - WEB FETCH RULE: Only call web_fetch with URLs that already appeared in a prior web_search result in this conversation. Never invent or guess URLs.
+- ARTIFACT DISCIPLINE: Do not create files, scripts, or reports unless the user explicitly asked for an artifact.
 - DELEGATION: Use `delegate_to_agent` only when a specialized agent is clearly a better fit than continuing inside the current run.
 """
 
@@ -585,9 +609,9 @@ def _build_retrieval_policy(route_type: str, force_memory: bool = False) -> dict
         })
     elif route_type == "direct_fact":
         policy.update({
-            "should_retrieve": False,
-            "use_vector": False,
-            "use_graph": False,
+            "should_retrieve": True,
+            "use_vector": True,
+            "use_graph": True,
             "use_session_rag": False,
             "top_n": max(1, int(getattr(cfg, "RETRIEVAL_TOP_K_FACT", 4))),
         })
@@ -803,14 +827,7 @@ def _merge_candidate_context(existing: str, blocked_records: list[dict]) -> str:
 
 
 def _tool_result_previews(tool_results: list[dict[str, Any]], limit: int = 4) -> list[dict[str, Any]]:
-    previews: list[dict[str, Any]] = []
-    for item in (tool_results or [])[:limit]:
-        previews.append({
-            "tool_name": item.get("tool_name"),
-            "success": bool(item.get("success")),
-            "preview": str(item.get("content") or item.get("preview") or "")[:220],
-        })
-    return previews
+    return summarize_tool_results(list(tool_results or [])[:limit], limit=limit, preview_chars=220)
 
 
 def _checkpoint_candidate_facts(checkpoint: Optional[LoopCheckpoint]) -> list[str]:
@@ -826,12 +843,18 @@ def _checkpoint_candidate_facts(checkpoint: Optional[LoopCheckpoint]) -> list[st
 def _build_followup_evidence_packet(
     tool_results: list[dict[str, Any]],
     *,
+    user_message: str,
     max_results: int = 4,
     max_total_chars: int = 1800,
 ) -> str:
+    selected_results = shared_select_working_evidence(
+        tool_results,
+        user_message=user_message,
+        max_results=max_results,
+    )
     sections: list[str] = []
     used = 0
-    for item in (tool_results or [])[:max_results]:
+    for item in selected_results:
         tool_name = str(item.get("tool_name") or "unknown")
         success = "ok" if item.get("success") else "failed"
         preview = _compact_tool_result_for_followup(tool_name, str(item.get("content") or ""))
@@ -854,40 +877,15 @@ def _build_followup_evidence_packet(
 
 
 def _extract_exact_query_targets(user_message: str) -> list[str]:
-    text = (user_message or "").lower()
-    targets = re.findall(r"\b[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\b", text)
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for target in targets:
-        normalized = target.strip().lower()
-        if normalized and normalized not in seen:
-            ordered.append(normalized)
-            seen.add(normalized)
-    return ordered
+    return shared_extract_exact_query_targets(user_message)
 
 
 def _tool_result_matches_exact_target(item: dict[str, Any], exact_targets: list[str]) -> bool:
-    if not exact_targets:
-        return False
-    haystacks = [
-        str(item.get("content") or "").lower(),
-        json.dumps(item.get("arguments") or {}, ensure_ascii=False).lower(),
-    ]
-    return any(target in haystack for target in exact_targets for haystack in haystacks)
+    return shared_tool_result_matches_exact_target(item, exact_targets)
 
 
 def _tool_kind_priority(tool_name: str) -> int:
-    priority = {
-        "web_fetch": 0,
-        "file_view": 1,
-        "web_search": 2,
-        "image_search": 3,
-        "query_memory": 5,
-        "todo_update": 6,
-        "todo_write": 7,
-        "store_memory": 8,
-    }
-    return priority.get(tool_name, 4)
+    return shared_tool_kind_priority(tool_name)
 
 
 def _select_followup_tool_results(
@@ -896,52 +894,11 @@ def _select_followup_tool_results(
     user_message: str,
     max_results: int = 4,
 ) -> list[dict[str, Any]]:
-    if not tool_results:
-        return []
-
-    exact_targets = _extract_exact_query_targets(user_message)
-    scored: list[tuple[tuple[int, int, int, int], int, dict[str, Any]]] = []
-    for idx, item in enumerate(tool_results):
-        tool_name = str(item.get("tool_name") or "unknown")
-        success = bool(item.get("success"))
-        substantive = tool_name not in {"todo_write", "todo_update", "query_memory", "store_memory"}
-        exact_match = _tool_result_matches_exact_target(item, exact_targets)
-        score = (
-            0 if success else 1,
-            0 if substantive else 1,
-            0 if exact_match else 1,
-            _tool_kind_priority(tool_name),
-        )
-        scored.append((score, idx, item))
-
-    scored.sort(key=lambda row: (row[0], -row[1]))
-
-    selected: list[dict[str, Any]] = []
-    seen_signatures: set[tuple[str, str]] = set()
-    for _, _, item in scored:
-        tool_name = str(item.get("tool_name") or "unknown")
-        preview = _compact_tool_result_for_followup(tool_name, str(item.get("content") or ""))
-        signature = (tool_name, preview[:180])
-        if signature in seen_signatures:
-            continue
-        selected.append(item)
-        seen_signatures.add(signature)
-        if len(selected) >= max_results:
-            break
-
-    if any(bool(item.get("success")) for item in selected) and len(selected) < max_results:
-        latest_failure = next(
-            (item for item in reversed(tool_results) if not bool(item.get("success"))),
-            None,
-        )
-        if latest_failure:
-            tool_name = str(latest_failure.get("tool_name") or "unknown")
-            preview = _compact_tool_result_for_followup(tool_name, str(latest_failure.get("content") or ""))
-            signature = (tool_name, preview[:180])
-            if signature not in seen_signatures:
-                selected.append(latest_failure)
-
-    return selected
+    return shared_select_working_evidence(
+        tool_results,
+        user_message=user_message,
+        max_results=max_results,
+    )
 
 
 def _dedupe_tool_names(tool_names: Optional[list[str]]) -> list[str]:
@@ -1345,20 +1302,10 @@ def _normalize_loop_mode(
     return requested, effective
 
 def _tool_call_signature(tool_name: str, arguments: dict[str, Any]) -> str:
-    try:
-        return json.dumps(
-            {
-                "tool": str(tool_name or ""),
-                "arguments": arguments or {},
-            },
-            sort_keys=True,
-            default=str,
-        )
-    except Exception:
-        return f"{tool_name}:{repr(arguments)}"
+    return shared_tool_call_signature(tool_name, arguments)
 
 def _is_retry_sensitive_tool(tool_name: str) -> bool:
-    return str(tool_name or "").lower() in {"web_search", "web_fetch"}
+    return shared_is_retry_sensitive_tool(tool_name)
 
 def _looks_like_tool_instability(tool_name: str, content: str) -> bool:
     text = str(content or "").lower()
@@ -1705,9 +1652,33 @@ class AgentCore:
             is_correction_turn = _is_correction_turn(user_message)
 
             current_facts = self.graph.get_current_facts(sid, owner_id=owner_id)
+            stance_signals = extract_stance_signals(
+                user_message,
+                turn_index=int(getattr(session, "message_count", 0) or 0),
+            )
+            if stance_signals:
+                trace_event("stance_signals_extracted", {
+                    "count": len(stance_signals),
+                    "signals": [
+                        {
+                            "topic": item.get("topic"),
+                            "position": item.get("position"),
+                            "confidence": item.get("confidence"),
+                        }
+                        for item in stance_signals[:6]
+                    ],
+                })
             anticipated_deterministic_facts, anticipated_deterministic_voids = extract_user_stated_fact_updates(
                 user_message,
                 current_facts=current_facts,
+            )
+            conversation_tension = analyze_conversation_tension(
+                user_message=user_message,
+                current_facts=current_facts,
+                deterministic_keyed_facts=anticipated_deterministic_facts,
+                session_history=list(getattr(session, "full_history", []) or []),
+                candidate_signals=list(getattr(session, "candidate_signals", []) or []),
+                current_stance_signals=stance_signals,
             )
             failed_tools = self.circuit_breaker.get_failed_tools(sid)
             task_tracker = get_session_task_tracker()
@@ -1769,6 +1740,24 @@ class AgentCore:
                 "profile": model_profile,
                 "native_tools": _should_use_native_tools(current_use_adapter, resolved_model),
             })
+            if conversation_tension.summary or conversation_tension.conflicting_facts:
+                trace_event("conversation_tension", {
+                    "summary": conversation_tension.summary,
+                    "notes": conversation_tension.notes,
+                    "challenge_level": conversation_tension.challenge_level,
+                    "should_challenge": conversation_tension.should_challenge,
+                    "drift_detected": conversation_tension.drift_detected,
+                    "conflicting_facts": list(conversation_tension.conflicting_facts),
+                })
+                yield _emit(_ev(
+                    "conversation_tension",
+                    summary=conversation_tension.summary,
+                    notes=conversation_tension.notes,
+                    challenge_level=conversation_tension.challenge_level,
+                    should_challenge=conversation_tension.should_challenge,
+                    drift_detected=conversation_tension.drift_detected,
+                    conflict_count=len(conversation_tension.conflicting_facts),
+                ))
 
             def record_failed_user_turn(note: str = "") -> None:
                 nonlocal failed_turn_recorded
@@ -1828,7 +1817,7 @@ class AgentCore:
                 manager_loop_enabled
                 and not forced_tools
                 and not is_trivial_turn
-                and route_type in {"multi_step", "open_ended"}
+                and route_type in {"multi_step", "open_ended", "direct_fact"}
             )
             if should_call_planner:
                 trace_phase(ContextPhase.PLANNING, "start", route_type=route_type)
@@ -1854,6 +1843,7 @@ class AgentCore:
                     route_type=route_type,
                     ctx_engine=ctx_eng,
                     model_profile=model_profile,
+                    conversation_tension=conversation_tension,
                 )
                 trace_event("phase_context", planning_context)
                 structured_plan = None
@@ -2001,6 +1991,7 @@ class AgentCore:
                     route_type=route_type,
                     ctx_engine=ctx_eng,
                     model_profile=model_profile,
+                    conversation_tension=conversation_tension,
                 )
                 observation_context["phase"] = "observation"
                 trace_event("phase_context", observation_context)
@@ -2116,6 +2107,7 @@ class AgentCore:
                 ctx_engine=ctx_eng,
                 phase=ContextPhase.ACTING,
                 model_profile=model_profile,
+                conversation_tension=conversation_tension,
             )
             if self._last_context_compilation:
                 trace_event("compiled_context", self._last_context_compilation)
@@ -2384,6 +2376,7 @@ class AgentCore:
                 correction_turn=is_correction_turn,
                 route_type=route_type,
                 ctx_engine=ctx_eng,
+                conversation_tension=conversation_tension,
             )
             trace_event("phase_context", verification_context)
             verification = verify_with_context_fn(
@@ -2509,6 +2502,7 @@ class AgentCore:
             route_type=route_type,
             ctx_engine=ctx_eng,
             model_profile=model_profile,
+            conversation_tension=conversation_tension,
         )
         trace_event("phase_context", response_context)
         trace_phase(ContextPhase.RESPONSE, "complete", response_length=len(clean_response))
@@ -2554,12 +2548,14 @@ class AgentCore:
             route_type=route_type,
             ctx_engine=ctx_eng,
             model_profile=model_profile,
+            conversation_tension=conversation_tension,
         )
         trace_event("phase_context", memory_commit_context)
         trace_phase(ContextPhase.MEMORY_COMMIT, "start", should_compress=should_compress)
         keyed_facts = list(deterministic_keyed_facts)
         voids = list(deterministic_voids)
         blocked_keyed_facts: list[dict] = []
+        candidate_signal_count = len(getattr(session, "candidate_signals", []) or [])
         if should_compress:
             yield _emit(_ev("compressing"))
             try:
@@ -2579,7 +2575,7 @@ class AgentCore:
                     compression_target = model or default_fallback
             
                 log("ctx", sid, f"Compressing exchange with {compression_target} (adapter: {adapter_name})...")
-                updated_ctx, compression_keyed_facts, compression_voids = await ctx_eng.compress_exchange(
+                maybe_result = await ctx_eng.compress_exchange(
                     user_message=user_message,
                     assistant_response=clean_response,
                     current_context=session.compressed_context,
@@ -2587,22 +2583,41 @@ class AgentCore:
                     model=compression_target,
                     grounding_text="\n".join(successful_tool_evidence),
                 )
-                compression_keyed_facts, blocked_keyed_facts = finalize_compression_fact_records(
-                    compression_keyed_facts,
+                commit_plan = plan_memory_commit(
+                    context_result=maybe_result,
                     user_message=user_message,
-                    grounding_text="\n".join(successful_tool_evidence),
-                    deterministic_facts=deterministic_keyed_facts,
+                    tool_results=[
+                        {"content": content, "success": True}
+                        for content in successful_tool_evidence
+                    ],
+                    deterministic_keyed_facts=deterministic_keyed_facts,
+                    deterministic_voids=deterministic_voids,
                     current_facts=current_facts,
+                    existing_candidate_signals=list(getattr(session, "candidate_signals", []) or []),
+                    existing_candidate_context=getattr(session, "candidate_context", ""),
+                    new_candidate_signals=stance_signals,
                 )
-                keyed_facts = merge_fact_records(deterministic_keyed_facts, compression_keyed_facts)
-                voids = merge_void_records(deterministic_voids, compression_voids)
-                self.sessions.update_context(sid, updated_ctx)
-                lines = _count_context_items(updated_ctx)
+                outcome = await apply_memory_commit(
+                    sessions=self.sessions,
+                    session_id=sid,
+                    owner_id=owner_id,
+                    agent_id=session.agent_id,
+                    turn=session.message_count,
+                    run_id=run_id,
+                    user_message=user_message,
+                    assistant_response=clean_response,
+                    graph=self.graph,
+                    plan=commit_plan,
+                    current_context=session.compressed_context,
+                )
+                keyed_facts = list(outcome.merged_facts or [])
+                voids = list(outcome.merged_voids or [])
+                blocked_keyed_facts = list(outcome.blocked_keyed_facts or [])
+                lines = outcome.context_lines
+                candidate_signal_count = len(outcome.candidate_signals or [])
                 log("ctx", sid, f"Context updated · {lines} lines · {len(keyed_facts)} new facts, {len(voids)} voids", level="ok")
                 if blocked_keyed_facts:
-                    candidate_context = _merge_candidate_context(session.candidate_context, blocked_keyed_facts)
-                    self.sessions.update_candidate_context(sid, candidate_context)
-                    session.candidate_context = candidate_context
+                    candidate_context = outcome.candidate_context
                     candidate_facts = [
                         str(item.get("fact") or "").strip()
                         for item in blocked_keyed_facts[:6]
@@ -2639,64 +2654,62 @@ class AgentCore:
                         ],
                         "blocked_count": len(blocked_keyed_facts),
                         "candidate_context_lines": len([line for line in candidate_context.splitlines() if line.strip()]),
+                        "candidate_signal_count": candidate_signal_count,
+                    })
+
+                if outcome.graph_error:
+                    log("ctx", sid, f"Database deterministic facts error: {outcome.graph_error}", level="error")
+                if outcome.index_error:
+                    log("rag", sid, f"Fact indexing error: {outcome.index_error}", level="error")
+                elif outcome.indexed_fact_keys:
+                    log("rag", sid, f"Indexed {len(outcome.indexed_fact_keys)} facts into vector store", level="ok")
+                    trace_event("facts_indexed", {
+                        "facts": list(outcome.indexed_fact_keys),
+                        "context_lines": lines,
                     })
 
             except Exception as e:
                 log("ctx", sid, f"Compression/indexing error: {e}", level="error")
                 lines = 0
         else:
-            lines = _count_context_items(session.compressed_context)
+            commit_plan = build_deterministic_memory_commit(
+                deterministic_keyed_facts=deterministic_keyed_facts,
+                deterministic_voids=deterministic_voids,
+                existing_candidate_signals=list(getattr(session, "candidate_signals", []) or []),
+                existing_candidate_context=getattr(session, "candidate_context", ""),
+                user_message=user_message,
+                new_candidate_signals=stance_signals,
+            )
+            outcome = await apply_memory_commit(
+                sessions=self.sessions,
+                session_id=sid,
+                owner_id=owner_id,
+                agent_id=session.agent_id,
+                turn=session.message_count,
+                run_id=run_id,
+                user_message=user_message,
+                assistant_response=clean_response,
+                graph=self.graph,
+                plan=commit_plan,
+                current_context=session.compressed_context,
+            )
+            keyed_facts = list(outcome.merged_facts or [])
+            voids = list(outcome.merged_voids or [])
+            lines = outcome.context_lines
             log("ctx", sid, "Skipping compression for this turn")
-            keyed_facts = merge_fact_records(deterministic_keyed_facts)
-            voids = merge_void_records(deterministic_voids)
+            if outcome.graph_error:
+                log("ctx", sid, f"Database deterministic facts error: {outcome.graph_error}", level="error")
+            if outcome.index_error:
+                log("rag", sid, f"Fact indexing error: {outcome.index_error}", level="error")
+            elif outcome.indexed_fact_keys:
+                log("rag", sid, f"Indexed {len(outcome.indexed_fact_keys)} facts into vector store", level="ok")
+                trace_event("facts_indexed", {
+                    "facts": list(outcome.indexed_fact_keys),
+                    "context_lines": lines,
+                })
 
         if (keyed_facts or voids) and not should_compress:
             log("ctx", sid, f"Persisting deterministic facts without compression · {len(keyed_facts)} facts, {len(voids)} voids")
-
-        if keyed_facts or voids:
-            try:
-                sg = self.graph
-                for void in voids:
-                    sg.void_temporal_fact(
-                        sid,
-                        void["subject"],
-                        void["predicate"],
-                        session.message_count,
-                        owner_id=owner_id,
-                    )
-                    log("ctx", sid, f"Voided fact: {void['subject']} | {void['predicate']}", level="ok")
-                for item in keyed_facts:
-                    if item.get("subject") and item.get("predicate") and item.get("subject") != "General":
-                        sg.add_temporal_fact(
-                            sid,
-                            item["subject"],
-                            item["predicate"],
-                            item.get("object", ""),
-                            session.message_count,
-                            owner_id=owner_id,
-                            run_id=run_id,
-                        )
-            except Exception as e:
-                log("ctx", sid, f"Database deterministic facts error: {e}", level="error")
-
-        if keyed_facts:
-            try:
-                ve = VectorEngine(sid, agent_id=session.agent_id, owner_id=owner_id)
-                anchor_text = f"User: {user_message}\nAssistant: {clean_response}"
-                for item in keyed_facts:
-                    await ve.index(
-                        key=item["key"],
-                        anchor=anchor_text,
-                        metadata={"fact": item["fact"], "run_id": run_id, "owner_id": owner_id or ""},
-                    )
-                log("rag", sid, f"Indexed {len(keyed_facts)} facts into vector store", level="ok")
-
-                trace_event("facts_indexed", {
-                    "facts": [f["key"] for f in keyed_facts],
-                    "context_lines": lines,
-                })
-            except Exception as e:
-                log("rag", sid, f"Fact indexing error: {e}", level="error")
         save_loop_checkpoint(
             "commit",
             tool_turn=loop_checkpoint.tool_turn if loop_checkpoint else 0,
@@ -3436,13 +3449,12 @@ class AgentCore:
                     if search_engine:
                         call.arguments["search_engine"] = search_engine # Inject into kwargs
 
-                args_summary = ", ".join(f"{k}={str(v)[:40]}" for k, v in call.arguments.items())
+                args_summary = summarize_tool_arguments(call.arguments or {})
                 log("tool", sid, f"Calling {call.tool_name}({args_summary})")
+                call_payload = canonical_tool_call(call.tool_name, call.arguments or {})
                 _trace(agent_id or "default", sid, "tool_call", {
                     "turn": tool_turn,
-                    "tool_name": call.tool_name,
-                    "arguments": call.arguments,
-                    "arguments_summary": args_summary,
+                    **call_payload,
                 }, run_id=run_id, owner_id=owner_id)
 
                 yield _ev("tool_running", tool_name=call.tool_name)
@@ -3453,6 +3465,7 @@ class AgentCore:
                     "_run_id": run_id,
                     "_owner_id": owner_id,
                     "_embed_model": getattr(self, "embed_model", "nomic-embed-text"),
+                    "_runtime_path": "legacy",
                 }
                 validation_error = self.tools.validate_tool_call(call)
                 if validation_error:
@@ -3512,10 +3525,12 @@ class AgentCore:
 
                 _trace(agent_id or "default", sid, "tool_result", {
                     "turn": tool_turn,
+                    "tool": call.tool_name,
                     "tool_name": call.tool_name,
                     "success": result.success,
+                    "status": "ok" if result.success else "failed",
                     "content_length": len(result.content),
-                    "content_preview": result.content[:500],
+                    "content_preview": clip_text(result.content, 500),
                 }, run_id=run_id, owner_id=owner_id)
 
                 is_validation_failure = (
@@ -3668,15 +3683,12 @@ class AgentCore:
                 "Either call the next needed tool with one valid JSON tool invocation, or answer the user directly if the evidence is enough. "
                 "Do not repeat tool JSON, schemas, hidden packet names, or internal notes."
             )
-            if any(
-                str(item.get("tool_name") or "") == "web_fetch"
-                and bool(item.get("success"))
-                and _tool_result_matches_exact_target(item, _extract_exact_query_targets(user_message))
-                for item in followup_tool_results
-            ):
-                post_tool_instruction += (
-                    " Prioritize verified exact-domain fetch evidence over noisier search results when deciding what is real, active, or trustworthy."
-                )
+            priority_reminder = shared_build_evidence_priority_reminder(
+                user_message,
+                followup_tool_results,
+            )
+            if priority_reminder:
+                post_tool_instruction += f" {priority_reminder}"
             observation_digest = ""
             use_compact_evidence_packet = callable(observe_step) or model_profile in {
                 "small_local",
@@ -3810,6 +3822,7 @@ class AgentCore:
             evidence_payload = "\n\n".join(combined_results)
             compact_packet = _build_followup_evidence_packet(
                 followup_tool_results,
+                user_message=user_message,
                 max_results=_model_profile_budget(model_profile, "followup_results", 4),
                 max_total_chars=_model_profile_budget(model_profile, "followup_chars", 1800),
             )
@@ -3959,6 +3972,7 @@ class AgentCore:
         direct_fact_memory_only: bool = False,
         ctx_engine: Optional[ContextEngine] = None,
         model_profile: str = "frontier_standard",
+        conversation_tension: Optional[ConversationTension] = None,
     ) -> list[ContextItem]:
         if ctx_engine is None:
             raise RuntimeError(
@@ -4389,6 +4403,31 @@ class AgentCore:
                 )
             )
 
+        tension_content = render_conversation_tension(conversation_tension or ConversationTension())
+        if tension_content:
+            items.append(
+                ContextItem(
+                    item_id="conversation_tension",
+                    kind=ContextKind.WORKING,
+                    title="Conversation Tension",
+                    content=tension_content,
+                    source="runtime",
+                    priority=33,
+                    max_chars=900,
+                    phase_visibility=frozenset({
+                        ContextPhase.PLANNING,
+                        ContextPhase.ACTING,
+                        ContextPhase.RESPONSE,
+                        ContextPhase.VERIFICATION,
+                    }),
+                    trace_id="working:conversation_tension",
+                    provenance={
+                        "challenge_level": (conversation_tension.challenge_level if conversation_tension else "low"),
+                        "drift_detected": bool(conversation_tension.drift_detected) if conversation_tension else False,
+                    },
+                )
+            )
+
         if loop_checkpoint:
             observation_lines = [f"Manager status: {loop_checkpoint.status or 'unknown'}"]
             if loop_checkpoint.strategy:
@@ -4435,6 +4474,43 @@ class AgentCore:
                     },
                 )
             )
+            working_evidence_snapshot = build_working_evidence_snapshot(
+                loop_checkpoint.tool_results or [],
+                user_message=user_message,
+                max_results=3,
+            )
+            working_evidence = build_working_evidence_block(
+                loop_checkpoint.tool_results or [],
+                user_message=user_message,
+                max_results=3,
+                preview_chars=180,
+            )
+            if working_evidence:
+                items.append(
+                    ContextItem(
+                        item_id="working_evidence",
+                        kind=ContextKind.EVIDENCE,
+                        title="Working Evidence",
+                        content=working_evidence,
+                        source="runtime",
+                        priority=23,
+                        max_chars=1200,
+                        phase_visibility=frozenset({
+                            ContextPhase.PLANNING,
+                            ContextPhase.ACTING,
+                            ContextPhase.RESPONSE,
+                            ContextPhase.VERIFICATION,
+                        }),
+                        trace_id="evidence:working_evidence",
+                        provenance={
+                            "objective": user_message.strip(),
+                            "tool_result_count": len(loop_checkpoint.tool_results or []),
+                            "selected_count": len(working_evidence_snapshot.selected),
+                            "substantive_count": working_evidence_snapshot.substantive_count,
+                            "exact_match_count": working_evidence_snapshot.exact_match_count,
+                        },
+                    )
+                )
 
         historical_content = self._build_historical_context_content(
             unified_hits,
@@ -4462,39 +4538,13 @@ class AgentCore:
                 )
             )
 
-        ctx_items = []
-        build_context_items = getattr(ctx_engine, "build_context_items", None)
-        if callable(build_context_items):
-            try:
-                ctx_items = [
-                    item for item in (build_context_items(context) or [])
-                    if isinstance(item, ContextItem)
-                ]
-            except Exception:
-                ctx_items = []
-        if not ctx_items:
-            ctx_block = ctx_engine.build_context_block(context)
-            if ctx_block:
-                ctx_items = [
-                    ContextItem(
-                        item_id="context_engine_memory",
-                        kind=ContextKind.MEMORY,
-                        title="",
-                        content=ctx_block,
-                        source="context_engine",
-                        priority=60,
-                        max_chars=1800,
-                        phase_visibility=frozenset({
-                            ContextPhase.PLANNING,
-                            ContextPhase.ACTING,
-                            ContextPhase.RESPONSE,
-                            ContextPhase.VERIFICATION,
-                        }),
-                        trace_id="memory:context_engine",
-                        provenance={"engine": ctx_engine.__class__.__name__},
-                        formatted=True,
-                    )
-                ]
+        ctx_items = build_context_engine_memory_items(
+            ctx_engine,
+            context,
+            fallback_trace_id="memory:context_engine",
+            fallback_source="context_engine",
+            fallback_provenance={"engine": ctx_engine.__class__.__name__},
+        )
         items.extend(ctx_items)
 
         allowed_tools = set(forced_tools or []) if forced_tools else None
@@ -4539,6 +4589,7 @@ class AgentCore:
         ctx_engine:         Optional[ContextEngine] = None,
         phase:             ContextPhase = ContextPhase.ACTING,
         model_profile:     str = "frontier_standard",
+        conversation_tension: Optional[ConversationTension] = None,
     ) -> list[dict]:
         context_items = self._build_context_items(
             system_prompt=system_prompt,
@@ -4558,6 +4609,7 @@ class AgentCore:
             direct_fact_memory_only=direct_fact_memory_only,
             ctx_engine=ctx_engine,
             model_profile=model_profile,
+            conversation_tension=conversation_tension,
         )
         compiled = compile_context_items(
             context_items,
@@ -4570,6 +4622,11 @@ class AgentCore:
             ),
         )
         self._last_context_compilation = compiled.to_trace_payload()
+        self._last_context_compilation["content"] = compiled.content
+        self._last_context_compilation["runtime_path"] = "legacy"
+        self._last_context_compilation["trace_scope"] = "message_prompt"
+        self._last_context_compilation["canonical_event"] = "compiled_context"
+        self._last_context_compilation["packet_contract_version"] = "phase-packet-v1"
         self._last_context_compilation["model_profile"] = model_profile
 
         messages = [{"role": "system", "content": compiled.content}]
@@ -4626,6 +4683,7 @@ class AgentCore:
         direct_fact_memory_only: bool = False,
         ctx_engine: Optional[ContextEngine] = None,
         model_profile: str = "frontier_standard",
+        conversation_tension: Optional[ConversationTension] = None,
     ) -> dict:
         context_items = self._build_context_items(
             system_prompt=system_prompt,
@@ -4645,6 +4703,7 @@ class AgentCore:
             direct_fact_memory_only=direct_fact_memory_only,
             ctx_engine=ctx_engine,
             model_profile=model_profile,
+            conversation_tension=conversation_tension,
         )
         compiled = compile_context_items(
             context_items,
@@ -4657,6 +4716,10 @@ class AgentCore:
             ),
         )
         payload = compiled.to_trace_payload()
+        payload["runtime_path"] = "legacy"
+        payload["trace_scope"] = "phase_packet"
+        payload["canonical_event"] = "phase_context"
+        payload["packet_contract_version"] = "phase-packet-v1"
         payload["model_profile"] = model_profile
         payload["content"] = compiled.content
         return payload

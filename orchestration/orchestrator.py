@@ -22,6 +22,8 @@ Rules:
 - Preserve exact user entities, domains, URLs, file names, tickers, and keywords unless the context clearly justifies normalization.
 - Prefer the minimum tool set needed for the next useful step, not every possible step.
 - Do not broaden or weaken the user's query with filler like "related to", "about", or "similar to" unless that expansion is clearly necessary.
+- If the phase context shows contradiction or drift between the user's current turn and earlier user-stated facts, preserve that tension. Do not silently smooth it over.
+- If answering depends on a contradicted user fact, prefer a plan that helps clarify or verify the conflict instead of pretending the tension does not exist.
 - For exact-domain product or company research, prefer first-party evidence before third-party commentary.
 - If the user asks what a product costs or what plans exist, prefer fetching the exact pricing page before concluding.
 - If the user asks whether a product is good, trustworthy, or recommendable, gather first-party feature/pricing evidence before finalizing.
@@ -74,6 +76,7 @@ Rules:
 - If one more concrete tool step is clearly needed, choose "continue" and name the tools.
 - If tools failed and no better tool exists, choose "finalize" so the actor explains what is missing.
 - Do not repeat the same failed tool unless the reason is explicit.
+- If the phase context shows user drift or contradiction, keep that tension visible in `strategy` or `notes` rather than flattening the conversation into the latest message only.
 - After substantive evidence exists, avoid admin tools unless task state genuinely changed. Do not ask for `todo_write` again.
 - Preserve exact user entities/domains in follow-up tools. Do not silently rewrite or broaden the target.
 - If search results are noisy or off-topic, only continue if you can name a sharper next query/source.
@@ -114,6 +117,7 @@ Rules:
 - Be strict about ticker/company swaps, invented files, invented actions, and invented completed work.
 - Mark supported=false if the answer echoes internal execution chatter, hidden packet text, or unexecuted tool intentions.
 - Be strict about mutated domains, renamed products, and widened search targets that are not supported by evidence.
+- Mark supported=false if the phase context shows a material contradiction in the user's own stated facts and the answer hides that contradiction instead of naming it.
 
 Return ONLY JSON:
 {{
@@ -136,11 +140,15 @@ TRIVIAL_SIGNAL = re.compile(
 )
 URL_SIGNAL = re.compile(r"https?://", re.IGNORECASE)
 MULTISTEP_SIGNAL = re.compile(
-    r"\b(then|after that|afterwards|step by step|plan|research|summarize|save|write|create|build|compare|analyze|intel|report)\b",
+    r"\b(then|after that|afterwards|step by step|plan|research|summarize|save|write|create|build|compare|analyze|intel|report|search|fetch|find|gather|look up|lookup|investigate)\b",
     re.IGNORECASE,
 )
 CURRENT_INFO_SIGNAL = re.compile(
     r"\b(current|latest|news|today|recent|price|who is|what is|when is|where is|which)\b",
+    re.IGNORECASE,
+)
+FRESHNESS_SIGNAL = re.compile(
+    r"\b(new|what'?s new|whats new|changed|update|updates|updated|latest)\b",
     re.IGNORECASE,
 )
 DOMAIN_SIGNAL = re.compile(r"\b[a-z0-9][a-z0-9.-]*\.[a-z]{2,}\b", re.IGNORECASE)
@@ -197,6 +205,25 @@ def _query_needs_research_evidence(query: str) -> bool:
         bool(ARTIFACT_SIGNAL.search(q))
         and bool(re.search(r"\b(summarize|summary|report|tldr|tl;dr|findings)\b", q))
     )
+
+
+def _memory_recall_can_short_circuit(query: str) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    if IDENTITY_MEMORY_SIGNAL.search(q):
+        return True
+    if not MEMORY_SIGNAL.search(q):
+        return False
+    if _query_needs_research_evidence(q):
+        return False
+    if CURRENT_INFO_SIGNAL.search(q) or FRESHNESS_SIGNAL.search(q):
+        return False
+    if URL_SIGNAL.search(q) or DOMAIN_SIGNAL.search(q):
+        return False
+    if PRICING_SIGNAL.search(q) or TRUST_SIGNAL.search(q) or COMPARISON_SIGNAL.search(q):
+        return False
+    return True
 
 
 def _choose_initial_evidence_tool(
@@ -411,7 +438,12 @@ class AgenticOrchestrator:
             }
         if route_type == "url_fetch" and "web_fetch" in known_tools and "web_fetch" not in failed_set:
             deterministic_tools.append({"name": "web_fetch", "priority": "high", "reason": "Direct URL detected."})
-        elif route_type == "memory_recall" and "query_memory" in known_tools and "query_memory" not in failed_set:
+        elif (
+            route_type == "memory_recall"
+            and _memory_recall_can_short_circuit(query)
+            and "query_memory" in known_tools
+            and "query_memory" not in failed_set
+        ):
             deterministic_tools.append({"name": "query_memory", "priority": "high", "reason": "Memory recall intent detected."})
         elif route_type == "direct_fact" and "web_search" in known_tools and "web_search" not in failed_set:
             deterministic_tools.append({"name": "web_search", "priority": "high", "reason": "Deterministic factual/current query route."})
@@ -508,7 +540,7 @@ class AgenticOrchestrator:
                 not tools
                 and "web_search" in known_tools
                 and "web_search" not in failed_set
-                and re.search(r"\b(current|latest|news|price|best|top|what|who|when|where|which)\b", query_norm)
+                and re.search(r"\b(current|latest|news|price|best|top|what|who|when|where|which|search|fetch|find|gather|look up|lookup|investigate)\b", query_norm)
                 and not CONVERSATIONAL_QUERY_SIGNAL.fullmatch(query_norm)
             ):
                 tools.append({

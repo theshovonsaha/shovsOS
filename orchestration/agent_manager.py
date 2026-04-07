@@ -22,6 +22,7 @@ from orchestration.agent_runtime import (
     AgentRuntimeInstance,
     AgentRuntimeServices,
 )
+from orchestration.managed_runtime_adapter import create_managed_runtime_adapter
 from orchestration.native_runtime_adapter import create_native_runtime_adapter
 from plugins.tool_registry import ToolRegistry
 
@@ -45,6 +46,7 @@ class AgentManager:
         self.guardrail_middleware = guardrail_middleware
         self._runtime_adapters: dict[str, AgentRuntimeAdapter] = {}
         self.register_runtime_adapter(create_native_runtime_adapter())
+        self.register_runtime_adapter(create_managed_runtime_adapter())
         self._agent_cache: dict[tuple[str, str, int], AgentRuntimeInstance] = {}  # owner_id, agent_id, revision
 
     def _get_profile(self, agent_id: str, owner_id: Optional[str] = None):
@@ -71,8 +73,8 @@ class AgentManager:
         self._runtime_adapters[runtime_kind] = adapter
 
     def get_runtime_adapter(self, runtime_kind: Optional[str] = None) -> AgentRuntimeAdapter:
-        normalized = runtime_kind if isinstance(runtime_kind, str) else "native"
-        normalized = normalized.strip().lower() or "native"
+        normalized = runtime_kind if isinstance(runtime_kind, str) else "managed"
+        normalized = normalized.strip().lower() or "managed"
         adapter = self._runtime_adapters.get(normalized)
         if adapter is None:
             raise RuntimeError(f"Unsupported runtime_kind: {normalized}")
@@ -157,7 +159,7 @@ class AgentManager:
         capabilities = self._get_runtime_capabilities(runtime, runtime_context)
         instance = runtime.build_instance(runtime_context)
         try:
-            setattr(instance, "_runtime_kind", getattr(runtime, "runtime_kind", "native"))
+            setattr(instance, "_runtime_kind", getattr(runtime, "runtime_kind", "managed"))
             setattr(instance, "_runtime_capabilities", capabilities)
         except Exception:
             pass
@@ -174,6 +176,7 @@ class AgentManager:
         owner_id: Optional[str] = None,
         _model_override: Optional[str] = None,
         loop_mode: Optional[str] = None,
+        runtime_kind_override: Optional[str] = None,
     ) -> str:
         """
         Runs an agent to completion for a specific task and returns the final response string.
@@ -181,7 +184,7 @@ class AgentManager:
         Inherits the parent session's active model/provider so cloud adapters work correctly.
         """
         config = self._get_profile(agent_id, owner_id=owner_id)
-        runtime = self.get_runtime_adapter(getattr(config, "runtime_kind", None))
+        runtime = self.get_runtime_adapter(runtime_kind_override or getattr(config, "runtime_kind", None))
         runtime_context = self._build_runtime_context(
             agent_id=agent_id,
             profile=config,
@@ -198,7 +201,7 @@ class AgentManager:
             kwargs["loop_mode"] = requested_loop_mode
         if self._supports_kwarg(runtime.run_task, "run_metadata"):
             kwargs["run_metadata"] = {
-                "runtime_kind": getattr(runtime, "runtime_kind", "native"),
+                "runtime_kind": getattr(runtime, "runtime_kind", "managed"),
                 "runtime_capabilities": {
                     "supports_managed_loop": capabilities.supports_managed_loop,
                     "supports_checkpoints": capabilities.supports_checkpoints,

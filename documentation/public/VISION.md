@@ -57,6 +57,14 @@ The platform is the kernel.
 
 Agents are compositions built on top of it.
 
+The product shape is:
+- a human control center for supervising and steering execution
+- an autonomous agent body that performs work across tools, memory, and model runtimes
+
+In practical terms:
+- control center: Nova and operator-facing observability surfaces
+- autonomous body: runtime phases, tool execution, memory updates, and verification flows
+
 A robust agent on Shovs is defined by a combination of:
 
 - system prompt

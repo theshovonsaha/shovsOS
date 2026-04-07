@@ -6,7 +6,8 @@ This page reflects the current project as implemented, not the older marketing f
 
 ### 1. Language OS Runtime
 
-- explicit runtime kernel in [engine/core.py](/Users/theshovonsaha/Developer/Github/agent/engine/core.py)
+- canonical managed runtime in [run_engine/engine.py](/Users/theshovonsaha/Developer/Github/agent/run_engine/engine.py)
+- compatibility-native runtime in [engine/core.py](/Users/theshovonsaha/Developer/Github/agent/engine/core.py)
 - phase-aware context compilation
 - selectable execution modes:
   - `single`
@@ -111,7 +112,7 @@ The runtime already sanitizes follow-up context, but more of the prompt can stil
 
 ### 2. External Adapter Parity In Practice
 
-The contract exists, but native runtime behavior is still the most mature path.
+The contract exists and managed runtime is default, but provider-specific behavior still needs broader long-run validation in heterogeneous deployments.
 
 ### 3. Runtime Decomposition
 

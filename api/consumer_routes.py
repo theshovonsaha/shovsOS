@@ -7,12 +7,15 @@ from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from orchestration.agent_manager import AgentManager
+from orchestration.agent_profiles import ProfileManager
 from orchestration.session_manager import SessionManager
 from engine.file_processor import FileProcessor
 from llm.adapter_factory import create_adapter
 from plugins.tool_registry import ToolRegistry
 from api.memory_inspector import build_session_memory_payload
+from api.owner import require_owner_id
+from run_engine.engine import RunEngine
+from run_engine.types import RunEngineRequest
 from services.consumer_store import ConsumerStoreService, ConsumerStoreSelection
 
 CONSUMER_AGENT_ID = "consumer"
@@ -34,19 +37,15 @@ class ConsumerStoreActionPayload(ConsumerStoreSelectionPayload):
 
 def make_consumer_router(
     *,
-    agent_manager: AgentManager,
+    profile_manager: ProfileManager,
     sessions: SessionManager,
     file_processor: FileProcessor,
     consumer_store: ConsumerStoreService,
     tool_registry: ToolRegistry,
+    run_engine: RunEngine,
 ) -> APIRouter:
     router = APIRouter(prefix="/consumer", tags=["consumer"])
-
-    def _require_owner_id(owner_id: Optional[str]) -> str:
-        normalized = (owner_id or "").strip()
-        if not normalized:
-            raise HTTPException(status_code=400, detail="owner_id is required")
-        return normalized
+    _require_owner_id = require_owner_id
 
     @router.get("/health")
     async def consumer_health():
@@ -136,8 +135,13 @@ def make_consumer_router(
     ):
         owner_id = _require_owner_id(owner_id)
         async def generate():
+            last_run_id: Optional[str] = None
             options = consumer_store.get_options()
-            active_model = model or options.get("model")
+            profile = profile_manager.get(CONSUMER_AGENT_ID, owner_id=owner_id) or profile_manager.get(
+                "default",
+                owner_id=owner_id,
+            )
+            active_model = model or options.get("model") or getattr(profile, "model", None) or "llama3.2"
             image_b64s: list[str] = []
             text_injection = ""
             if files:
@@ -153,23 +157,34 @@ def make_consumer_router(
             full_message = f"{text_injection}\n\n{message}" if text_injection else message
             yield f"data: {json.dumps({'type': 'phase', 'phase': 'thinking'})}\n\n"
 
-            agent = agent_manager.get_agent_instance(CONSUMER_AGENT_ID, owner_id=owner_id)
             tool_events = 0
             sid = session_id
-            async for event in agent.chat_stream(
-                user_message=full_message,
-                session_id=session_id,
-                agent_id=CONSUMER_AGENT_ID,
-                model=active_model,
-                use_planner=False,
-                loop_mode="single",
-                force_memory=False,
-                images=image_b64s or None,
+            if not sid:
+                created = sessions.create(
+                    model=active_model,
+                    system_prompt=getattr(profile, "system_prompt", "") or "",
+                    agent_id=CONSUMER_AGENT_ID,
+                    owner_id=owner_id,
+                )
+                sid = created.id
+
+            run_request = RunEngineRequest(
+                session_id=sid,
                 owner_id=owner_id,
-            ):
+                agent_id=CONSUMER_AGENT_ID,
+                user_message=full_message,
+                model=active_model,
+                system_prompt=getattr(profile, "system_prompt", "") or "",
+                allowed_tools=tuple(getattr(profile, "tools", []) or []),
+                use_planner=bool(getattr(profile, "default_use_planner", True)),
+                images=image_b64s or None,
+                agent_revision=getattr(profile, "revision", None),
+            )
+            async for event in run_engine.stream(run_request):
                 event_type = event.get("type")
                 if event_type == "session":
                     sid = event.get("session_id")
+                    last_run_id = event.get("run_id")
                     yield f"data: {json.dumps({'type': 'session', 'session_id': sid, 'run_id': event.get('run_id')})}\n\n"
                 elif event_type == "token":
                     yield f"data: {json.dumps({'type': 'token', 'content': event.get('content', '')})}\n\n"
@@ -188,10 +203,21 @@ def make_consumer_router(
                     yield f"data: {json.dumps({'type': 'activity_detail', 'text': f'{tool_name} {status}', 'detail': detail[:400]})}\n\n"
                 elif event_type == "compressing":
                     yield f"data: {json.dumps({'type': 'phase', 'phase': 'finalizing'})}\n\n"
+                elif event_type == "plan":
+                    yield f"data: {json.dumps({'type': 'plan', 'strategy': event.get('strategy', ''), 'tools': event.get('tools', []), 'confidence': event.get('confidence', 0)})}\n\n"
+                elif event_type == "verification_warning":
+                    yield f"data: {json.dumps({'type': 'verification_warning', 'issues': event.get('issues', []), 'confidence': event.get('confidence', 0)})}\n\n"
+                elif event_type == "conversation_tension":
+                    yield f"data: {json.dumps({'type': 'tension', 'summary': event.get('summary', ''), 'challenge_level': event.get('challenge_level', '')})}\n\n"
+                elif event_type == "done":
+                    sid = event.get("session_id", sid)
+                    last_run_id = event.get("run_id", last_run_id)
+                    yield f"data: {json.dumps({'type': 'done', 'session_id': sid, 'run_id': last_run_id})}\n\n"
+                    return
                 elif event_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'message': event.get('message', 'Unknown error')})}\n\n"
 
-            yield f"data: {json.dumps({'type': 'done', 'session_id': sid})}\n\n"
+            yield f"data: {json.dumps({'type': 'done', 'session_id': sid, 'run_id': last_run_id})}\n\n"
 
         return StreamingResponse(
             generate(),
@@ -210,6 +236,25 @@ def make_consumer_router(
             owner_id=owner_id,
             context_preview=lambda raw: [line for line in (raw or "").splitlines() if line.strip()],
         )
+
+    @router.get("/sessions")
+    async def consumer_list_sessions(owner_id: str):
+        owner_id = _require_owner_id(owner_id)
+        items = sessions.list_sessions(agent_id=CONSUMER_AGENT_ID, owner_id=owner_id)
+        return {"sessions": items}
+
+    @router.get("/sessions/{session_id}/messages")
+    async def consumer_session_messages(session_id: str, owner_id: str):
+        owner_id = _require_owner_id(owner_id)
+        session = sessions.get(session_id, owner_id=owner_id)
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        msgs = []
+        for m in session.full_history:
+            role = m.get("role", "")
+            if role in ("user", "assistant"):
+                msgs.append({"role": role, "content": m.get("content", "")})
+        return {"messages": msgs, "session_id": session_id}
 
     @router.get("/tools")
     async def consumer_tools():

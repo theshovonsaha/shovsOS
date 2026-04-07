@@ -75,6 +75,23 @@ class RunEval:
     created_at: str = ""
 
 
+@dataclass
+class RunPassRecord:
+    pass_id: int
+    run_id: str
+    phase: str
+    tool_turn: int = 0
+    status: str = ""
+    objective: str = ""
+    strategy: str = ""
+    notes: str = ""
+    selected_tools: list[str] | None = None
+    tool_results: list[dict[str, Any]] | None = None
+    compiled_context: dict[str, Any] | None = None
+    response_preview: str = ""
+    created_at: str = ""
+
+
 class RunStore:
     def __init__(self, db_path: str = DEFAULT_RUNS_DB):
         self.db_path = str(Path(db_path))
@@ -158,6 +175,25 @@ class RunStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_passes (
+                    pass_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    tool_turn INTEGER DEFAULT 0,
+                    status TEXT,
+                    objective TEXT,
+                    strategy TEXT,
+                    notes TEXT,
+                    selected_tools_json TEXT,
+                    tool_results_json TEXT,
+                    compiled_context_json TEXT,
+                    response_preview TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_parent_run_id ON runs(parent_run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_owner_id ON runs(owner_id)")
@@ -166,6 +202,7 @@ class RunStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_run_artifacts_owner_id ON run_artifacts(owner_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_run_evals_run_id ON run_evals(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_run_evals_owner_id ON run_evals(owner_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_run_passes_run_id ON run_passes(run_id)")
             conn.commit()
 
     def start_run(
@@ -314,6 +351,74 @@ class RunStore:
                 (run_id,),
             ).fetchall()
             return [self._row_to_checkpoint(row) for row in rows]
+
+    def save_pass(
+        self,
+        *,
+        run_id: str,
+        phase: str,
+        tool_turn: int = 0,
+        status: str = "",
+        objective: str = "",
+        strategy: str = "",
+        notes: str = "",
+        selected_tools: Optional[list[str]] = None,
+        tool_results: Optional[list[dict[str, Any]]] = None,
+        compiled_context: Optional[dict[str, Any]] = None,
+        response_preview: str = "",
+    ) -> RunPassRecord:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO run_passes
+                (run_id, phase, tool_turn, status, objective, strategy, notes, selected_tools_json, tool_results_json, compiled_context_json, response_preview, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    phase,
+                    tool_turn,
+                    status,
+                    objective,
+                    strategy,
+                    notes,
+                    json.dumps(selected_tools or []),
+                    json.dumps(tool_results or []),
+                    json.dumps(compiled_context or {}),
+                    response_preview,
+                    created_at,
+                ),
+            )
+            conn.commit()
+            pass_id = int(cursor.lastrowid)
+        return RunPassRecord(
+            pass_id=pass_id,
+            run_id=run_id,
+            phase=phase,
+            tool_turn=tool_turn,
+            status=status,
+            objective=objective,
+            strategy=strategy,
+            notes=notes,
+            selected_tools=list(selected_tools or []),
+            tool_results=list(tool_results or []),
+            compiled_context=dict(compiled_context or {}),
+            response_preview=response_preview,
+            created_at=created_at,
+        )
+
+    def list_passes(self, run_id: str) -> list[RunPassRecord]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM run_passes
+                WHERE run_id = ?
+                ORDER BY pass_id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            return [self._row_to_pass(row) for row in rows]
 
     def save_artifact(
         self,
@@ -495,6 +600,24 @@ class RunStore:
             score=float(row["score"]) if row["score"] is not None else None,
             detail=row["detail"] or "",
             metadata=json.loads(row["metadata_json"] or "{}"),
+            created_at=row["created_at"] or "",
+        )
+
+    @staticmethod
+    def _row_to_pass(row: sqlite3.Row) -> RunPassRecord:
+        return RunPassRecord(
+            pass_id=int(row["pass_id"]),
+            run_id=row["run_id"],
+            phase=row["phase"],
+            tool_turn=int(row["tool_turn"] or 0),
+            status=row["status"] or "",
+            objective=row["objective"] or "",
+            strategy=row["strategy"] or "",
+            notes=row["notes"] or "",
+            selected_tools=json.loads(row["selected_tools_json"] or "[]"),
+            tool_results=json.loads(row["tool_results_json"] or "[]"),
+            compiled_context=json.loads(row["compiled_context_json"] or "{}"),
+            response_preview=row["response_preview"] or "",
             created_at=row["created_at"] or "",
         )
 
