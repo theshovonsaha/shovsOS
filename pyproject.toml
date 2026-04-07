@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=58"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shovs-memory"
+version = "0.1.0"
+description = "Inspectable agent memory with deterministic user facts, temporal invalidation, and semantic retrieval."
+readme = "documentation/public/SHOVS_MEMORY.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Shovon Saha" }
+]
+dependencies = [
+  "httpx",
+  "numpy",
+  "python-dotenv",
+]
+
+[project.urls]
+Homepage = "https://github.com/shovsOS/shovsOS"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "api*",
+  "config*",
+  "engine*",
+  "guardrails*",
+  "llm*",
+  "memory*",
+  "orchestration*",
+  "plugins*",
+  "services*",
+  "shovs_memory*",
+]
+namespaces = true

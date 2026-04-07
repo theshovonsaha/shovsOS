@@ -6,9 +6,33 @@ on:
   pull_request:
 
 jobs:
-  backend-tests:
-    # Temporarily disabled by default to reduce CI spend.
-    # Re-enable by creating a repository variable: ENABLE_BACKEND_CI_TESTS=true
+  backend-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run backend smoke tests
+        run: |
+          pytest -q \
+            tests/test_context_compiler.py \
+            tests/test_run_engine_helpers.py \
+            tests/test_run_engine_contract.py \
+            tests/test_consumer_routes.py
+
+  backend-full:
     if: ${{ vars.ENABLE_BACKEND_CI_TESTS == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -27,10 +51,10 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Run backend tests
+      - name: Run full backend tests
         run: pytest -q
 
-  frontend-build:
+  frontend-build-nova:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -43,13 +67,37 @@ jobs:
           cache: "npm"
           cache-dependency-path: |
             package-lock.json
-            frontend/package-lock.json
+            frontend_nova/package-lock.json
 
       - name: Install root deps
         run: npm ci
 
-      - name: Install frontend deps
-        run: npm --prefix frontend ci
+      - name: Install Nova deps
+        run: npm --prefix frontend_nova ci
 
-      - name: Build frontend
-        run: npm --prefix frontend run build
+      - name: Build Nova
+        run: npm --prefix frontend_nova run build
+
+  frontend-build-consumer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: |
+            package-lock.json
+            frontend_consumer/package-lock.json
+
+      - name: Install root deps
+        run: npm ci
+
+      - name: Install Consumer deps
+        run: npm --prefix frontend_consumer ci
+
+      - name: Build Consumer
+        run: npm --prefix frontend_consumer run build

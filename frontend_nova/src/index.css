@@ -901,6 +901,7 @@ a:hover {
   font-weight: 500;
   letter-spacing: .1em;
   text-transform: uppercase;
+  margin: 2rem;
   padding: 6px 14px;
   border-radius: 2px;
   cursor: pointer;
@@ -1289,8 +1290,6 @@ textarea::placeholder {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
   gap: 1px;
-  background: var(--border);
-  border: 1px solid var(--border);
 }
 
 .agent-card {
@@ -1875,7 +1874,7 @@ textarea::placeholder {
 }
 
 .premium-select-trigger {
-  width: 100%;
+  width: 20rem;
   padding: 10px 14px;
   background: var(--surface2);
   border: 1px solid var(--border-hi);
@@ -4774,7 +4773,8 @@ body,
 .stat-pill {
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid rgba(255, 255, 255, 0.05);
-  padding: 6px 12px;
+  margin: 10px;
+  padding: 6px 12px  ;
   border-radius: 10px;
   font-size: 11px;
   color: var(--text-dim);
@@ -5011,7 +5011,8 @@ body,
 
 .btn-secondary {
   background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 1px  rgba(255, 255, 255, 0.1);
+  margin: 2rem;
   color: var(--text-dim);
 }
 

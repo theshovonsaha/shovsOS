@@ -74,6 +74,14 @@ async def _stream_api_chat(payload: dict) -> list[dict]:
     return events
 
 
+async def _api_get(path: str, params: dict | None = None) -> dict:
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(path, params=params or {})
+        response.raise_for_status()
+        return response.json()
+
+
 @pytest.mark.asyncio
 async def test_groq_stock_research_workflow_has_real_tool_use():
     if not _groq_available():
@@ -149,7 +157,83 @@ async def test_groq_memory_correction_workflow_tracks_source_and_cleanup():
         pytest.skip(f"Groq memory correction runtime error: {second_errors[-1]}")
 
     final_text = _latest_assistant_response(session_id).strip()
+    final_turn_tool_calls = [event for event in transcripts[-1] if event.get("type") == "tool_call"]
     assert final_text, f"No final answer in memory correction workflow. See {log_path}"
     assert "shovon" in final_text.lower(), log_path
     assert "toronto" in final_text.lower(), log_path
     assert "vancouver" not in final_text.lower(), log_path
+
+
+@pytest.mark.asyncio
+async def test_groq_golden_ticket_memory_state_is_correct_and_inspectable():
+    if not _groq_available():
+        pytest.skip("GROQ_API_KEY not set")
+
+    owner_id = f"groq-golden-{uuid.uuid4().hex[:8]}"
+    session_id = f"groq_golden_{uuid.uuid4().hex[:8]}"
+    model = "groq:llama-3.3-70b-versatile"
+
+    prompts = [
+        "Call me Shovon. I live in Vancouver.",
+        "Actually, I moved to Toronto.",
+        "What is my preferred name and current location? Answer in one short sentence.",
+    ]
+
+    transcripts: list[list[dict]] = []
+    for prompt in prompts:
+        events = await _stream_api_chat({
+            "message": prompt,
+            "session_id": session_id,
+            "owner_id": owner_id,
+            "model": model,
+            "use_planner": "false",
+        })
+        transcripts.append(events)
+        errors = [event for event in events if event.get("type") == "error"]
+        if errors:
+            pytest.skip(f"Groq golden ticket runtime error: {errors[-1]}")
+
+    memory_state = await _api_get(
+        f"/sessions/{session_id}/memory-state",
+        params={"owner_id": owner_id},
+    )
+    final_text = _latest_assistant_response(session_id).strip()
+    final_turn_tool_calls = [event for event in transcripts[-1] if event.get("type") == "tool_call"]
+
+    log_path = _write_log("golden_ticket_memory_state", {
+        "session_id": session_id,
+        "owner_id": owner_id,
+        "model": model,
+        "prompts": prompts,
+        "turns": transcripts,
+        "memory_state": memory_state,
+        "trace": _session_trace_payload(session_id, limit=220),
+        "final_text": final_text,
+    })
+    print(f"\n[groq-log] {log_path}")
+
+    assert final_text, f"No final answer for golden ticket. See {log_path}"
+    assert "shovon" in final_text.lower(), log_path
+    assert "toronto" in final_text.lower(), log_path
+    assert "vancouver" not in final_text.lower(), log_path
+    assert not final_turn_tool_calls, log_path
+
+    summary = memory_state["summary"]
+    assert summary["deterministic_fact_count"] >= 2, log_path
+    assert summary["superseded_fact_count"] >= 1, log_path
+    assert any(
+        item["predicate"] == "preferred_name" and item["object"] == "Shovon"
+        for item in memory_state["deterministic_facts"]
+    ), log_path
+    assert any(
+        item["predicate"] == "location" and item["object"] == "Toronto"
+        for item in memory_state["deterministic_facts"]
+    ), log_path
+    assert any(
+        item["predicate"] == "location" and item["object"] == "Vancouver"
+        for item in memory_state["superseded_facts"]
+    ), log_path
+    assert any(
+        signal["label"] == "Deterministic extractor"
+        for signal in memory_state["recent_memory_signals"]
+    ), log_path

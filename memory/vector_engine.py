@@ -15,7 +15,7 @@ DB_PATH     = "./chroma_db"
 OPENAI_COMPAT_PROVIDERS = {"openai", "local_openai", "lmstudio", "llamacpp"}
 
 class VectorEngine:
-    _http_clients: dict[tuple[str, float], httpx.AsyncClient] = {}
+    _http_clients: dict[tuple[str, float, int | None], httpx.AsyncClient] = {}
     _chroma_clients: dict[str, chromadb.PersistentClient] = {}
     _embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
     _cache_lock = threading.RLock()
@@ -47,7 +47,11 @@ class VectorEngine:
 
     @classmethod
     def _get_http_client(cls, base_url: str, timeout: float) -> httpx.AsyncClient:
-        key = (base_url.rstrip("/"), float(timeout))
+        try:
+            loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            loop_id = None
+        key = (base_url.rstrip("/"), float(timeout), loop_id)
         client = cls._http_clients.get(key)
         if client is None or client.is_closed:
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0)

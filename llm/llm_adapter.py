@@ -27,19 +27,34 @@ class OllamaAdapter(BaseLLMAdapter):
         self.base_url = base_url
         self.timeout  = timeout
         self._client: Optional[httpx.AsyncClient] = None
+        self._client_loop_id: Optional[int] = None
+
+    @staticmethod
+    def _current_loop_id() -> Optional[int]:
+        try:
+            return id(asyncio.get_running_loop())
+        except RuntimeError:
+            return None
 
     def _get_client(self) -> httpx.AsyncClient:
-        if self._client is None or self._client.is_closed:
+        current_loop_id = self._current_loop_id()
+        if (
+            self._client is None
+            or self._client.is_closed
+            or (current_loop_id is not None and self._client_loop_id not in (None, current_loop_id))
+        ):
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=self.timeout,
                 headers={"Content-Type": "application/json"}
             )
+            self._client_loop_id = current_loop_id
         return self._client
 
     async def close(self):
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+        self._client_loop_id = None
 
     async def _raise_for_status(self, response):
         """
@@ -67,7 +82,31 @@ class OllamaAdapter(BaseLLMAdapter):
             try:
                 resp = await client.post("/api/chat", json=payload)
                 await self._raise_for_status(resp)
-                return resp.json()["message"]["content"]
+                data = resp.json()
+                msg = data.get("message", {})
+                # Ollama returns native tool_calls when tool schemas are provided.
+                # Serialize them so extract_tool_call() can parse downstream.
+                tool_calls = msg.get("tool_calls")
+                if tool_calls and isinstance(tool_calls, list):
+                    normalized = []
+                    for tc in tool_calls:
+                        fn = tc.get("function") or {}
+                        args = fn.get("arguments", {})
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except Exception:
+                                args = {}
+                        normalized.append({
+                            "type": "function",
+                            "function": {
+                                "name": fn.get("name", ""),
+                                "arguments": json.dumps(args) if not isinstance(args, str) else args,
+                            },
+                        })
+                    if normalized:
+                        return json.dumps({"tool_calls": normalized})
+                return msg.get("content", "")
             except httpx.HTTPStatusError as e:
                 if e.response.status_code < 500:
                     raise LLMError(f"LLM rejected: {e.response.status_code} - {e.response.text}") from e

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report a reproducible bug in runtime, tools, memory, or UI.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Please provide enough detail to reproduce.
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: One-line description of the issue.
+      placeholder: Tool call fails on second turn for run_engine path
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction Steps
+      description: Exact steps to reproduce.
+      placeholder: |
+        1. Start backend with npm run dev:backend
+        2. Send /chat/stream request with ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs, Traces, or Screenshots
+      description: Paste trace snippets, error logs, or screenshots.
+    validations:
+      required: false
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, Python, Node, provider/model, and relevant env vars (redact secrets).
+    validations:
+      required: true

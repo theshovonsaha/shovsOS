@@ -39,11 +39,11 @@ from orchestration.agent_profiles import ProfileManager, AgentProfile
 from orchestration.orchestrator import AgenticOrchestrator
 from llm.llm_adapter import OllamaAdapter
 from engine.context_engine import ContextEngine
+from memory.semantic_graph import SemanticGraph
 from orchestration.session_manager import SessionManager
 from llm.adapter_factory import create_adapter
 from plugins.tool_registry import ToolRegistry
 from plugins.tools import register_all_tools
-from plugins.tools_web import register_web_tools
 from engine.file_processor import FileProcessor
 from orchestration.agent_manager import AgentManager
 from config.logger import get_logger, log
@@ -51,11 +51,16 @@ from api.log_routes import setup_log_routes
 from api.voice_endpoint import setup_voice_routes
 from api.rag_routes import make_rag_router            # ← NEW
 from api.consumer_routes import make_consumer_router
+from api.memory_inspector import build_session_memory_payload
+from api.owner import require_owner_id
 from services.storage_admin import StorageAdminService, StoreSelection
 from services.consumer_store import ConsumerStoreService
 
 from guardrails import GuardrailMiddleware
 from guardrails.api_routes import make_guardrail_router
+from orchestration.run_store import get_run_store
+from config.trace_store import get_trace_store
+from run_engine import RunEngine, RunEngineRequest
 
 # ── Config ────────────────────────────────────────────────────────────────────
 FALLBACK_CHAT_MODEL = "llama3.2"
@@ -63,10 +68,7 @@ CHAT_RATE_LIMIT = os.getenv("CHAT_RATE_LIMIT", "30/minute")
 
 
 def _require_owner_id(owner_id: Optional[str]) -> str:
-    normalized = (owner_id or "").strip()
-    if not normalized:
-        raise HTTPException(status_code=400, detail="owner_id is required")
-    return normalized
+    return require_owner_id(owner_id)
 
 
 def _count_context_items(raw_context: str) -> int:
@@ -110,6 +112,7 @@ context_engine  = ContextEngine(adapter=adapter, compression_model=FALLBACK_CHAT
 file_processor  = FileProcessor()
 profile_manager = ProfileManager()
 orchestrator    = AgenticOrchestrator(adapter=adapter)
+semantic_graph  = SemanticGraph()
 
 # ── Guardrails ────────────────────────────────────────────────────────────────
 guardrail_middleware = GuardrailMiddleware(
@@ -127,17 +130,28 @@ agent_manager = AgentManager(
     orchestrator         = orchestrator,
     guardrail_middleware = guardrail_middleware,
 )
+run_engine = RunEngine(
+    adapter=adapter,
+    sessions=session_manager,
+    tool_registry=tool_registry,
+    run_store=get_run_store(),
+    trace_store=get_trace_store(),
+    orchestrator=orchestrator,
+    context_engine=context_engine,
+    graph=semantic_graph,
+)
 storage_admin = StorageAdminService(session_manager, profile_manager)
 consumer_session_manager = SessionManager(max_sessions=200, db_path="consumer_sessions.db")
 consumer_context_engine = ContextEngine(adapter=adapter, compression_model=FALLBACK_CHAT_MODEL)
-consumer_agent_manager = AgentManager(
-    profiles=profile_manager,
-    sessions=consumer_session_manager,
-    context_engine=consumer_context_engine,
+consumer_run_engine = RunEngine(
     adapter=adapter,
-    global_registry=tool_registry,
+    sessions=consumer_session_manager,
+    tool_registry=tool_registry,
+    run_store=get_run_store(),
+    trace_store=get_trace_store(),
     orchestrator=orchestrator,
-    guardrail_middleware=guardrail_middleware,
+    context_engine=consumer_context_engine,
+    graph=semantic_graph,
 )
 consumer_store = ConsumerStoreService(
     consumer_db_path="consumer.db",
@@ -146,7 +160,6 @@ consumer_store = ConsumerStoreService(
 
 # ── Register tools ────────────────────────────────────────────────────────────
 register_all_tools(tool_registry, agent_manager=agent_manager)
-register_web_tools(tool_registry)
 
 
 # ── MCP Client (optional — loads mcp_servers.json if present) ─────────────────
@@ -211,11 +224,30 @@ def _seed_standard_profiles():
                 "Always run code with bash after writing it to verify it works."
             ),
         ),
+        AgentProfile(
+            id="consumer",
+            name="Consumer Assistant",
+            description="Plain-language assistant for the consumer chat surface.",
+            model="groq:moonshotai/kimi-k2-instruct",
+            tools=["web_search", "web_fetch", "query_memory"],
+            system_prompt=(
+                "You are a clear, calm assistant for the consumer product surface. "
+                "Prefer plain text, avoid internal execution chatter, and only use tools when they materially improve accuracy or complete the task."
+            ),
+            default_use_planner=True,
+            default_loop_mode="auto",
+            default_context_mode="v2",
+            bootstrap_files=["IDENTITY.md", "SOUL.md"],
+        ),
     ]
     for p in standard:
-        if not profile_manager.get(p.id):
+        existing = profile_manager.get(p.id)
+        if not existing:
             profile_manager.create(p)
             log("startup", "profiles", f"Seeded agent profile: {p.id}")
+        elif existing.default_use_planner != p.default_use_planner:
+            profile_manager.create(p)
+            log("startup", "profiles", f"Migrated planner default for profile: {p.id}")
 
 
 # ── App lifespan ──────────────────────────────────────────────────────────────
@@ -241,11 +273,12 @@ app.include_router(make_guardrail_router(guardrail_middleware), prefix="/guardra
 app.include_router(make_rag_router(), prefix="/rag")          # ← NEW
 app.include_router(
     make_consumer_router(
-        agent_manager=consumer_agent_manager,
+        profile_manager=profile_manager,
         sessions=consumer_session_manager,
         file_processor=file_processor,
         consumer_store=consumer_store,
         tool_registry=tool_registry,
+        run_engine=consumer_run_engine,
     )
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -283,6 +316,13 @@ class StorageActionPayload(StorageSelectionPayload):
 
 class StorageBackupPayload(StorageSelectionPayload):
     backup_label: str = ""
+
+
+class MemorySearchPayload(BaseModel):
+    query: str = Field(..., min_length=1, max_length=4096)
+    top_k: int = Field(default=5, ge=1, le=50)
+    owner_id: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 # ── Core routes (unchanged from v0.5.0) ──────────────────────────────────────
@@ -377,6 +417,7 @@ async def chat_stream(
     planner_model:     Optional[str]    = Form(None),
     context_model:     Optional[str]    = Form(None),
     embed_model:       Optional[str]    = Form(None),
+    runtime_path:      Optional[str]    = Form(None),
     forced_tools_json: Optional[str]    = Form(None),
     owner_id:          Optional[str]    = Form(None),
     files:             List[UploadFile] = File(default=[]),
@@ -435,18 +476,70 @@ async def chat_stream(
                 )
                 session_manager.set_context_mode(created.id, resolved_context_mode)
                 effective_session_id = created.id
-            agent_instance = agent_manager.get_agent_instance(agent_id or "default", owner_id=owner_id)
-            
-            if embed_model:
-                agent_instance.embed_model = embed_model
-                if getattr(agent_instance, "graph", None) is not None:
-                    agent_instance.graph.embedding_model = embed_model
+            else:
+                existing_session = session_manager.get(effective_session_id, owner_id=owner_id)
+                if existing_session:
+                    session_manager.set_context_mode(effective_session_id, resolved_context_mode)
 
             resolved_use_planner = use_planner if use_planner is not None else bool(getattr(profile, "default_use_planner", True))
             resolved_loop_mode = loop_mode or getattr(profile, "default_loop_mode", "auto")
             resolved_planner_model = planner_model or None
             resolved_context_model = context_model or None
+            resolved_embed_model = embed_model or getattr(profile, "embed_model", None) or "nomic-embed-text"
 
+            resolved_runtime_path = str(runtime_path or "run_engine").strip().lower()
+            legacy_aliases = {"legacy", "native", "agent_core", "agentcore"}
+            managed_aliases = {"run_engine", "managed", ""}
+            if resolved_runtime_path in legacy_aliases:
+                legacy_compat_enabled = os.getenv("ALLOW_LEGACY_CHAT_RUNTIME", "false").lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+                if not legacy_compat_enabled:
+                    warning = (
+                        "Legacy runtime path is disabled. "
+                        "Set ALLOW_LEGACY_CHAT_RUNTIME=true to enable compatibility mode."
+                    )
+                    yield f"data: {json.dumps({'type': 'warning', 'message': warning})}\n\n"
+                    resolved_runtime_path = "run_engine"
+            elif resolved_runtime_path not in managed_aliases:
+                warning = f"Unknown runtime_path '{resolved_runtime_path}'. Falling back to run_engine."
+                yield f"data: {json.dumps({'type': 'warning', 'message': warning})}\n\n"
+                resolved_runtime_path = "run_engine"
+
+            if resolved_runtime_path in managed_aliases:
+                run_request = RunEngineRequest(
+                    session_id=effective_session_id,
+                    owner_id=owner_id,
+                    agent_id=agent_id or "default",
+                    user_message=full_message,
+                    model=model or (profile.model if profile else FALLBACK_CHAT_MODEL),
+                    system_prompt=system_prompt or (profile.system_prompt if profile else ""),
+                    context_mode=resolved_context_mode,
+                    allowed_tools=tuple(getattr(profile, "tools", []) or []),
+                    use_planner=resolved_use_planner,
+                    max_tool_calls=max_tool_calls,
+                    max_turns=max_turns,
+                    planner_model=resolved_planner_model,
+                    context_model=resolved_context_model,
+                    embed_model=resolved_embed_model,
+                    images=image_b64s or None,
+                    search_backend=search_backend,
+                    search_engine=search_engine,
+                    agent_revision=getattr(profile, "revision", None),
+                    forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
+                )
+                async for event in run_engine.stream(run_request):
+                    yield f"data: {json.dumps(event)}\n\n"
+                return
+
+            agent_instance = agent_manager.get_agent_instance(agent_id or "default", owner_id=owner_id)
+            if embed_model:
+                agent_instance.embed_model = embed_model
+                if getattr(agent_instance, "graph", None) is not None:
+                    agent_instance.graph.embedding_model = embed_model
             async for event in agent_instance.chat_stream(
                 user_message   = full_message,
                 session_id     = effective_session_id,
@@ -599,6 +692,18 @@ async def get_context(session_id: str, owner_id: str):
     lines = _context_preview(s.compressed_context)
     return {"session_id": session_id, "lines": len(lines), "context": lines, "raw": s.compressed_context}
 
+@app.get("/sessions/{session_id}/memory-state")
+async def get_session_memory_state(session_id: str, owner_id: str):
+    owner_id = _require_owner_id(owner_id)
+    s = session_manager.get(session_id, owner_id=owner_id)
+    if not s:
+        raise HTTPException(404, "Session not found")
+    return build_session_memory_payload(
+        session=s,
+        owner_id=owner_id,
+        context_preview=_context_preview,
+    )
+
 @app.get("/memory")
 async def list_memories(limit: int = 100, owner_id: Optional[str] = None):
     owner_id = _require_owner_id(owner_id)
@@ -607,15 +712,36 @@ async def list_memories(limit: int = 100, owner_id: Optional[str] = None):
     return {"memories": graph.list_all(limit=limit, owner_id=owner_id), "total": graph.count(owner_id=owner_id), "limit": limit}
 
 @app.post("/memory/search")
-async def search_memory(payload: dict):
-    from memory.semantic_graph import SemanticGraph
-    query = payload.get("query", "")
-    top_k = payload.get("top_k", 5)
-    owner_id = _require_owner_id(payload.get("owner_id"))
-    if not query:
-        raise HTTPException(400, "query is required")
-    results = await SemanticGraph().traverse(query, top_k=top_k, owner_id=owner_id)
-    return {"query": query, "results": results}
+async def search_memory(payload: MemorySearchPayload):
+    from memory.retrieval import unified_memory_search
+
+    owner_id = _require_owner_id(payload.owner_id)
+    return await unified_memory_search(
+        payload.query,
+        owner_id=owner_id,
+        session_id=payload.session_id,
+        top_k=payload.top_k,
+    )
+
+
+@app.post("/memory/benchmark/run")
+async def run_memory_benchmark(payload: Optional[dict] = Body(default=None)):
+    from memory.benchmark_harness import run_memory_benchmark as run_benchmark
+    from memory.benchmark_store import save_latest
+
+    owner_id = _require_owner_id((payload or {}).get("owner_id"))
+    result = await run_benchmark(owner_id)
+    save_latest(owner_id, result)
+    return result
+
+
+@app.get("/memory/benchmark/latest")
+async def get_memory_benchmark_latest(owner_id: Optional[str] = None):
+    from memory.benchmark_store import load_latest
+
+    owner_id = _require_owner_id(owner_id)
+    result = load_latest(owner_id)
+    return {"result": result}
 
 @app.delete("/memory/{memory_id}")
 async def delete_memory(memory_id: int, owner_id: Optional[str] = None):

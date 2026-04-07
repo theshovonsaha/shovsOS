@@ -362,6 +362,7 @@ async def test_delegate_tool_accepts_legacy_arguments():
     assert awaited.args[0] == "analyst"
     assert "aapl_report.md" in awaited.args[1]
     assert awaited.kwargs["parent_id"] == "parent_session"
+    assert awaited.kwargs["runtime_kind_override"] == "managed"
 
 
 @pytest.mark.asyncio

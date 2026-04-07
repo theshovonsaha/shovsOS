@@ -121,13 +121,13 @@ def test_tool_registry_validate_tool_call():
 @pytest.mark.asyncio
 async def test_query_memory_uses_session_facts(monkeypatch):
     class FakeGraph:
-        async def traverse(self, topic, top_k=5):
+        async def traverse(self, topic, top_k=5, threshold=0.5, owner_id=None):
             return []
 
-        def get_current_facts(self, session_id):
+        def get_current_facts(self, session_id, owner_id=None):
             return [("User", "likes", "blue")]
 
     monkeypatch.setattr("memory.semantic_graph.SemanticGraph", FakeGraph)
     result = await _query_memory("blue", _session_id="session-1")
-    assert "Session facts" in result
+    assert "Unified memory results" in result
     assert "likes" in result

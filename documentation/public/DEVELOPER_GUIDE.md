@@ -27,13 +27,23 @@ The runtime already supports:
 
 ### Runtime
 
+- [run_engine/engine.py](/Users/theshovonsaha/Developer/Github/agent/run_engine/engine.py)
+  - managed runtime execution path
+  - phase packet flow, pass ledger writes, and verification-gated memory commit
+
 - [engine/core.py](/Users/theshovonsaha/Developer/Github/agent/engine/core.py)
-  - main execution kernel
+  - legacy/native execution kernel
   - prompt construction
   - loop control
   - tool execution
   - follow-up context sanitation
   - model execution profile shaping
+
+Current state:
+- managed runtime is canonical and default (`runtime_kind=managed`)
+- legacy/native runtime remains compatibility-only (`runtime_kind=native`)
+- `/chat/stream` legacy path is env-gated via `ALLOW_LEGACY_CHAT_RUNTIME=true`
+- publish-direction is one canonical runtime contract with legacy reliability preserved behind explicit compatibility controls
 
 - [engine/context_schema.py](/Users/theshovonsaha/Developer/Github/agent/engine/context_schema.py)
   - typed context item model
@@ -65,6 +75,10 @@ The runtime already supports:
 - [memory/vector_engine.py](/Users/theshovonsaha/Developer/Github/agent/memory/vector_engine.py)
 - [memory/session_rag.py](/Users/theshovonsaha/Developer/Github/agent/memory/session_rag.py)
 - [memory/task_tracker.py](/Users/theshovonsaha/Developer/Github/agent/memory/task_tracker.py)
+- [engine/deterministic_facts.py](/Users/theshovonsaha/Developer/Github/agent/engine/deterministic_facts.py)
+- [engine/direct_fact_policy.py](/Users/theshovonsaha/Developer/Github/agent/engine/direct_fact_policy.py)
+- [engine/compression_fact_policy.py](/Users/theshovonsaha/Developer/Github/agent/engine/compression_fact_policy.py)
+- [shovs_memory/memory.py](/Users/theshovonsaha/Developer/Github/agent/shovs_memory/memory.py)
 
 ### Tools
 
@@ -142,6 +156,16 @@ Do not write code that allows:
 
 to become hard truth without grounding.
 
+Current deterministic coverage includes explicit user statements for:
+- preferred name
+- location
+- timezone
+- preferred editor
+- package manager
+- primary language
+
+Direct-fact queries over these fields can now answer from trusted memory without unnecessary tool use when the fact is already present.
+
 ### Candidate Signals
 
 Weak or unverified signals should be downgraded, not promoted.
@@ -150,6 +174,10 @@ That means:
 - use candidate context
 - keep it visible for planning or verification
 - do not treat it as truth
+
+Compression-side alias noise should also be blocked. Example:
+- keep `User location = Vancouver`
+- block `Shovon lives in Vancouver` from becoming a second hard fact when it is only a paraphrase of the trusted user lane
 
 ## Memory and Embedding Plumbing
 
@@ -214,7 +242,7 @@ Keep them narrow:
 - model
 - tools
 - system prompt
-- runtime behavior
+- runtime behavior (`managed` default; `native` only for compatibility cases)
 - workspace bootstrap docs
 - default loop/context/planner behavior
 
@@ -264,6 +292,9 @@ Useful test areas:
 - model-profile budget selection
 - run/checkpoint persistence
 - fact guard behavior
+- deterministic fact extraction and correction handling
+- direct-fact no-tool answers from trusted memory
+- sandbox file tool path compatibility
 - managed loop traces
 - follow-up sanitation after tool execution
 - memory provider and embedding transport compatibility

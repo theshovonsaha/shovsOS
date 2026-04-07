@@ -304,6 +304,32 @@ def test_agent_manager_routes_through_runtime_adapter():
     assert getattr(instance, "_runtime_capabilities").preferred_loop_mode == "single"
 
 
+def test_agent_manager_defaults_to_managed_runtime_when_profile_runtime_missing():
+    from orchestration.agent_manager import AgentManager
+
+    profiles = MagicMock()
+    profile = MagicMock()
+    profile.model = "llama3.2"
+    profile.tools = []
+    profile.system_prompt = "test"
+    profile.name = "Runtime Fallback"
+    profile.revision = 1
+    profile.runtime_kind = ""
+    profiles.get.return_value = profile
+
+    mgr = AgentManager(
+        profiles=profiles,
+        sessions=MagicMock(),
+        context_engine=MagicMock(),
+        adapter=MagicMock(),
+        global_registry=MagicMock(),
+    )
+
+    runtime = mgr.get_runtime_adapter(profile.runtime_kind)
+
+    assert getattr(runtime, "runtime_kind", None) == "managed"
+
+
 @pytest.mark.asyncio
 async def test_agent_manager_runtime_run_task_uses_registered_adapter():
     from orchestration.agent_manager import AgentManager
@@ -364,6 +390,43 @@ async def test_agent_manager_runtime_run_task_uses_registered_adapter():
     )
 
     assert result == "handled:do the thing"
+
+
+@pytest.mark.asyncio
+async def test_agent_manager_runtime_override_selects_managed_adapter():
+    from orchestration.agent_manager import AgentManager
+
+    profiles = MagicMock()
+    profile = MagicMock()
+    profile.model = "llama3.2"
+    profile.tools = []
+    profile.system_prompt = "test"
+    profile.name = "Default Runtime"
+    profile.revision = 1
+    profile.runtime_kind = "native"
+    profiles.get.return_value = profile
+
+    mgr = AgentManager(
+        profiles=profiles,
+        sessions=MagicMock(),
+        context_engine=MagicMock(),
+        adapter=MagicMock(),
+        global_registry=MagicMock(),
+    )
+
+    managed_runtime = mgr.get_runtime_adapter("managed")
+    managed_runtime.run_task = AsyncMock(return_value="managed-result")
+
+    result = await mgr.run_agent_task(
+        "default",
+        "delegate task",
+        parent_id="parent-session",
+        owner_id="owner-a",
+        runtime_kind_override="managed",
+    )
+
+    assert result == "managed-result"
+    managed_runtime.run_task.assert_awaited()
 
 
 # ── Context Assembly Order ──────────────────────────────────────────────────

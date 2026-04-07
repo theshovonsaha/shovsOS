@@ -12,16 +12,18 @@ Add these routes to main.py to expose the internal log stream.
    log("agent", "system", f"Request: agent={agent_id} model={model or 'default'}")
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.responses import StreamingResponse
 from typing import Optional
 import json
 from config.trace_store import get_trace_store
+from api.owner import require_owner_id
 
 
 def setup_log_routes(app: FastAPI):
     from config.logger import get_logger
     trace_store = get_trace_store()
+    _require_owner_id = require_owner_id
 
     @app.get("/logs/stream")
     async def log_stream(session_id: Optional[str] = None, category: Optional[str] = None):
@@ -125,8 +127,3 @@ def setup_log_routes(app: FastAPI):
         safe_window = max(10, min(2000, window))
         stats = trace_store.stats(session_id=session_id, run_id=run_id, owner_id=owner_id, window=safe_window)
         return stats
-    def _require_owner_id(owner_id: Optional[str]) -> str:
-        normalized = (owner_id or "").strip()
-        if not normalized:
-            raise HTTPException(status_code=400, detail="owner_id is required")
-        return normalized

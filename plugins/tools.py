@@ -39,6 +39,12 @@ from typing import Optional
 import httpx
 
 from plugins.tool_registry import Tool, ToolRegistry
+from plugins.tools_web import (
+    WEB_FETCH_TOOL as CANONICAL_WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL as CANONICAL_WEB_SEARCH_TOOL,
+    _web_fetch as _canonical_web_fetch,
+    _web_search as _canonical_web_search,
+)
 from config.logger import log
 from memory.task_tracker import get_session_task_tracker
 
@@ -178,7 +184,15 @@ async def _web_search(query: str, num_results: int = 8, backend: str = None, sea
             engine = "duckduckgo"
             results = await _search_duckduckgo(query, num_results)
             
-        return _format_search_results(query, results, engine=engine, max_results=num_results) if results else f"No results found for: {query} via {engine}."
+        if not results:
+            return json.dumps({
+                "type": "web_search_results",
+                "query": query,
+                "results": [],
+                "engine": engine,
+                "error": f"No results found for: {query} via {engine}."
+            })
+        return _format_search_results(query, results, engine=engine, max_results=num_results)
     except Exception as e:
         return f"web_search ({engine}) error: {e}"
 
@@ -487,7 +501,12 @@ BASH_TOOL = Tool(
 
 def _safe_path(path_str: str) -> Path:
     """Resolve path and ensure it stays inside SANDBOX_DIR."""
-    p = (SANDBOX_DIR / path_str).resolve()
+    normalized = str(path_str or "").strip()
+    if normalized.startswith("/sandbox/"):
+        normalized = normalized[len("/sandbox/"):]
+    elif normalized == "/sandbox":
+        normalized = "."
+    p = (SANDBOX_DIR / normalized).resolve()
     if not str(p).startswith(str(SANDBOX_DIR)):
         raise ValueError(f"Path '{path_str}' escapes sandbox — refused")
     return p
@@ -1080,43 +1099,47 @@ async def _query_memory(
 ) -> str:
     """Traverse the semantic graph memory for facts related to a topic."""
     try:
-        graph = _build_runtime_graph(kwargs)
         owner_id = kwargs.get("_owner_id")
-        if owner_id is None:
-            results = await graph.traverse(topic, top_k=5)
-        else:
-            results = await graph.traverse(topic, top_k=5, owner_id=owner_id)
-        deterministic_facts = []
         active_session_id = session_id or kwargs.get("_session_id")
-        if active_session_id:
-            if owner_id is None:
-                deterministic_facts = graph.get_current_facts(active_session_id)
-            else:
-                deterministic_facts = graph.get_current_facts(active_session_id, owner_id=owner_id)
-            if deterministic_facts:
-                topic_l = topic.lower()
-                topic_terms = {tok for tok in topic_l.split() if tok}
-                filtered = []
-                for s, p, o in deterministic_facts:
-                    joined = f"{s} {p} {o}".lower()
-                    if topic_l in joined or any(tok in joined for tok in topic_terms):
-                        filtered.append((s, p, o))
-                if filtered:
-                    deterministic_facts = filtered
+        graph = _build_runtime_graph(kwargs)
+        from memory.retrieval import unified_memory_search
 
-        if not results and not deterministic_facts:
+        payload = await unified_memory_search(
+            topic,
+            owner_id=owner_id,
+            session_id=active_session_id,
+            top_k=5,
+            graph=graph,
+        )
+        results = payload.get("results") or []
+        stats = payload.get("stats") or {}
+
+        if not results:
             return f"No memories found related to '{topic}'."
-        
-        lines = []
-        if deterministic_facts:
-            lines.append(f"Session facts ({len(deterministic_facts)}):")
-            for s, p, o in deterministic_facts[:5]:
-                lines.append(f"  - [{s}] --[{p}]--> [{o}]")
-            lines.append("")
 
-        lines.append(f"Found {len(results)} relevant memories:")
-        for r in results:
-            lines.append(f"  - [{r['subject']}] --[{r['predicate']}]--> [{r['object']}]  (confidence: {r['similarity']})")
+        lines = [
+            f"Unified memory results for '{topic}' ({len(results)}):",
+            f"  - source counts: {stats.get('source_counts', {})}",
+        ]
+        for item in results:
+            kind = str(item.get("kind") or "")
+            score = item.get("score")
+            source = ", ".join(item.get("sources") or [])
+            if kind in {"fact", "triplet"}:
+                lines.append(
+                    "  - "
+                    f"[{item.get('subject', '')}] --[{item.get('predicate', '')}]--> [{item.get('object', '')}] "
+                    f"(score: {score}, source: {source})"
+                )
+            else:
+                anchor = str(item.get("anchor") or "").replace("\n", " ").strip()
+                if len(anchor) > 180:
+                    anchor = anchor[:177].rstrip() + "..."
+                lines.append(
+                    "  - "
+                    f"[{item.get('key', 'memory_anchor')}] {anchor} "
+                    f"(score: {score}, source: {source})"
+                )
         return "\n".join(lines)
     except Exception as e:
         return f"Failed to query memory: {e}"
@@ -1529,16 +1552,14 @@ async def _delegate_to_agent(target_agent_id: Optional[str] = None, task: Option
         log("agent", "system", f"Delegating task to '{target_agent_id}': {str(task)[:50]}...", level="info")
         parent_run_id = kwargs.get("_run_id")
         owner_id = kwargs.get("_owner_id")
-        if parent_run_id is None and owner_id is None:
-            result = await _agent_manager.run_agent_task(target_agent_id, task, parent_id=parent_id)
-        else:
-            result = await _agent_manager.run_agent_task(
-                target_agent_id,
-                task,
-                parent_id=parent_id,
-                parent_run_id=parent_run_id,
-                owner_id=owner_id,
-            )
+        runtime_kind_override = str(kwargs.get("_delegate_runtime_kind") or "").strip().lower() or "managed"
+        delegate_kwargs = {
+            "parent_id": parent_id,
+            "parent_run_id": parent_run_id,
+            "owner_id": owner_id,
+            "runtime_kind_override": runtime_kind_override,
+        }
+        result = await _agent_manager.run_agent_task(target_agent_id, task, **delegate_kwargs)
         return result
     except Exception as e:
         return f"Delegation error: {e}"
@@ -1613,6 +1634,12 @@ RAG_SEARCH_TOOL = Tool(
     handler=_rag_search,
     tags=["memory", "rag"],
 )
+
+# Canonicalize web tool surface to tools_web so registration and imports use one source of truth.
+_web_search = _canonical_web_search
+_web_fetch = _canonical_web_fetch
+WEB_SEARCH_TOOL = CANONICAL_WEB_SEARCH_TOOL
+WEB_FETCH_TOOL = CANONICAL_WEB_FETCH_TOOL
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Registration helper

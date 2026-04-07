@@ -21,7 +21,7 @@ from config.config import cfg
 
 
 class SemanticGraph:
-    _http_clients: dict[tuple[str, float], httpx.AsyncClient] = {}
+    _http_clients: dict[tuple[str, float, int | None], httpx.AsyncClient] = {}
     _embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
     _cache_lock = threading.RLock()
 
@@ -39,7 +39,11 @@ class SemanticGraph:
 
     @classmethod
     def _get_http_client(cls, base_url: str, timeout: float) -> httpx.AsyncClient:
-        key = (base_url.rstrip("/"), float(timeout))
+        try:
+            loop_id = id(asyncio.get_running_loop())
+        except RuntimeError:
+            loop_id = None
+        key = (base_url.rstrip("/"), float(timeout), loop_id)
         client = cls._http_clients.get(key)
         if client is None or client.is_closed:
             limits = httpx.Limits(max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0)
@@ -446,3 +450,52 @@ class SemanticGraph:
                     ORDER BY valid_from ASC
                 ''', (session_id, owner_id))
             return cursor.fetchall()
+
+    def list_temporal_facts(
+        self,
+        session_id: str,
+        owner_id: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return the recent fact timeline for a session, including superseded facts."""
+        safe_limit = max(1, int(limit))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if owner_id is None:
+                cursor.execute(
+                    '''
+                    SELECT subject, predicate, object, valid_from, valid_to, created_at, run_id
+                    FROM facts
+                    WHERE session_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    ''',
+                    (session_id, safe_limit),
+                )
+            else:
+                cursor.execute(
+                    '''
+                    SELECT subject, predicate, object, valid_from, valid_to, created_at, run_id
+                    FROM facts
+                    WHERE session_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')
+                    ORDER BY id DESC
+                    LIMIT ?
+                    ''',
+                    (session_id, owner_id, safe_limit),
+                )
+            rows = cursor.fetchall()
+
+        return [
+            {
+                "subject": row["subject"],
+                "predicate": row["predicate"],
+                "object": row["object"],
+                "valid_from": row["valid_from"],
+                "valid_to": row["valid_to"],
+                "created_at": row["created_at"],
+                "run_id": row["run_id"],
+                "status": "current" if row["valid_to"] is None else "superseded",
+            }
+            for row in rows
+        ]

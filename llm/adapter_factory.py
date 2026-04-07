@@ -30,6 +30,7 @@ _KNOWN_PROVIDERS = {
     "gemini",
     "anthropic",
     "nvidia",
+    "bridge",
 }
 
 
@@ -113,6 +114,9 @@ def create_adapter(provider: str = None) -> BaseLLMAdapter:
     elif final_provider == "nvidia":
         from llm.nvidia_adapter import NvidiaAdapter
         adapter = NvidiaAdapter()
+    elif final_provider == "bridge":
+        from llm.bridge_adapter import BridgeAdapter
+        adapter = BridgeAdapter()
     else:
         from llm.llm_adapter import OllamaAdapter
         adapter = OllamaAdapter()

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security report
+    url: mailto:theshovonsaha@gmail.com
+    about: Report vulnerabilities privately; do not post security issues publicly.
+  - name: Support
+    url: https://github.com/theshovonsaha/agent/blob/main/SUPPORT.md
+    about: Read support guidance before opening issues.
