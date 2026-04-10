@@ -90,8 +90,6 @@ interface OptionsPanelProps {
   currentSearchEngine: string;
   setCurrentSearchEngine: (engine: string) => void;
   models: Record<string, string[]>;
-  runtimePath: 'legacy' | 'run_engine';
-  setRuntimePath: (val: 'legacy' | 'run_engine') => void;
   usePlanner: boolean;
   setUsePlanner: (val: boolean) => void;
   loopMode: 'auto' | 'single' | 'managed';
@@ -147,8 +145,6 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   currentSearchEngine,
   setCurrentSearchEngine,
   models,
-  runtimePath,
-  setRuntimePath,
   usePlanner,
   setUsePlanner,
   loopMode,
@@ -559,46 +555,23 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 fontWeight: 600,
               }}
             >
-              Runtime Path
+              Runtime
             </label>
             <div
               style={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-                gap: '8px',
+                minHeight: '42px',
+                borderRadius: '12px',
+                border: '1px solid var(--accent)',
+                background: 'rgba(111, 210, 255, 0.12)',
+                color: 'var(--accent)',
+                fontSize: '12px',
+                fontWeight: 600,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
               }}
             >
-              {[
-                { value: 'run_engine', label: 'Run Engine' },
-                { value: 'legacy', label: 'Legacy Core' },
-              ].map((option) => {
-                const active = runtimePath === option.value;
-                return (
-                  <button
-                    key={option.value}
-                    type='button'
-                    onClick={() =>
-                      setRuntimePath(option.value as 'legacy' | 'run_engine')
-                    }
-                    style={{
-                      minHeight: '42px',
-                      borderRadius: '12px',
-                      border: active
-                        ? '1px solid var(--accent)'
-                        : '1px solid var(--border)',
-                      background: active
-                        ? 'rgba(111, 210, 255, 0.12)'
-                        : 'var(--bg)',
-                      color: active ? 'var(--accent)' : 'var(--text-dim)',
-                      fontSize: '12px',
-                      fontWeight: 600,
-                      cursor: 'pointer',
-                    }}
-                  >
-                    {option.label}
-                  </button>
-                );
-              })}
+              Managed RunEngine
             </div>
             <p
               className='settings-help'
@@ -609,8 +582,8 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 lineHeight: 1.4,
               }}
             >
-              Run Engine uses the new checkpoint-first orchestration path.
-              Legacy Core keeps the older mixed runtime for comparison.
+              Nova now uses the canonical managed runtime only. Planning,
+              evidence, verification, and memory policy all flow through one path.
             </p>
           </div>
 

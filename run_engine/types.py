@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from engine.context_schema import ContextPhase
-
-
-RunEngineRuntimePath = Literal["legacy", "run_engine"]
 
 
 @dataclass(frozen=True)

@@ -47,6 +47,7 @@ export interface Session {
     id: string;
     title: string;
     model: string;
+    agent_id?: string;
     created_at: string;
     updated_at: string;
     message_count: number;
@@ -55,14 +56,65 @@ export interface Session {
 
 interface AgentSettingsProfile {
     id: string;
+    name?: string;
+    description?: string;
     model: string;
     embed_model?: string;
+    system_prompt?: string;
+    tools?: string[];
     default_use_planner?: boolean;
     default_loop_mode?: 'auto' | 'single' | 'managed';
     default_context_mode?: 'v1' | 'v2' | 'v3';
 }
 
-type RuntimePath = 'legacy' | 'run_engine';
+interface SessionMemoryState {
+    summary: {
+        deterministic_fact_count: number;
+        superseded_fact_count: number;
+        candidate_signal_count: number;
+        stance_signal_count: number;
+        context_line_count: number;
+        memory_signal_count: number;
+    };
+    deterministic_facts: Array<{
+        subject: string;
+        predicate: string;
+        object: string;
+        status: 'current' | 'superseded';
+        created_at?: string | null;
+    }>;
+    superseded_facts: Array<{
+        subject: string;
+        predicate: string;
+        object: string;
+        status: 'current' | 'superseded';
+        created_at?: string | null;
+    }>;
+    candidate_signals: Array<{
+        text: string;
+        reason: string;
+        signal_type?: string;
+        topic?: string;
+        confidence?: string;
+        superseded?: boolean;
+    }>;
+    stance_signals: Array<{
+        text: string;
+        reason: string;
+        signal_type?: string;
+        topic?: string;
+        confidence?: string;
+        superseded?: boolean;
+    }>;
+    recent_memory_signals: Array<{
+        event_type: string;
+        label: string;
+        summary: string;
+        created_at?: string;
+    }>;
+    explanation: string[];
+}
+
 
 export interface Attachment {
     id: string;
@@ -224,6 +276,7 @@ export function useAgent() {
     const [models, setModels] = useState<Record<string, string[]>>({ ollama: ['llama3.2'] });
     const [embedModels, setEmbedModels] = useState<Record<string, string[]>>({ 'ollama': ['nomic-embed-text'] });
     const [tools, setTools] = useState<any[]>([]);
+    const [activeAgentProfile, setActiveAgentProfile] = useState<AgentSettingsProfile | null>(null);
     const [sessions, setSessions] = useState<Session[]>([]);
     const [currentSessionId, setCurrentSessionId] = useState<string | null>(localStorage.getItem('shovs_current_sid'));
     const [activeAgentId, setActiveAgentId] = useState<string | null>(localStorage.getItem('shovs_active_agent_id'));
@@ -233,13 +286,10 @@ export function useAgent() {
     const [messages, setMessages] = useState<Message[]>([]);
     const [contextLines, setContextLines] = useState(0);
     const [contextMode, setContextMode] = useState<'v1' | 'v2' | 'v3'>('v1');
+    const [sessionMemoryState, setSessionMemoryState] = useState<SessionMemoryState | null>(null);
     const [isStreaming, setIsStreaming] = useState(false);
     const [pendingFiles, setPendingFiles] = useState<Attachment[]>([]);
     const [forcedTools, setForcedTools] = useState<string[]>([]);
-    const [runtimePath, setRuntimePath] = useState<RuntimePath>(
-        (localStorage.getItem('shovs_runtime_path') as RuntimePath) || 'run_engine'
-    );
-
     // V10 Layer Controls
     const [usePlanner, setUsePlanner] = useState<boolean>(localStorage.getItem('shovs_use_planner') !== 'false');
     const [loopMode, setLoopMode] = useState<'auto' | 'single' | 'managed'>(
@@ -278,7 +328,6 @@ export function useAgent() {
     const conversationRef = useRef<HTMLElement | null>(null);
 
     useEffect(() => { fetchHealth(); fetchModels(); fetchTools(); }, []);
-    useEffect(() => { fetchSessions(); }, [activeAgentId]);
     useEffect(() => {
         let cancelled = false;
 
@@ -375,10 +424,6 @@ export function useAgent() {
         else localStorage.removeItem('shovs_current_sid');
     }, [currentSessionId]);
 
-    useEffect(() => {
-        localStorage.setItem('shovs_runtime_path', runtimePath);
-    }, [runtimePath]);
-
     // Auto-load session on first mount if SID exists
     useEffect(() => {
         const savedSid = localStorage.getItem('shovs_current_sid');
@@ -449,6 +494,40 @@ export function useAgent() {
         } catch { }
     };
 
+    const fetchActiveAgentProfile = useCallback(async (agentId?: string | null) => {
+        const targetAgentId = agentId || activeAgentId;
+        if (!targetAgentId) {
+            setActiveAgentProfile(null);
+            return;
+        }
+        try {
+            const data: AgentSettingsProfile = await fetch(
+                withOwnerQuery(`/api/agents/${targetAgentId}`),
+            ).then((r) => r.json());
+            setActiveAgentProfile(data);
+        } catch (e) {
+            console.error('Failed to load active agent profile', e);
+            setActiveAgentProfile(null);
+        }
+    }, [activeAgentId]);
+
+    const refreshSessionMemoryState = useCallback(async (sessionIdOverride?: string | null) => {
+        const targetSessionId = sessionIdOverride || currentSessionId;
+        if (!targetSessionId) {
+            setSessionMemoryState(null);
+            return;
+        }
+        try {
+            const data: SessionMemoryState = await fetch(
+                withOwnerQuery(`/api/sessions/${targetSessionId}/memory-state`),
+            ).then((r) => r.json());
+            setSessionMemoryState(data);
+        } catch (e) {
+            console.error('Failed to load session memory state', e);
+            setSessionMemoryState(null);
+        }
+    }, [currentSessionId]);
+
     const fetchSessions = useCallback(async () => {
         try {
             const url = activeAgentId
@@ -459,6 +538,10 @@ export function useAgent() {
         } catch { }
     }, [activeAgentId]);
 
+    useEffect(() => { fetchSessions(); }, [activeAgentId, fetchSessions]);
+    useEffect(() => { fetchActiveAgentProfile(activeAgentId); }, [activeAgentId, fetchActiveAgentProfile]);
+    useEffect(() => { refreshSessionMemoryState(currentSessionId); }, [currentSessionId, refreshSessionMemoryState]);
+
     const loadSession = async (id: string) => {
         if (isSendingRef.current) return;
         try {
@@ -467,6 +550,10 @@ export function useAgent() {
                 fetch(withOwnerQuery(`/api/logs/traces/recent?session_id=${encodeURIComponent(id)}&limit=260`)).then(r => r.json()).catch(() => ({ events: [] })),
             ]);
             setCurrentSessionId(id);
+            if (data.agent_id) {
+                setActiveAgentId(data.agent_id);
+                fetchActiveAgentProfile(data.agent_id);
+            }
             if (data.model) setCurrentModel(data.model);
             const traceBlockGroups = buildAssistantBlockGroupsFromTrace(Array.isArray(traceData?.events) ? traceData.events : []);
             let assistantIndex = 0;
@@ -532,6 +619,7 @@ export function useAgent() {
             setMessages(loaded);
             setContextLines(data.context_lines || 0);
             setContextMode(data.context_mode === 'v2' ? 'v2' : data.context_mode === 'v3' ? 'v3' : 'v1');
+            refreshSessionMemoryState(id);
             fetchSessions();
         } catch (e) { console.error(e); }
     };
@@ -652,7 +740,6 @@ export function useAgent() {
             fd.append('context_model', contextModel);
             fd.append('context_mode', contextMode);
             fd.append('embed_model', embedModel);
-            fd.append('runtime_path', runtimePath);
             fd.append('use_planner', usePlanner.toString());
             fd.append('loop_mode', loopMode);
             if (maxToolCalls.trim()) fd.append('max_tool_calls', maxToolCalls.trim());
@@ -831,6 +918,7 @@ export function useAgent() {
                             case 'context_updated':
                                 msg.blocks = msg.blocks.filter(b => b.type !== 'compressing');
                                 setContextLines(ev.lines);
+                                refreshSessionMemoryState(currentSessionId);
                                 fetchSessions();
                                 break;
 
@@ -878,6 +966,7 @@ export function useAgent() {
         } finally {
             setIsStreaming(false);
             isSendingRef.current = false;
+            refreshSessionMemoryState(currentSessionId);
         }
     };
 
@@ -1106,11 +1195,13 @@ export function useAgent() {
     return {
         health, models, tools, sessions, currentSessionId,
         activeAgentId, setActiveAgentId,
+        activeAgentProfile,
         currentModel, setCurrentModel,
         currentSearchBackend, setCurrentSearchBackend,
         currentSearchEngine, setCurrentSearchEngine,
         messages, contextLines,
         contextMode, setSessionContextMode,
+        sessionMemoryState,
         isStreaming, pendingFiles,
         forcedTools, setForcedTools,
         isListening, speaking, voiceStatus,
@@ -1132,9 +1223,8 @@ export function useAgent() {
         setShowActorThought,
         showObserverActivity,
         setShowObserverActivity,
-        runtimePath,
-        setRuntimePath,
         clearSessionContext,
+        refreshSessionMemoryState,
         loadSession, newSession, deleteSession,
         addFiles, removeFile, sendMessage, stopExecution, bottomRef, conversationRef,
         pendingConfirmation, approveConfirmation, denyConfirmation,

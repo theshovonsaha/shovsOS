@@ -1197,7 +1197,13 @@ class RunEngine:
                 tools=self._get_schema_subset(available_names),
             )
         except Exception as exc:
-            log("run_engine", request.session_id, f"Tool actor completion failed: {exc}", level="warn")
+            log(
+                "run_engine",
+                request.session_id,
+                f"Tool actor completion failed: {exc}",
+                level="warn",
+                owner_id=request.owner_id,
+            )
 
         call = extract_tool_call(raw, self.tool_registry) if raw else None
         if call is not None:

@@ -2,8 +2,8 @@
 Built-in Tools
 --------------
 Real implementations for:
-  - web_search       DuckDuckGo (no API key required)
-  - web_fetch        httpx full-page retrieval
+  - web_search       canonical web search from tools_web.py
+  - web_fetch        canonical web fetch from tools_web.py
   - image_search     DuckDuckGo images (no API key required)
     - bash             sandboxed Docker command execution
   - file_create      write file inside sandbox dir
@@ -34,7 +34,7 @@ import shlex
 import subprocess
 import textwrap
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 
@@ -48,6 +48,9 @@ from plugins.tools_web import (
 from config.logger import log
 from memory.task_tracker import get_session_task_tracker
 
+if TYPE_CHECKING:
+    from orchestration.agent_manager import AgentManager
+
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -60,45 +63,67 @@ SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 
 _agent_manager: Optional[AgentManager] = None  # Injected during registration
 
+WEB_SEARCH_TOOL = CANONICAL_WEB_SEARCH_TOOL
+WEB_FETCH_TOOL = CANONICAL_WEB_FETCH_TOOL
+_web_search = _canonical_web_search
+_web_fetch = _canonical_web_fetch
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  WEB SEARCH  —  DuckDuckGo HTML scrape (no API key)
-# ══════════════════════════════════════════════════════════════════════════════
 
-async def _search_tavily(query: str, num_results: int, api_key: str) -> list[dict]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.post(
-            "https://api.tavily.com/search",
-            json={"api_key": api_key, "query": query, "include_answer": False, "max_results": num_results},
-            headers={"Content-Type": "application/json"}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")} for r in data.get("results", [])]
+def _normalize_search_results(results: list[dict], max_results: int = 8) -> list[dict]:
+    """Compatibility helper kept for tests and fallback search formatting."""
+    normalized: list[dict] = []
+    seen_urls: set[str] = set()
 
-async def _search_brave(query: str, num_results: int, api_key: str) -> list[dict]:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            params={"q": query, "count": min(num_results, 20)},
-            headers={"Accept": "application/json", "X-Subscription-Token": api_key}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("description", "")} for r in data.get("web", {}).get("results", [])]
+    for item in results or []:
+        title = str(item.get("title", "")).strip()
+        url = str(item.get("url", "")).strip()
+        snippet = re.sub(r"\s+", " ", str(item.get("snippet", "")).strip()).strip()
+        source = str(item.get("source", "")).strip()
 
-async def _search_searxng(query: str, num_results: int, base_url: str) -> list[dict]:
-    url = base_url.rstrip("/") + "/search"
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        resp = await client.get(
-            url,
-            params={"q": query, "format": "json"}
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [{"title": r.get("title", ""), "url": r.get("url", ""), "snippet": r.get("content", "")} for r in data.get("results", [])[:num_results]]
+        if not title and not snippet:
+            continue
+        if not snippet:
+            snippet = title or "Untitled"
+        if len(snippet) > 320:
+            snippet = snippet[:317].rstrip() + "..."
+
+        url_key = url.lower().rstrip("/")
+        if url_key and url_key in seen_urls:
+            continue
+        if url_key:
+            seen_urls.add(url_key)
+
+        entry = {"title": title or "Untitled", "url": url, "snippet": snippet}
+        if source:
+            entry["source"] = source
+        normalized.append(entry)
+        if len(normalized) >= max(1, max_results):
+            break
+
+    return normalized
+
+
+def _format_search_results(
+    query: str,
+    results: list[dict],
+    engine: str = "unknown",
+    max_results: int = 8,
+) -> str:
+    cleaned = _normalize_search_results(results, max_results=max_results)
+    context_summary = "\n".join(f"- {item['snippet']}" for item in cleaned[:3])
+    return json.dumps(
+        {
+            "type": "web_search_results",
+            "query": query,
+            "engine": engine,
+            "context_summary": context_summary,
+            "results": cleaned,
+        }
+    )
+
 
 async def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
+    """Compatibility fallback used by tools_web when DuckDuckGo is requested directly."""
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -107,7 +132,7 @@ async def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
         "Accept-Language": "en-US,en;q=0.9",
     }
     results: list[dict] = []
-    
+
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
             resp = await client.get(
@@ -118,23 +143,29 @@ async def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
             data = resp.json()
 
         if data.get("AbstractText"):
-            results.append({
-                "title": data.get("Heading", "Answer"),
-                "url":   data.get("AbstractURL", ""),
-                "snippet": data["AbstractText"],
-            })
+            results.append(
+                {
+                    "title": data.get("Heading", "Answer"),
+                    "url": data.get("AbstractURL", ""),
+                    "snippet": data["AbstractText"],
+                    "source": "duckduckgo",
+                }
+            )
 
         for topic in data.get("RelatedTopics", []):
             if len(results) >= num_results:
                 break
             if isinstance(topic, dict) and "Text" in topic:
-                results.append({
-                    "title":   topic.get("Text", "")[:80],
-                    "url":     topic.get("FirstURL", ""),
-                    "snippet": topic.get("Text", ""),
-                })
+                results.append(
+                    {
+                        "title": topic.get("Text", "")[:80],
+                        "url": topic.get("FirstURL", ""),
+                        "snippet": topic.get("Text", ""),
+                        "source": "duckduckgo",
+                    }
+                )
         if results:
-            return results
+            return results[:num_results]
     except Exception:
         pass
 
@@ -152,225 +183,25 @@ async def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
             r'class="result__snippet"[^>]*>(.*?)</span>',
             re.DOTALL,
         )
-        for m in block_re.finditer(html):
+        for match in block_re.finditer(html):
             if len(results) >= num_results:
                 break
-            url     = m.group(1).strip()
-            title   = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-            snippet = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+            url = match.group(1).strip()
+            title = re.sub(r"<[^>]+>", "", match.group(2)).strip()
+            snippet = re.sub(r"<[^>]+>", "", match.group(3)).strip()
             if url and title:
-                results.append({"title": title, "url": url, "snippet": snippet})
+                results.append(
+                    {
+                        "title": title,
+                        "url": url,
+                        "snippet": snippet,
+                        "source": "duckduckgo",
+                    }
+                )
     except Exception:
         pass
 
-    return results
-
-async def _web_search(query: str, num_results: int = 8, backend: str = None, search_engine: str = None) -> str:
-    """
-    Dynamic Web Search using the configured engine.
-    Supports Tavily, Brave, SearxNG, and DuckDuckGo (fallback).
-    """
-    from config.config import cfg
-    engine = (search_engine or cfg.SEARCH_ENGINE).lower()
-    
-    try:
-        if engine == "tavily" and cfg.TAVILY_API_KEY:
-            results = await _search_tavily(query, num_results, cfg.TAVILY_API_KEY)
-        elif engine == "brave" and cfg.BRAVE_SEARCH_KEY:
-            results = await _search_brave(query, num_results, cfg.BRAVE_SEARCH_KEY)
-        elif engine == "searxng" and cfg.SEARXNG_URL:
-            results = await _search_searxng(query, num_results, cfg.SEARXNG_URL)
-        else:
-            engine = "duckduckgo"
-            results = await _search_duckduckgo(query, num_results)
-            
-        if not results:
-            return json.dumps({
-                "type": "web_search_results",
-                "query": query,
-                "results": [],
-                "engine": engine,
-                "error": f"No results found for: {query} via {engine}."
-            })
-        return _format_search_results(query, results, engine=engine, max_results=num_results)
-    except Exception as e:
-        return f"web_search ({engine}) error: {e}"
-
-
-def _normalize_search_results(results: list[dict], max_results: int = 8) -> list[dict]:
-    """Normalize and de-duplicate raw search results for better context quality."""
-    normalized: list[dict] = []
-    seen_urls: set[str] = set()
-
-    for r in results or []:
-        title = str(r.get("title", "")).strip()
-        url = str(r.get("url", "")).strip()
-        snippet = str(r.get("snippet", "")).strip()
-        source = str(r.get("source", "")).strip()
-
-        if not title and not snippet:
-            continue
-        if not snippet:
-            snippet = title
-        snippet = re.sub(r"\s+", " ", snippet).strip()
-        if len(snippet) > 320:
-            snippet = snippet[:317].rstrip() + "..."
-
-        url_key = url.lower().rstrip("/")
-        if url_key and url_key in seen_urls:
-            continue
-        if url_key:
-            seen_urls.add(url_key)
-
-        normalized.append({
-            "title": title or "Untitled",
-            "url": url,
-            "snippet": snippet,
-            "source": source,
-        })
-        if len(normalized) >= max_results:
-            break
-
-    return normalized
-
-
-def _format_search_results(query: str, results: list[dict], engine: str = "unknown", max_results: int = 8) -> str:
-    cleaned = _normalize_search_results(results, max_results=max(1, max_results))
-    context_summary = "\n".join(f"- {item['snippet']}" for item in cleaned[:3])
-    return json.dumps({
-        "type": "web_search_results",
-        "query": query,
-        "engine": engine,
-        "context_summary": context_summary,
-        "results": cleaned
-    })
-
-
-WEB_SEARCH_TOOL = Tool(
-    name="web_search",
-    description=(
-        "Search the web for current information using DuckDuckGo. "
-        "Use for recent news, facts, or anything that may have changed. "
-        "Returns titles, URLs and snippets."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "query":       {"type": "string",  "description": "The search query"},
-            "num_results": {"type": "integer", "description": "Max results (default 8, max 20)", "default": 8},
-        },
-        "required": ["query"],
-    },
-    handler=_web_search,
-    tags=["web", "search"],
-    response_format="json",
-)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  WEB FETCH  —  full page text via httpx
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _web_fetch(url: str, max_chars: int = 12000) -> str:
-    """Fetch and return well-structured, readable text from a URL."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "Chrome/120 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    try:
-        async with httpx.AsyncClient(
-            timeout=HTTP_TIMEOUT,
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "")
-
-            if "json" in content_type:
-                return json.dumps({
-                    "type": "web_fetch_result",
-                    "url": url,
-                    "content": json.dumps(resp.json(), indent=2)[:max_chars],
-                    "truncated": False,
-                    "total_length": len(resp.text),
-                    "title": url,
-                })
-
-            html = resp.text
-
-            # — PHASE 20: High-Signal Extraction using trafilatura —
-            import trafilatura
-            
-            # Extract main content with readability logic
-            clean_text = trafilatura.extract(
-                html, 
-                include_links=True, 
-                include_images=False, 
-                output_format='txt',
-                include_comments=False,
-                include_tables=True
-            )
-            
-            # Metadata extraction
-            metadata = trafilatura.extract_metadata(html)
-            title = metadata.title if metadata and metadata.title else url
-
-            if not clean_text:
-                # Fallback to a very basic strip if trafilatura fails
-                from html.parser import HTMLParser
-                class SimpleExtractor(HTMLParser):
-                    def __init__(self):
-                        super().__init__()
-                        self.text = []
-                    def handle_data(self, d): self.text.append(d)
-                    def get_text(self): return " ".join(self.text)
-                
-                ext = SimpleExtractor()
-                ext.feed(html)
-                clean_text = ext.get_text()
-
-            # Structure the final response
-            final_content = clean_text.strip()[:max_chars]
-            
-            return json.dumps({
-                "type": "web_fetch_result",
-                "url": url,
-                "title": title,
-                "content": final_content,
-                "truncated": len(clean_text) > max_chars,
-                "total_length": len(clean_text)
-            })
-
-    except httpx.HTTPStatusError as e:
-        return json.dumps({"type": "web_fetch_result", "url": url, "error": f"HTTP {e.response.status_code}"})
-    except Exception as e:
-        return json.dumps({"type": "web_fetch_result", "url": url, "error": str(e)})
-
-
-WEB_FETCH_TOOL = Tool(
-    name="web_fetch",
-    description=(
-        "Fetch the full text content of a specific URL. "
-        "Use when you need to read an entire page, not just a snippet. "
-        "Strips HTML and returns readable text."
-    ),
-    parameters={
-        "type": "object",
-        "properties": {
-            "url":       {"type": "string",  "description": "Full URL to fetch"},
-            "max_chars": {"type": "integer", "description": "Max chars to return (default 8000)", "default": 8000},
-        },
-        "required": ["url"],
-    },
-    handler=_web_fetch,
-    tags=["web", "fetch"],
-    response_format="json",
-)
+    return results[:num_results]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1634,12 +1465,6 @@ RAG_SEARCH_TOOL = Tool(
     handler=_rag_search,
     tags=["memory", "rag"],
 )
-
-# Canonicalize web tool surface to tools_web so registration and imports use one source of truth.
-_web_search = _canonical_web_search
-_web_fetch = _canonical_web_fetch
-WEB_SEARCH_TOOL = CANONICAL_WEB_SEARCH_TOOL
-WEB_FETCH_TOOL = CANONICAL_WEB_FETCH_TOOL
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Registration helper

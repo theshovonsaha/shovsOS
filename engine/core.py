@@ -1,5 +1,10 @@
 """
-AgentCore v3 — intelligence fixes + structured tracing
+AgentCore compatibility runtime.
+
+This module remains in the repo for low-level compatibility paths, packet
+parity work, and regression coverage. Live product traffic now routes through
+`run_engine/engine.py`; changes here should preserve compatibility behavior and
+shared packet semantics rather than introduce a second primary runtime.
 """
 
 import asyncio
@@ -1322,6 +1327,7 @@ def _looks_like_tool_instability(tool_name: str, content: str) -> bool:
     return False
 
 class AgentCore:
+    """Compatibility/test runtime substrate kept for parity and low-level probes."""
 
     def __init__(
         self,

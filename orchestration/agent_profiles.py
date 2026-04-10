@@ -17,10 +17,10 @@ DEFAULT_RUNTIME_KIND = "managed"
 RUNTIME_KIND_ALIASES = {
     "managed": "managed",
     "run_engine": "managed",
-    "native": "native",
-    "legacy": "native",
-    "agent_core": "native",
-    "agentcore": "native",
+    "native": "managed",
+    "legacy": "managed",
+    "agent_core": "managed",
+    "agentcore": "managed",
 }
 DEFAULT_AGENT_TOOLS = [
     "web_search",

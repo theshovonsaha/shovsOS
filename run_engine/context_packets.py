@@ -9,6 +9,7 @@ from engine.context_memory_items import build_context_engine_memory_items
 from engine.conversation_tension import ConversationTension, render_conversation_tension
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from run_engine.evidence_lane import build_working_evidence_block, build_working_evidence_snapshot
+from run_engine.meta_context import build_meta_context_block, build_meta_context_snapshot
 from run_engine.tool_contract import format_tool_result_line
 from run_engine.types import CompiledPassPacket, RunEngineRequest
 
@@ -107,6 +108,51 @@ def build_phase_packet(
         )
     )
 
+    candidate_context = str(getattr(session, "candidate_context", "") or "").strip()
+    evidence_objective = inputs.effective_objective or inputs.request.user_message
+    evidence_snapshot = build_working_evidence_snapshot(
+        inputs.tool_results,
+        user_message=evidence_objective,
+        max_results=3,
+    )
+    meta_snapshot = build_meta_context_snapshot(
+        objective=evidence_objective,
+        allowed_tools=inputs.allowed_tools,
+        current_facts=inputs.current_facts,
+        candidate_context=candidate_context,
+        evidence_snapshot=evidence_snapshot,
+        conversation_tension=inputs.conversation_tension,
+        observation_status=inputs.observation_status,
+    )
+    meta_context = build_meta_context_block(meta_snapshot)
+    if meta_context:
+        items.append(
+            ContextItem(
+                item_id="meta_context",
+                kind=ContextKind.META,
+                title="Meta Context",
+                content=meta_context,
+                source="run_engine",
+                priority=31,
+                max_chars=1200,
+                trace_id="run_engine:meta_context",
+                provenance={
+                    "known_fact_count": meta_snapshot.known_fact_count,
+                    "candidate_count": meta_snapshot.candidate_count,
+                    "evidence_count": meta_snapshot.evidence_count,
+                    "exact_match_count": meta_snapshot.exact_match_count,
+                    "substantive_evidence_count": meta_snapshot.substantive_evidence_count,
+                },
+                phase_visibility=frozenset({
+                    ContextPhase.PLANNING,
+                    ContextPhase.ACTING,
+                    ContextPhase.RESPONSE,
+                    ContextPhase.VERIFICATION,
+                    ContextPhase.MEMORY_COMMIT,
+                }),
+            )
+        )
+
     items.append(
         ContextItem(
             item_id="loop_contract",
@@ -179,7 +225,6 @@ def build_phase_packet(
             )
         )
 
-    candidate_context = str(getattr(session, "candidate_context", "") or "").strip()
     if candidate_context:
         items.append(
             ContextItem(
@@ -298,12 +343,6 @@ def build_phase_packet(
             )
         )
 
-    evidence_objective = inputs.effective_objective or inputs.request.user_message
-    evidence_snapshot = build_working_evidence_snapshot(
-        inputs.tool_results,
-        user_message=evidence_objective,
-        max_results=3,
-    )
     working_evidence = build_working_evidence_block(
         inputs.tool_results,
         user_message=evidence_objective,

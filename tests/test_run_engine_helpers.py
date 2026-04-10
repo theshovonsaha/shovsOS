@@ -338,13 +338,54 @@ def test_build_phase_packet_can_include_shared_session_and_memory_lanes():
     )
 
     assert "Session Anchor" in packet.content
+    assert "Meta Context" in packet.content
+    assert "Epistemic Posture:" in packet.content
     assert "Deterministic Facts" in packet.content
     assert "Candidate Signals" in packet.content
     assert "Working Evidence" in packet.content
     assert "Curated evidence most relevant to the current objective." in packet.content
+    meta_item = next(item for item in packet.trace["included"] if item["item_id"] == "meta_context")
+    assert meta_item["kind"] == "meta"
+    assert meta_item["provenance"]["known_fact_count"] == 1
+    assert meta_item["provenance"]["candidate_count"] == 1
     evidence_item = next(item for item in packet.trace["included"] if item["item_id"] == "working_evidence")
     assert evidence_item["kind"] == "evidence"
     assert evidence_item["provenance"]["selected_count"] == 1
+
+
+def test_build_phase_packet_meta_context_can_define_minimum_probe():
+    from types import SimpleNamespace
+
+    from engine.context_schema import ContextPhase
+    from run_engine.context_packets import PacketBuildInputs, build_phase_packet
+    from run_engine.types import RunEngineRequest
+
+    packet = build_phase_packet(
+        context_engine=None,
+        inputs=PacketBuildInputs(
+            request=RunEngineRequest(
+                session_id="packet-meta-probe",
+                owner_id="owner-1",
+                agent_id="default",
+                user_message="Research wigglebudget.com",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+            ),
+            session=SimpleNamespace(first_message="Research wigglebudget.com", sliding_window=[]),
+            phase=ContextPhase.PLANNING,
+            system_prompt="You are Shovs.",
+            effective_objective="Research wigglebudget.com",
+            current_context="",
+            allowed_tools=[{"name": "web_fetch", "description": "Fetch exact page"}, {"name": "web_search", "description": "Search the web"}],
+            tool_results=[],
+        ),
+    )
+
+    assert "Minimum Next Probe:" in packet.content
+    assert "Fetch the exact target directly: wigglebudget.com." in packet.content
+    meta_item = next(item for item in packet.trace["included"] if item["item_id"] == "meta_context")
+    assert meta_item["kind"] == "meta"
+    assert meta_item["provenance"]["evidence_count"] == 0
 
 
 def test_build_phase_packet_prefers_resolved_working_objective_when_present():

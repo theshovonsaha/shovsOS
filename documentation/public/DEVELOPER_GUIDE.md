@@ -41,9 +41,8 @@ The runtime already supports:
 
 Current state:
 - managed runtime is canonical and default (`runtime_kind=managed`)
-- legacy/native runtime remains compatibility-only (`runtime_kind=native`)
-- `/chat/stream` legacy path is env-gated via `ALLOW_LEGACY_CHAT_RUNTIME=true`
-- publish-direction is one canonical runtime contract with legacy reliability preserved behind explicit compatibility controls
+- legacy/native code remains only as low-level compatibility/test coverage, not as a live route selection path
+- publish-direction is one canonical runtime contract with observable state, evidence, and memory policies converged on the managed runtime
 
 - [engine/context_schema.py](/Users/theshovonsaha/Developer/Github/agent/engine/context_schema.py)
   - typed context item model

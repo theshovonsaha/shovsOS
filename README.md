@@ -19,11 +19,7 @@ Shovs is designed as:
 - an autonomous agent body (runtime, tools, memory, and orchestration) that executes work
 
 The project currently runs with one canonical execution center:
-- managed path: `run_engine/engine.py` (default)
-
-Compatibility path (optional):
-- legacy-native path: `engine/core.py`
-- enabled only when `ALLOW_LEGACY_CHAT_RUNTIME=true` and `runtime_path=legacy`
+- managed path: `run_engine/engine.py`
 
 The open-source direction is explicit convergence to one canonical runtime contract while preserving proven reliability behaviors behind controlled compatibility flags.
 
@@ -244,9 +240,8 @@ User/UI
       --> RunStore + TraceStore (checkpoints, artifacts, evals)
       --> AdapterFactory (Ollama|LM Studio|OpenAI|Groq|...)
 
-Legacy compatibility (opt-in)
-  `/chat/stream` + `runtime_path=legacy`
-    --> AgentCore (`engine/core.py`)
+Internal compatibility modules remain in the repo for test coverage and incremental migration,
+but user-facing chat routes run through `RunEngine`.
 ```
 
 ## Repository Map
