@@ -9,7 +9,7 @@ Shovs is organized as a human control center over an autonomous agent body.
 - `frontend_consumer`: simplified user-facing interaction plane.
 
 2. Autonomous agent body:
-- runtime execution (`run_engine` and legacy runtime during convergence)
+- runtime execution (`run_engine`)
 - orchestration, tools, memory, traces, checkpoints, and evals
 
 3. Shared substrate:
@@ -23,10 +23,6 @@ Shovs is organized as a human control center over an autonomous agent body.
 
 Canonical execution center:
 - managed runtime: `run_engine/engine.py`
-
-Compatibility execution center (opt-in):
-- legacy runtime: `engine/core.py`
-- only when `ALLOW_LEGACY_CHAT_RUNTIME=true` and route requests `runtime_path=legacy`
 
 Convergence objective (active):
 - one canonical runtime contract

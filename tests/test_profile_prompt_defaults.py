@@ -73,7 +73,7 @@ def test_profile_runtime_kind_legacy_aliases_normalize(tmp_path):
     stored = pm.get("runtime_alias_test")
 
     assert stored is not None
-    assert stored.runtime_kind == "native"
+    assert stored.runtime_kind == "managed"
 
 
 def test_profile_bootstrap_fields_round_trip(tmp_path):

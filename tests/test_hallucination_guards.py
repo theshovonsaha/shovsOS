@@ -53,11 +53,14 @@ async def test_solvability_guard_pivot_logic():
         if ev["type"] == "token":
             full_output += ev["content"]
         
-    # 3. Verify — the pivot message uses "[SYSTEM: Tool '...' failed 3 times. ...]"
-    last_user_msg = messages[-1]["content"]
-    assert "failed 3 times" in last_user_msg
-    assert "test_tool" in last_user_msg
-    assert "Stop attempting it" in last_user_msg
+    # 3. Verify — the circuit breaker opened after 3 failures.
+    # The runtime now uses a circuit-breaker pattern: after 3 failures the tool is
+    # blocked and the loop continues to a final non-tool response (turn 4).
+    tool_results = [ev for ev in events if ev.get("type") == "tool_result"]
+    assert len(tool_results) == 3, f"Should record exactly 3 tool failures before circuit opens, got {len(tool_results)}"
+    assert all(ev.get("success") is False for ev in tool_results), "All 3 tool results should be failures"
+    # Final turn should produce a non-tool response (the "Final answer" text)
+    assert full_output.endswith("Final answer")
 
 
 @pytest.mark.asyncio

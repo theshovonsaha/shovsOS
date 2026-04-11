@@ -355,7 +355,7 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
 
                 <div className="form-section">
                     <div className="input-group">
-                        <label>Quick Presets</label>
+                        <label>Starting Templates</label>
                         <div className="agent-preset-row">
                             {(Object.keys(AGENT_PRESETS) as AgentPresetId[]).map((presetId) => (
                                 <button
@@ -368,6 +368,9 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                                     {AGENT_PRESETS[presetId].label}
                                 </button>
                             ))}
+                        </div>
+                        <div className="agent-builder-note" style={{ marginTop: '8px' }}>
+                            Templates are only starting points. The agent can be steered and molded later through chat, prompt edits, and capability changes.
                         </div>
                     </div>
 

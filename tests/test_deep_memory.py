@@ -72,13 +72,18 @@ async def test_store_and_query_tools():
         mock_instance.traverse = AsyncMock(return_value=[
             {"subject": "User", "predicate": "is allergic to", "object": "peanuts", "similarity": 0.95}
         ])
+        mock_instance.list_loci = MagicMock(return_value=[])
+        mock_instance.get_compiled_drawer = MagicMock(return_value=None)
+        mock_instance.get_current_facts = MagicMock(return_value=[])
         MockGraph.return_value = mock_instance
         
         # Test Store
         res_store = await _store_memory("User", "is allergic to", "peanuts")
         assert "Successfully stored" in res_store
         assert "peanuts" in res_store
-        mock_instance.add_triplet.assert_called_once_with("User", "is allergic to", "peanuts")
+        mock_instance.add_triplet.assert_called_once()
+        call_args = mock_instance.add_triplet.call_args
+        assert call_args[0] == ("User", "is allergic to", "peanuts")
         
         # Test Query
         res_query = await _query_memory("allergies")

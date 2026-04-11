@@ -39,7 +39,7 @@ class Session:
     owner_id:            Optional[str] = None
     created_at:          str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at:          str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    model:               str = "llama3.2" # Fallback
+    model:               str = cfg.DEFAULT_MODEL # Fallback
     system_prompt:       str = ""
     compressed_context:  str = ""
     candidate_context:   str = ""

@@ -23,8 +23,18 @@ from orchestration.agent_runtime import (
     AgentRuntimeServices,
 )
 from orchestration.managed_runtime_adapter import create_managed_runtime_adapter
-from orchestration.native_runtime_adapter import create_native_runtime_adapter
 from plugins.tool_registry import ToolRegistry
+
+
+RUNTIME_KIND_ALIASES = {
+    "": "managed",
+    "managed": "managed",
+    "run_engine": "managed",
+    "native": "managed",
+    "legacy": "managed",
+    "agent_core": "managed",
+    "agentcore": "managed",
+}
 
 class AgentManager:
     def __init__(
@@ -45,7 +55,6 @@ class AgentManager:
         self.orch            = orchestrator
         self.guardrail_middleware = guardrail_middleware
         self._runtime_adapters: dict[str, AgentRuntimeAdapter] = {}
-        self.register_runtime_adapter(create_native_runtime_adapter())
         self.register_runtime_adapter(create_managed_runtime_adapter())
         self._agent_cache: dict[tuple[str, str, int], AgentRuntimeInstance] = {}  # owner_id, agent_id, revision
 
@@ -74,7 +83,7 @@ class AgentManager:
 
     def get_runtime_adapter(self, runtime_kind: Optional[str] = None) -> AgentRuntimeAdapter:
         normalized = runtime_kind if isinstance(runtime_kind, str) else "managed"
-        normalized = normalized.strip().lower() or "managed"
+        normalized = RUNTIME_KIND_ALIASES.get(normalized.strip().lower(), normalized.strip().lower() or "managed")
         adapter = self._runtime_adapters.get(normalized)
         if adapter is None:
             raise RuntimeError(f"Unsupported runtime_kind: {normalized}")

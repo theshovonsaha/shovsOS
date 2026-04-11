@@ -8,16 +8,18 @@ from plugins import tools_web
 @pytest.mark.asyncio
 async def test_web_fetch_blocks_non_http_scheme():
     result = await tools_web._web_fetch("file:///etc/passwd")
-    assert result.startswith("web_fetch: invalid URL")
-    assert "http/https" in result
+    data = json.loads(result)
+    assert data["type"] == "web_fetch_error"
+    assert "http/https" in data["error"]
 
 
 @pytest.mark.asyncio
 async def test_web_fetch_blocks_private_host_by_default():
     assert tools_web.WEB_FETCH_ALLOW_PRIVATE is False
     result = await tools_web._web_fetch("http://127.0.0.1:8000/health")
-    assert result.startswith("web_fetch: blocked URL host")
-    assert "127.0.0.1" in result
+    data = json.loads(result)
+    assert data["type"] == "web_fetch_error"
+    assert "127.0.0.1" in data["error"]
 
 
 @pytest.mark.asyncio

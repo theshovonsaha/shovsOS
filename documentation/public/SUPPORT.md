@@ -9,7 +9,7 @@ For usage questions, bug reports, and feature requests:
 
 For sensitive or security-related topics:
 
-- Contact theshovonsaha@gmail.com (see SECURITY.md)
+- Open a private [GitHub Security Advisory](https://github.com/shovsOS/shovsOS/security/advisories) (see SECURITY.md)
 
 ## Before Opening an Issue
 

@@ -31,13 +31,15 @@ import asyncio
 import os
 import tempfile
 import re
+import uuid
 from typing import Optional, AsyncIterator
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from config.logger import log
+from run_engine import RunEngineRequest
 
 
-def setup_voice_routes(app: FastAPI, agent_manager) -> None:
+def setup_voice_routes(app: FastAPI, *, run_engine, profile_manager) -> None:
     """Register voice WebSocket endpoint."""
 
     @app.websocket("/ws/voice")
@@ -48,6 +50,7 @@ def setup_voice_routes(app: FastAPI, agent_manager) -> None:
         session_id: Optional[str] = None
         agent_id: str = "default"
         model: Optional[str] = None
+        owner_id: Optional[str] = None
 
         try:
             # Phase 1: Receive config
@@ -56,11 +59,17 @@ def setup_voice_routes(app: FastAPI, agent_manager) -> None:
             session_id = config.get("session_id")
             agent_id = config.get("agent_id", "default")
             model = config.get("model")
+            owner_id = str(config.get("owner_id") or "").strip() or None
             voice_model = config.get("voice_model", "aura-orion-en")
             sensitivity = config.get("sensitivity", 0.5)
 
             await ws.send_json({"type": "config_ack", "status": "ok"})
-            log("system", session_id or "voice", f"Voice config: agent={agent_id} model={model} v_model={voice_model} sens={sensitivity}")
+            log(
+                "system",
+                session_id or "voice",
+                f"Voice config: agent={agent_id} model={model} v_model={voice_model} sens={sensitivity}",
+                owner_id=owner_id,
+            )
 
             # Phase 2: Dual-Mode Loop (Streaming STT & TTS)
             while True:
@@ -154,7 +163,6 @@ def setup_voice_routes(app: FastAPI, agent_manager) -> None:
                     continue
 
                 # Agent & TTS Stream
-                agent_instance = agent_manager.get_agent_instance(agent_id)
                 full_response = ""
                 sentence_buffer = ""
                 
@@ -176,12 +184,24 @@ def setup_voice_routes(app: FastAPI, agent_manager) -> None:
                 
                 await ws.send_json({"type": "tts_start"})
 
-                async for event in agent_instance.chat_stream(
-                    user_message=f"{voice_optimized_prompt}\n\nUser: {user_text}",
-                    session_id=session_id,
+                profile = profile_manager.get(agent_id) or profile_manager.get("default")
+                effective_session_id = session_id or f"voice_{uuid.uuid4().hex[:8]}"
+                if not session_id:
+                    session_id = effective_session_id
+
+                request = RunEngineRequest(
+                    session_id=effective_session_id,
+                    owner_id="",
                     agent_id=agent_id,
-                    model=llm_model,
-                ):
+                    user_message=f"{voice_optimized_prompt}\n\nUser: {user_text}",
+                    model=llm_model or (getattr(profile, "model", None) or "llama3.2"),
+                    system_prompt=getattr(profile, "system_prompt", "") or "",
+                    allowed_tools=tuple(getattr(profile, "tools", []) or []),
+                    use_planner=bool(getattr(profile, "default_use_planner", True)),
+                    agent_revision=getattr(profile, "revision", None),
+                )
+
+                async for event in run_engine.stream(request):
                     if event["type"] == "token":
                         token = event["content"]
                         full_response += token

@@ -11,16 +11,17 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, List
 from pydantic import BaseModel, Field
+from config.config import cfg
 
 DB_PATH = "agents.db"
 DEFAULT_RUNTIME_KIND = "managed"
 RUNTIME_KIND_ALIASES = {
     "managed": "managed",
     "run_engine": "managed",
-    "native": "native",
-    "legacy": "native",
-    "agent_core": "native",
-    "agentcore": "native",
+    "native": "managed",
+    "legacy": "managed",
+    "agent_core": "managed",
+    "agentcore": "managed",
 }
 DEFAULT_AGENT_TOOLS = [
     "web_search",
@@ -83,8 +84,8 @@ class AgentProfile(BaseModel):
     name:          str
     description:   str = ""
     runtime_kind:  str = DEFAULT_RUNTIME_KIND
-    model:         str = "llama3.2"  # Fallback only
-    embed_model:   str = "nomic-embed-text"
+    model:         str = cfg.DEFAULT_MODEL  # Fallback only
+    embed_model:   str = cfg.EMBED_MODEL
     system_prompt: str = GENERAL_SYSTEM_PROMPT
     tools:         List[str] = Field(default_factory=lambda: ["web_search", "web_fetch"])
     avatar_url:    Optional[str] = None
@@ -415,7 +416,7 @@ class ProfileManager:
                 DEFAULT_RUNTIME_KIND,
             ) if "runtime_kind" in r.keys() and r["runtime_kind"] else DEFAULT_RUNTIME_KIND,
             model=r["model"],
-            embed_model=r["embed_model"] if "embed_model" in r.keys() else "nomic-embed-text",
+            embed_model=r["embed_model"] if "embed_model" in r.keys() else cfg.EMBED_MODEL,
             system_prompt=r["system_prompt"],
             tools=json.loads(r["tools"]),
             avatar_url=r["avatar_url"],

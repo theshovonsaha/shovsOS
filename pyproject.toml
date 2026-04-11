@@ -27,15 +27,10 @@ include-package-data = true
 [tool.setuptools.packages.find]
 where = ["."]
 include = [
-  "api*",
   "config*",
   "engine*",
-  "guardrails*",
-  "llm*",
   "memory*",
   "orchestration*",
-  "plugins*",
-  "services*",
   "shovs_memory*",
 ]
 namespaces = true

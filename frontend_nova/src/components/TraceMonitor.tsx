@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { getOwnerId } from '../owner';
+import { OperatorInterventions } from './OperatorInterventions';
 
 interface TraceEventSummary {
   id: string;
@@ -7,6 +8,7 @@ interface TraceEventSummary {
   iso_ts?: string;
   agent_id: string;
   session_id: string;
+  run_id?: string | null;
   event_type: string;
   pass_index?: number | null;
   size_bytes: number;
@@ -39,15 +41,119 @@ interface TraceStats {
   latest_ts?: number | null;
 }
 
+interface RunReplaySummary {
+  checkpoint_count: number;
+  pass_count: number;
+  artifact_count: number;
+  eval_count: number;
+  trace_event_count: number;
+  evidence_count: number;
+}
+
+interface RunReplayArtifact {
+  artifact_id: string;
+  artifact_type: string;
+  label: string;
+  tool_name?: string | null;
+  size_bytes: number;
+  preview?: string;
+  created_at?: string;
+}
+
+interface RunReplayCheckpoint {
+  checkpoint_id: number;
+  phase: string;
+  tool_turn?: number;
+  status?: string;
+  strategy?: string;
+  notes?: string;
+  tools?: string[];
+  created_at?: string;
+}
+
+interface RunReplayPass {
+  pass_id: number;
+  phase: string;
+  tool_turn?: number;
+  status?: string;
+  objective?: string;
+  strategy?: string;
+  notes?: string;
+  selected_tools?: string[];
+  response_preview?: string;
+  created_at?: string;
+}
+
+interface RunReplayEvidence {
+  source: string;
+  phase: string;
+  tool_turn?: number | null;
+  pass_id?: number | null;
+  item_id: string;
+  trace_id?: string | null;
+  summary: string;
+  provenance?: Record<string, unknown>;
+}
+
+interface RunReplayResponse {
+  found: boolean;
+  run: {
+    run_id: string;
+    status: string;
+    session_id: string;
+    model: string;
+    started_at?: string;
+    ended_at?: string | null;
+  } | null;
+  summary?: RunReplaySummary;
+  latest_checkpoint?: {
+    phase?: string;
+    status?: string;
+    strategy?: string;
+    notes?: string;
+  } | null;
+  latest_pass?: {
+    phase?: string;
+    status?: string;
+    objective?: string;
+    strategy?: string;
+    notes?: string;
+    selected_tools?: string[];
+    response_preview?: string;
+  } | null;
+  checkpoints?: RunReplayCheckpoint[];
+  passes?: RunReplayPass[];
+  artifacts?: RunReplayArtifact[];
+  evidence?: RunReplayEvidence[];
+}
+
 interface TraceMonitorProps {
   sessionId?: string | null;
   isVisible: boolean;
+  isStreaming: boolean;
+  pendingConfirmation?: {
+    call_id: string;
+    tool: string;
+    arguments: Record<string, any>;
+    preview: string;
+    reason: string;
+    created_at?: string;
+  } | null;
+  onApproveConfirmation: (callId: string) => void;
+  onDenyConfirmation: (callId: string, reason: string) => void;
+  onStopExecution: () => void;
+}
+
+interface PacketSection {
+  title: string;
+  body: string;
 }
 
 const TRACE_PAGE_SIZE = 120;
 const VIEW_SCOPE_KEY = 'shovs_trace_scope';
 const EVENT_FILTER_KEY = 'shovs_trace_filter';
 const AUTO_REFRESH_KEY = 'shovs_trace_auto';
+const TRACE_FOCUS_KEY = 'shovs_trace_focus';
 
 const BASE_EVENT_TYPES = [
   'story',
@@ -89,6 +195,13 @@ interface StoryGroup {
   stageLabels: string[];
   headline: string;
   lines: string[];
+}
+
+interface MonitorInsight {
+  id: string;
+  title: string;
+  summary: string;
+  tone: 'neutral' | 'good' | 'warn';
 }
 
 const HUMAN_EVENT_LABELS: Record<string, string> = {
@@ -290,6 +403,16 @@ function buildStoryGroups(events: TraceEventSummary[]): StoryGroup[] {
     .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
 }
 
+function latestEventOf(
+  events: TraceEventSummary[],
+  eventTypes: string[],
+): TraceEventSummary | null {
+  for (const event of events) {
+    if (eventTypes.includes(event.event_type)) return event;
+  }
+  return null;
+}
+
 function formatTime(ts?: number): string {
   if (!ts) return '--';
   const d = new Date(ts * 1000);
@@ -326,10 +449,35 @@ function mergeEvents(
   return merged;
 }
 
+function parsePacketSections(content: string): PacketSection[] {
+  const text = String(content || '').trim();
+  if (!text) return [];
+
+  const sections: PacketSection[] = [];
+  const pattern = /--- (.+?) ---\n([\s\S]*?)\n--- End \1 ---/g;
+  for (const match of text.matchAll(pattern)) {
+    const title = String(match[1] || '').trim();
+    const body = String(match[2] || '').trim();
+    if (title && body) sections.push({ title, body });
+  }
+
+  if (sections.length > 0) return sections;
+  return [{ title: 'Compiled Context', body: text }];
+}
+
 export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   sessionId,
   isVisible,
+  isStreaming,
+  pendingConfirmation,
+  onApproveConfirmation,
+  onDenyConfirmation,
+  onStopExecution,
 }) => {
+  const [focusMode, setFocusMode] = useState<'story' | 'inspect'>(() => {
+    const stored = localStorage.getItem(TRACE_FOCUS_KEY);
+    return stored === 'inspect' ? 'inspect' : 'story';
+  });
   const [scope, setScope] = useState<'session' | 'all'>(() => {
     const stored = localStorage.getItem(VIEW_SCOPE_KEY);
     return stored === 'all' ? 'all' : 'session';
@@ -347,11 +495,13 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     null,
   );
   const [stats, setStats] = useState<TraceStats | null>(null);
+  const [runReplay, setRunReplay] = useState<RunReplayResponse | null>(null);
 
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [loadingRunReplay, setLoadingRunReplay] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const scopedSessionId =
@@ -387,6 +537,63 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
 
   const oldestTs = events.length ? events[events.length - 1].ts : undefined;
   const storyGroups = useMemo(() => buildStoryGroups(events), [events]);
+  const monitorInsights = useMemo(() => {
+    const runtime = latestEventOf(events, [
+      'route_decision',
+      'runtime_loop_mode',
+      'phase_context',
+    ]);
+    const tool = latestEventOf(events, ['tool_result', 'tool_call']);
+    const verification = latestEventOf(events, [
+      'verification_warning',
+      'verification_result',
+    ]);
+    const response = latestEventOf(events, ['assistant_response']);
+
+    const insights: MonitorInsight[] = [];
+    if (runtime) {
+      insights.push({
+        id: `runtime-${runtime.id}`,
+        title: 'Runtime',
+        summary: describeTraceEvent(runtime),
+        tone: runtime.event_type === 'route_decision' ? 'good' : 'neutral',
+      });
+    }
+    if (tool) {
+      insights.push({
+        id: `tool-${tool.id}`,
+        title: 'Latest Tool',
+        summary: describeTraceEvent(tool),
+        tone:
+          tool.event_type === 'tool_result' &&
+          (tool.data as Record<string, unknown> | undefined)?.success === false
+            ? 'warn'
+            : 'neutral',
+      });
+    }
+    if (verification) {
+      insights.push({
+        id: `verify-${verification.id}`,
+        title: 'Verification',
+        summary: describeTraceEvent(verification),
+        tone:
+          verification.event_type === 'verification_warning' ||
+          (verification.data as Record<string, unknown> | undefined)
+            ?.supported === false
+            ? 'warn'
+            : 'good',
+      });
+    }
+    if (response) {
+      insights.push({
+        id: `response-${response.id}`,
+        title: 'Response',
+        summary: describeTraceEvent(response),
+        tone: 'neutral',
+      });
+    }
+    return insights;
+  }, [events]);
 
   const fetchRecent = useCallback(
     async (opts?: { append?: boolean; beforeTs?: number }) => {
@@ -476,6 +683,10 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   }, [autoRefresh]);
 
   useEffect(() => {
+    localStorage.setItem(TRACE_FOCUS_KEY, focusMode);
+  }, [focusMode]);
+
+  useEffect(() => {
     if (!isVisible) return;
     refreshAll();
   }, [isVisible, refreshAll]);
@@ -509,9 +720,12 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     const controller = new AbortController();
     setLoadingDetail(true);
 
-    fetch(`/api/logs/traces/event/${encodeURIComponent(selectedId)}`, {
-      signal: controller.signal,
-    })
+    fetch(
+      `/api/logs/traces/event/${encodeURIComponent(selectedId)}?owner_id=${encodeURIComponent(getOwnerId())}`,
+      {
+        signal: controller.signal,
+      },
+    )
       .then(async (res) => {
         if (!res.ok) throw new Error(`Trace detail failed: HTTP ${res.status}`);
         const data: TraceEventResponse = await res.json();
@@ -529,6 +743,39 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
 
     return () => controller.abort();
   }, [isVisible, selectedId]);
+
+  useEffect(() => {
+    if (!isVisible || !selectedEvent?.run_id) {
+      setRunReplay(null);
+      setLoadingRunReplay(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    setLoadingRunReplay(true);
+
+    fetch(
+      `/api/logs/traces/run/${encodeURIComponent(selectedEvent.run_id)}?owner_id=${encodeURIComponent(getOwnerId())}&trace_limit=180`,
+      { signal: controller.signal },
+    )
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`Run replay failed: HTTP ${res.status}`);
+        const data: RunReplayResponse = await res.json();
+        setRunReplay(data.found ? data : null);
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        setRunReplay(null);
+        setError(
+          err instanceof Error ? err.message : 'Failed to load run replay',
+        );
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingRunReplay(false);
+      });
+
+    return () => controller.abort();
+  }, [isVisible, selectedEvent?.run_id]);
 
   const promptMessages = useMemo(() => {
     if (!selectedEvent || selectedEvent.event_type !== 'llm_prompt')
@@ -552,6 +799,37 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     () => (selectedEvent ? describeTraceEvent(selectedEvent) : ''),
     [selectedEvent],
   );
+  const selectedPacketSections = useMemo(() => {
+    if (!selectedEvent) return [] as PacketSection[];
+    if (
+      selectedEvent.event_type !== 'phase_context' &&
+      selectedEvent.event_type !== 'compiled_context'
+    ) {
+      return [] as PacketSection[];
+    }
+    const data =
+      selectedEvent.data && typeof selectedEvent.data === 'object'
+        ? (selectedEvent.data as Record<string, unknown>)
+        : null;
+    return parsePacketSections(String(data?.content || ''));
+  }, [selectedEvent]);
+  const selectedIncludedItems = useMemo(() => {
+    if (!selectedEvent?.data || typeof selectedEvent.data !== 'object') return [];
+    const included = (selectedEvent.data as Record<string, unknown>).included;
+    if (!Array.isArray(included)) return [];
+    return included.filter(
+      (item): item is Record<string, any> =>
+        typeof item === 'object' && item !== null,
+    );
+  }, [selectedEvent]);
+  const recentReplayCheckpoints = useMemo(
+    () => [...(runReplay?.checkpoints || [])].slice(-4).reverse(),
+    [runReplay],
+  );
+  const recentReplayPasses = useMemo(
+    () => [...(runReplay?.passes || [])].slice(-4).reverse(),
+    [runReplay],
+  );
 
   return (
     <div className='trace-monitor-shell'>
@@ -564,6 +842,20 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         </div>
 
         <div className='trace-controls'>
+          <div className='trace-mode-switch'>
+            <button
+              className={focusMode === 'story' ? 'active' : ''}
+              onClick={() => setFocusMode('story')}
+            >
+              Story
+            </button>
+            <button
+              className={focusMode === 'inspect' ? 'active' : ''}
+              onClick={() => setFocusMode('inspect')}
+            >
+              Inspect
+            </button>
+          </div>
           <label className='trace-control'>
             <span>scope</span>
             <select
@@ -610,6 +902,16 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         </div>
       </div>
 
+      <OperatorInterventions
+        sessionId={sessionId}
+        isStreaming={isStreaming}
+        pendingConfirmation={pendingConfirmation}
+        onApprove={onApproveConfirmation}
+        onDeny={onDenyConfirmation}
+        onStop={onStopExecution}
+        variant='compact'
+      />
+
       <div className='trace-stats-row'>
         <div className='trace-stat-card'>
           <span className='k'>events</span>
@@ -631,9 +933,23 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         </div>
       </div>
 
+      {monitorInsights.length > 0 && (
+        <div className='trace-insight-row'>
+          {monitorInsights.map((insight) => (
+            <div
+              key={insight.id}
+              className={`trace-insight-card tone-${insight.tone}`}
+            >
+              <div className='trace-insight-title'>{insight.title}</div>
+              <div className='trace-insight-summary'>{insight.summary}</div>
+            </div>
+          ))}
+        </div>
+      )}
+
       {error && <div className='trace-error'>{error}</div>}
 
-      <div className='trace-grid'>
+      <div className={`trace-grid ${focusMode === 'story' ? 'story-focus' : 'inspect-focus'}`}>
         <section className='trace-list-pane'>
           <div className='trace-list-head'>
             <input
@@ -730,6 +1046,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
           </div>
         </section>
 
+        {focusMode === 'inspect' ? (
         <section className='trace-detail-pane'>
           {!selectedEvent && !loadingDetail && (
             <div className='trace-empty'>
@@ -747,6 +1064,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                 </div>
                 <div className='trace-detail-meta'>
                   <span>session: {selectedEvent.session_id}</span>
+                  <span>run: {selectedEvent.run_id || '--'}</span>
                   <span>agent: {selectedEvent.agent_id}</span>
                   <span>
                     pass:{' '}
@@ -762,6 +1080,203 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                 <div className='trace-json-head'>Readable Summary</div>
                 <pre className='trace-json'>{selectedSummary}</pre>
               </div>
+
+              {selectedPacketSections.length > 0 && (
+                <div className='trace-packet-wrap'>
+                  <div className='trace-json-head'>Compiled Packet</div>
+                  {selectedIncludedItems.length > 0 && (
+                    <div className='trace-packet-badges'>
+                      {selectedIncludedItems.map((item) => (
+                        <span
+                          key={`${String(item.item_id || item.title || 'item')}-${String(item.trace_id || '')}`}
+                          className='trace-packet-badge'
+                        >
+                          {String(item.kind || 'item')} ·{' '}
+                          {String(item.title || item.item_id || 'section')}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div className='trace-packet-list'>
+                    {selectedPacketSections.map((section, index) => (
+                      <div
+                        key={`${section.title}-${index}`}
+                        className='trace-packet-card'
+                      >
+                        <div className='trace-packet-title'>{section.title}</div>
+                        <pre className='trace-packet-copy'>{section.body}</pre>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {(loadingRunReplay || runReplay) && (
+                <div className='trace-run-wrap'>
+                  <div className='trace-json-head'>Run Replay</div>
+                  {loadingRunReplay && !runReplay ? (
+                    <div className='trace-empty'>Loading run replay...</div>
+                  ) : (
+                    <>
+                      <div className='trace-run-head'>
+                        <div className='trace-run-stats'>
+                          <span className='trace-run-stat'>
+                            status: {runReplay?.run?.status || '--'}
+                          </span>
+                          <span className='trace-run-stat'>
+                            checkpoints: {runReplay?.summary?.checkpoint_count ?? 0}
+                          </span>
+                          <span className='trace-run-stat'>
+                            passes: {runReplay?.summary?.pass_count ?? 0}
+                          </span>
+                          <span className='trace-run-stat'>
+                            artifacts: {runReplay?.summary?.artifact_count ?? 0}
+                          </span>
+                          <span className='trace-run-stat'>
+                            evidence: {runReplay?.summary?.evidence_count ?? 0}
+                          </span>
+                        </div>
+                        {runReplay?.latest_pass?.objective && (
+                          <div className='trace-run-copy'>
+                            objective: {runReplay.latest_pass.objective}
+                          </div>
+                        )}
+                        {runReplay?.latest_checkpoint?.strategy && (
+                          <div className='trace-run-copy'>
+                            strategy: {runReplay.latest_checkpoint.strategy}
+                          </div>
+                        )}
+                      </div>
+
+                      {(runReplay?.latest_checkpoint?.notes ||
+                        (runReplay?.latest_pass?.selected_tools || []).length >
+                          0) && (
+                        <div className='trace-run-head'>
+                          {runReplay?.latest_checkpoint?.notes && (
+                            <div className='trace-run-copy'>
+                              notes: {runReplay.latest_checkpoint.notes}
+                            </div>
+                          )}
+                          {(runReplay?.latest_pass?.selected_tools || []).length >
+                            0 && (
+                            <div className='trace-run-copy'>
+                              selected tools:{' '}
+                              {runReplay?.latest_pass?.selected_tools?.join(
+                                ', ',
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {recentReplayCheckpoints.length > 0 && (
+                        <div className='trace-run-list'>
+                          {recentReplayCheckpoints.map((checkpoint) => (
+                            <div
+                              key={`checkpoint-${checkpoint.checkpoint_id}`}
+                              className='trace-run-card'
+                            >
+                              <div className='trace-run-card-head'>
+                                <span>
+                                  {checkpoint.phase || 'phase'} · status{' '}
+                                  {checkpoint.status || '--'}
+                                </span>
+                                <span>
+                                  turn{' '}
+                                  {typeof checkpoint.tool_turn === 'number'
+                                    ? checkpoint.tool_turn
+                                    : '--'}
+                                </span>
+                              </div>
+                              <div className='trace-run-card-copy'>
+                                {(
+                                  checkpoint.strategy ||
+                                  checkpoint.notes ||
+                                  'No checkpoint notes stored.'
+                                ).trim()}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {recentReplayPasses.length > 0 && (
+                        <div className='trace-run-list'>
+                          {recentReplayPasses.map((pass) => (
+                            <div
+                              key={`pass-${pass.pass_id}`}
+                              className='trace-run-card'
+                            >
+                              <div className='trace-run-card-head'>
+                                <span>
+                                  {pass.phase || 'phase'} · {pass.status || '--'}
+                                </span>
+                                <span>pass {pass.pass_id}</span>
+                              </div>
+                              <div className='trace-run-card-copy'>
+                                {(
+                                  pass.objective ||
+                                  pass.strategy ||
+                                  pass.response_preview ||
+                                  'No pass summary stored.'
+                                ).trim()}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {(runReplay?.evidence?.length || 0) > 0 && (
+                        <div className='trace-run-list'>
+                          {runReplay!.evidence!.slice(0, 3).map((item, index) => (
+                            <div
+                              key={`${item.trace_id || item.item_id}-${index}`}
+                              className='trace-run-card'
+                            >
+                              <div className='trace-run-card-head'>
+                                <span>{item.phase || 'phase'}</span>
+                                <span>
+                                  {item.source}
+                                  {typeof item.tool_turn === 'number'
+                                    ? ` · turn ${item.tool_turn}`
+                                    : ''}
+                                </span>
+                              </div>
+                              <div className='trace-run-card-copy'>
+                                {item.summary || 'No evidence summary.'}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {(runReplay?.artifacts?.length || 0) > 0 && (
+                        <div className='trace-run-list'>
+                          {runReplay!.artifacts!.slice(0, 4).map((artifact) => (
+                            <div
+                              key={artifact.artifact_id}
+                              className='trace-run-card'
+                            >
+                              <div className='trace-run-card-head'>
+                                <span>{artifact.label}</span>
+                                <span>
+                                  {artifact.artifact_type}
+                                  {artifact.tool_name
+                                    ? ` · ${artifact.tool_name}`
+                                    : ''}
+                                </span>
+                              </div>
+                              <div className='trace-run-card-copy'>
+                                {(artifact.preview || '').trim() || 'No preview stored.'}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
 
               {promptMessages.length > 0 && (
                 <div className='prompt-stack'>
@@ -792,6 +1307,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             </>
           )}
         </section>
+        ) : null}
       </div>
     </div>
   );

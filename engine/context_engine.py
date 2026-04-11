@@ -18,6 +18,7 @@ from typing import Optional
 from llm.base_adapter import BaseLLMAdapter
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from engine.fact_guard import is_grounded_fact_record
+from config.config import cfg
 
 
 COMPRESSION_PROMPT = """\
@@ -91,7 +92,7 @@ class ContextEngine:
         compression_model: Optional[str] = None,
     ):
         self.adapter           = adapter
-        self.compression_model = compression_model
+        self.compression_model = compression_model or cfg.DEFAULT_MODEL
 
     def set_adapter(self, adapter: BaseLLMAdapter):
         """Hot-swap the underlying LLM adapter (called when user switches providers)."""

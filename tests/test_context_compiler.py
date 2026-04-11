@@ -34,6 +34,14 @@ def test_context_compiler_filters_items_by_phase_policy():
             priority=25,
         ),
         ContextItem(
+            item_id="meta",
+            kind=ContextKind.META,
+            title="Meta Context",
+            content="Known vs candidate, falsifier, minimum probe.",
+            source="run_engine",
+            priority=27,
+        ),
+        ContextItem(
             item_id="tools",
             kind=ContextKind.ENVIRONMENT,
             title="Tools",
@@ -51,6 +59,7 @@ def test_context_compiler_filters_items_by_phase_policy():
     )
 
     assert "Instruction" in compiled.content
+    assert "Meta Context" in compiled.content
     assert "Working Evidence" in compiled.content
     assert "Tools" in compiled.content
     assert "Working State" not in compiled.content

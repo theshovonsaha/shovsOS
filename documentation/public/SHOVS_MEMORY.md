@@ -6,6 +6,7 @@ It is not a separate memory engine. It wraps the same primitives the runtime
 already uses:
 
 - deterministic user-stated fact extraction
+- deterministic task-state extraction for constraints and directives
 - temporal fact storage with invalidation
 - semantic retrieval
 - inspectable memory state
@@ -18,7 +19,7 @@ The full Shovs runtime is powerful, but it is a large first ask.
 
 - use it inside an existing agent loop
 - keep your own orchestration
-- gain deterministic fact writes, correction handling, and inspectable memory
+- gain deterministic fact writes, task/directive capture, correction handling, and inspectable memory
 
 ## Current Shape
 
@@ -57,6 +58,11 @@ inspection = memory.inspect()
     - preferred editor
     - package manager
     - primary language
+    - environment mode
+    - scope boundary
+    - budget limit
+    - task constraint
+    - follow-up directive
   - correction handling through temporal voiding
 
 - `store_fact(...)`
@@ -70,7 +76,7 @@ inspection = memory.inspect()
   - superseded facts
   - candidate signals
   - context preview
-  - recent memory decision signals
+  - recent memory decision signals when using the full runtime inspector
 
 ## What It Really Is
 

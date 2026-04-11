@@ -2,7 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Dashboard } from './Dashboard';
 import { LogPanel } from './LogPanel';
 import { useAgent } from './useAgent';
+import { AgentCapabilitiesView } from './components/AgentCapabilitiesView';
 import { GuardrailConfirmationModal } from './components/GuardrailConfirmationModal';
+import { MemoryWorkspaceView } from './components/MemoryWorkspaceView';
 import { OptionsPanel } from './components/OptionsPanel';
 import { PremiumSelect } from './components/PremiumSelect';
 import { RichContentViewer } from './components/RichContentViewer';
@@ -210,9 +212,13 @@ function App() {
   const [mobilePanel, setMobilePanel] = useState<
     'none' | 'sessions' | 'options'
   >('none');
-  const [workspaceView, setWorkspaceView] = useState<'chat' | 'monitor'>(() => {
+  const [workspaceView, setWorkspaceView] = useState<
+    'chat' | 'capabilities' | 'monitor' | 'memory'
+  >(() => {
     const saved = localStorage.getItem('nova_workspace_view');
-    return saved === 'monitor' ? 'monitor' : 'chat';
+    return saved === 'capabilities' || saved === 'monitor' || saved === 'memory'
+      ? saved
+      : 'chat';
   });
   const [shovsMode, setShovsMode] = useState(false);
   const [toolMenuOpen, setToolMenuOpen] = useState(false);
@@ -279,6 +285,9 @@ function App() {
     : agent.health.status === 'ok'
       ? 'connected'
       : 'connecting';
+  const allowedToolNames = new Set(agent.activeAgentProfile?.tools || []);
+  const allowedTools = agent.tools.filter((tool) => allowedToolNames.has(tool.name));
+  const globalOnlyTools = agent.tools.filter((tool) => !allowedToolNames.has(tool.name));
 
   if (!agent.activeAgentId) {
     return (
@@ -367,8 +376,6 @@ function App() {
       currentSearchEngine={agent.currentSearchEngine}
       setCurrentSearchEngine={agent.setCurrentSearchEngine}
       models={agent.models}
-      runtimePath={agent.runtimePath}
-      setRuntimePath={agent.setRuntimePath}
       usePlanner={agent.usePlanner}
       setUsePlanner={agent.setUsePlanner}
       loopMode={agent.loopMode}
@@ -420,10 +427,22 @@ function App() {
             Chat
           </button>
           <button
+            className={workspaceView === 'capabilities' ? 'active' : ''}
+            onClick={() => setWorkspaceView('capabilities')}
+          >
+            Capabilities
+          </button>
+          <button
             className={workspaceView === 'monitor' ? 'active' : ''}
             onClick={() => setWorkspaceView('monitor')}
           >
             Monitor
+          </button>
+          <button
+            className={workspaceView === 'memory' ? 'active' : ''}
+            onClick={() => setWorkspaceView('memory')}
+          >
+            Memory
           </button>
         </div>
 
@@ -565,6 +584,27 @@ function App() {
             <TraceMonitor
               sessionId={agent.currentSessionId}
               isVisible={workspaceView === 'monitor'}
+              isStreaming={agent.isStreaming}
+              pendingConfirmation={agent.pendingConfirmation}
+              onApproveConfirmation={agent.approveConfirmation}
+              onDenyConfirmation={agent.denyConfirmation}
+              onStopExecution={agent.stopExecution}
+            />
+          ) : workspaceView === 'capabilities' ? (
+            <AgentCapabilitiesView
+              agentName={
+                agent.activeAgentProfile?.name ||
+                agent.activeAgentId ||
+                'Active agent'
+              }
+              description={agent.activeAgentProfile?.description}
+              allowedTools={allowedTools}
+              globalTools={agent.tools}
+            />
+          ) : workspaceView === 'memory' ? (
+            <MemoryWorkspaceView
+              sessionId={agent.currentSessionId}
+              memoryState={agent.sessionMemoryState}
             />
           ) : (
             <>
@@ -574,10 +614,10 @@ function App() {
               >
                 {agent.messages.length === 0 ? (
                   <div className='nova-conversation-empty'>
-                    <h2>Minimal surface, maximum visibility.</h2>
+                    <h2>Talk to the agent and shape how it behaves.</h2>
                     <p>
-                      Start with a prompt. Deep logs, trace telemetry, and
-                      safety approvals remain available when needed.
+                      Capabilities and memory stay visible in dedicated views.
+                      You do not need to pick a rigid mode first to steer the work.
                     </p>
                   </div>
                 ) : (
@@ -780,7 +820,11 @@ function App() {
 
                     {toolMenuOpen ? (
                       <div className='nova-tool-menu'>
-                        {agent.tools.map((tool) => {
+                        <div className='nova-tool-menu-section'>
+                          <div className='nova-tool-menu-label'>
+                            Enabled for this agent
+                          </div>
+                          {allowedTools.map((tool) => {
                           const isSelected = agent.forcedTools.includes(
                             tool.name,
                           );
@@ -801,6 +845,25 @@ function App() {
                             </button>
                           );
                         })}
+                        </div>
+                        <div className='nova-tool-menu-section muted'>
+                          <div className='nova-tool-menu-label'>
+                            Available globally
+                          </div>
+                          {globalOnlyTools.map((tool) => (
+                            <button
+                              key={tool.name}
+                              className='disabled'
+                              disabled
+                              title='Not enabled for this active agent'
+                            >
+                              <span>{tool.name}</span>
+                              <small>
+                                {tool.description.split('.')[0]} · not enabled here
+                              </small>
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     ) : null}
                   </div>
@@ -873,6 +936,11 @@ function App() {
         sessionId={agent.currentSessionId}
         isOpen={logOpen}
         onClose={() => setLogOpen(false)}
+        isStreaming={agent.isStreaming}
+        pendingConfirmation={agent.pendingConfirmation}
+        onApproveConfirmation={agent.approveConfirmation}
+        onDenyConfirmation={agent.denyConfirmation}
+        onStopExecution={agent.stopExecution}
       />
 
       {shovsMode ? (
@@ -900,7 +968,7 @@ function App() {
         />
       ) : null}
 
-      {agent.pendingConfirmation ? (
+      {agent.pendingConfirmation && !logOpen && workspaceView !== 'monitor' ? (
         <GuardrailConfirmationModal
           confirmation={agent.pendingConfirmation}
           onApprove={agent.approveConfirmation}

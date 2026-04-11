@@ -10,6 +10,7 @@ from engine.candidate_signals import extract_stance_signals
 from engine.conversation_tension import analyze_conversation_tension
 from engine.context_schema import ContextPhase
 from engine.deterministic_facts import extract_user_stated_fact_updates
+from engine.tool_loop_guard import ToolLoopGuard
 from engine.tool_contract import (
     canonical_tool_call,
     clip_text,
@@ -255,6 +256,7 @@ class RunEngine:
             latest_notes = ""
             latest_observation_status = ""
             latest_observation_tools: list[str] = []
+            tool_loop_guard = ToolLoopGuard()
             normalized_max_tool_calls = self._normalize_optional_limit(
                 request.max_tool_calls,
                 minimum=1,
@@ -782,6 +784,57 @@ class RunEngine:
                     "content_preview": clip_text(tool_result.content, 280),
                     "content": tool_result.content,
                 }
+                stall_alert = tool_loop_guard.observe_result(
+                    tool_name=tool_result.tool_name,
+                    arguments=dict(tool_call.arguments or {}),
+                    success=bool(tool_result.success),
+                    content=str(tool_result.content or ""),
+                )
+                if stall_alert:
+                    latest_notes = str(stall_alert["message"] or "")
+                    alert_payload = {
+                        "tool_name": "bash",
+                        "success": False,
+                        "content": latest_notes,
+                        "arguments": dict(tool_call.arguments or {}),
+                    }
+                    tool_results.append(alert_payload)
+                    self.run_store.save_checkpoint(
+                        run_id=run.run_id,
+                        phase="acting",
+                        tool_turn=tool_turn,
+                        status="logical_stall_alert",
+                        notes=latest_notes,
+                        tools=["bash"],
+                        tool_results=summarize_tool_results([alert_payload], limit=1, preview_chars=220),
+                    )
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="logical_stall_alert",
+                        data={
+                            "tool_name": "bash",
+                            "command": stall_alert.get("command", ""),
+                            "message": latest_notes,
+                            "suggested_pivot": stall_alert.get("suggested_pivot", ""),
+                            "turn": tool_turn,
+                        },
+                    )
+                    yield stall_alert
+                    self._save_pass_record(
+                        run_id=run.run_id,
+                        phase=ContextPhase.ACTING,
+                        tool_turn=tool_turn,
+                        status="logical_stall_alert",
+                        objective=effective_objective,
+                        strategy=latest_strategy,
+                        notes=latest_notes,
+                        selected_tools=["bash"],
+                        tool_results=tool_results[-3:],
+                        packet=acting_packet,
+                    )
+                    selected_tools = []
+                    break
                 self._save_pass_record(
                     run_id=run.run_id,
                     phase=ContextPhase.ACTING,
@@ -1197,7 +1250,13 @@ class RunEngine:
                 tools=self._get_schema_subset(available_names),
             )
         except Exception as exc:
-            log("run_engine", request.session_id, f"Tool actor completion failed: {exc}", level="warn")
+            log(
+                "run_engine",
+                request.session_id,
+                f"Tool actor completion failed: {exc}",
+                level="warn",
+                owner_id=request.owner_id,
+            )
 
         call = extract_tool_call(raw, self.tool_registry) if raw else None
         if call is not None:
@@ -1398,6 +1457,7 @@ class RunEngine:
                 existing_candidate_context=existing_candidate_context,
                 user_message=request.user_message,
                 new_candidate_signals=stance_signals,
+                current_turn=self._message_count(session_id, request.owner_id),
             )
             outcome = await apply_memory_commit(
                 sessions=self.sessions,
@@ -1438,6 +1498,7 @@ class RunEngine:
                 existing_candidate_context=existing_candidate_context,
                 user_message=request.user_message,
                 new_candidate_signals=stance_signals,
+                current_turn=self._message_count(session_id, request.owner_id),
             )
             outcome = await apply_memory_commit(
                 sessions=self.sessions,
@@ -1470,6 +1531,7 @@ class RunEngine:
             existing_candidate_signals=existing_candidate_signals,
             existing_candidate_context=existing_candidate_context,
             new_candidate_signals=stance_signals,
+            current_turn=self._message_count(session_id, request.owner_id),
         )
         outcome = await apply_memory_commit(
             sessions=self.sessions,

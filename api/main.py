@@ -34,7 +34,6 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-from engine.core import AgentCore
 from orchestration.agent_profiles import ProfileManager, AgentProfile
 from orchestration.orchestrator import AgenticOrchestrator
 from llm.llm_adapter import OllamaAdapter
@@ -55,6 +54,7 @@ from api.memory_inspector import build_session_memory_payload
 from api.owner import require_owner_id
 from services.storage_admin import StorageAdminService, StoreSelection
 from services.consumer_store import ConsumerStoreService
+from plugins.shovs_meta_gateway import inject_gateway_dependencies, register_gateway_tools
 
 from guardrails import GuardrailMiddleware
 from guardrails.api_routes import make_guardrail_router
@@ -62,8 +62,9 @@ from orchestration.run_store import get_run_store
 from config.trace_store import get_trace_store
 from run_engine import RunEngine, RunEngineRequest
 
-# ── Config ────────────────────────────────────────────────────────────────────
-FALLBACK_CHAT_MODEL = "llama3.2"
+from config.config import cfg
+from engine.fact_guard import is_grounded_fact_record
+FALLBACK_CHAT_MODEL = cfg.DEFAULT_MODEL
 CHAT_RATE_LIMIT = os.getenv("CHAT_RATE_LIMIT", "30/minute")
 
 
@@ -159,6 +160,8 @@ consumer_store = ConsumerStoreService(
 )
 
 # ── Register tools ────────────────────────────────────────────────────────────
+inject_gateway_dependencies(tool_registry, semantic_graph)
+register_gateway_tools(tool_registry)
 register_all_tools(tool_registry, agent_manager=agent_manager)
 
 
@@ -196,7 +199,7 @@ def _seed_standard_profiles():
         AgentProfile(
             id="researcher",
             name="Research Specialist",
-            model="groq:llama-3.3-70b-versatile",
+            model=cfg.DEFAULT_MODEL,
             tools=["web_search", "web_fetch", "rag_search", "query_memory", "store_memory"],
             system_prompt=(
                 "You are a meticulous research agent. Always verify claims across multiple sources. "
@@ -206,8 +209,8 @@ def _seed_standard_profiles():
         ),
         AgentProfile(
             id="analyst",
-            name="Data Analyst Agent",
-            model="groq:llama-3.3-70b-versatile",
+            name="Data Analyst",
+            model=cfg.DEFAULT_MODEL,
             tools=["file_create", "file_view", "file_str_replace", "rag_search", "bash"],
             system_prompt=(
                 "You are a data analyst. Write clean, well-structured markdown reports and Python scripts. "
@@ -268,7 +271,7 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 setup_log_routes(app)
-setup_voice_routes(app, agent_manager)
+setup_voice_routes(app, run_engine=run_engine, profile_manager=profile_manager)
 app.include_router(make_guardrail_router(guardrail_middleware), prefix="/guardrails")
 app.include_router(make_rag_router(), prefix="/rag")          # ← NEW
 app.include_router(
@@ -417,7 +420,6 @@ async def chat_stream(
     planner_model:     Optional[str]    = Form(None),
     context_model:     Optional[str]    = Form(None),
     embed_model:       Optional[str]    = Form(None),
-    runtime_path:      Optional[str]    = Form(None),
     forced_tools_json: Optional[str]    = Form(None),
     owner_id:          Optional[str]    = Form(None),
     files:             List[UploadFile] = File(default=[]),
@@ -462,7 +464,12 @@ async def chat_stream(
             text_injection = file_processor.build_text_injection([f for f in processed_files if f.ok])
             full_message   = f"{text_injection}\n\n{message}" if text_injection else message
 
-            log("agent", "system", f"Incoming request: agent={agent_id} model={model or 'default'}")
+            log(
+                "agent",
+                "system",
+                f"Incoming request: agent={agent_id} model={model or 'default'}",
+                owner_id=owner_id,
+            )
             profile = profile_manager.get(agent_id or "default", owner_id=owner_id) or profile_manager.get("default", owner_id=owner_id)
             resolved_context_mode = context_mode or getattr(profile, "default_context_mode", "v2")
             if resolved_context_mode not in {"v1", "v2", "v3"}:
@@ -487,86 +494,48 @@ async def chat_stream(
             resolved_context_model = context_model or None
             resolved_embed_model = embed_model or getattr(profile, "embed_model", None) or "nomic-embed-text"
 
-            resolved_runtime_path = str(runtime_path or "run_engine").strip().lower()
-            legacy_aliases = {"legacy", "native", "agent_core", "agentcore"}
-            managed_aliases = {"run_engine", "managed", ""}
-            if resolved_runtime_path in legacy_aliases:
-                legacy_compat_enabled = os.getenv("ALLOW_LEGACY_CHAT_RUNTIME", "false").lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                )
-                if not legacy_compat_enabled:
-                    warning = (
-                        "Legacy runtime path is disabled. "
-                        "Set ALLOW_LEGACY_CHAT_RUNTIME=true to enable compatibility mode."
-                    )
-                    yield f"data: {json.dumps({'type': 'warning', 'message': warning})}\n\n"
-                    resolved_runtime_path = "run_engine"
-            elif resolved_runtime_path not in managed_aliases:
-                warning = f"Unknown runtime_path '{resolved_runtime_path}'. Falling back to run_engine."
-                yield f"data: {json.dumps({'type': 'warning', 'message': warning})}\n\n"
-                resolved_runtime_path = "run_engine"
-
-            if resolved_runtime_path in managed_aliases:
-                run_request = RunEngineRequest(
-                    session_id=effective_session_id,
-                    owner_id=owner_id,
-                    agent_id=agent_id or "default",
-                    user_message=full_message,
-                    model=model or (profile.model if profile else FALLBACK_CHAT_MODEL),
-                    system_prompt=system_prompt or (profile.system_prompt if profile else ""),
-                    context_mode=resolved_context_mode,
-                    allowed_tools=tuple(getattr(profile, "tools", []) or []),
-                    use_planner=resolved_use_planner,
-                    max_tool_calls=max_tool_calls,
-                    max_turns=max_turns,
-                    planner_model=resolved_planner_model,
-                    context_model=resolved_context_model,
-                    embed_model=resolved_embed_model,
-                    images=image_b64s or None,
-                    search_backend=search_backend,
-                    search_engine=search_engine,
-                    agent_revision=getattr(profile, "revision", None),
-                    forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
-                )
-                async for event in run_engine.stream(run_request):
-                    yield f"data: {json.dumps(event)}\n\n"
-                return
-
-            agent_instance = agent_manager.get_agent_instance(agent_id or "default", owner_id=owner_id)
-            if embed_model:
-                agent_instance.embed_model = embed_model
-                if getattr(agent_instance, "graph", None) is not None:
-                    agent_instance.graph.embedding_model = embed_model
-            async for event in agent_instance.chat_stream(
-                user_message   = full_message,
-                session_id     = effective_session_id,
-                agent_id       = agent_id,
-                model          = model,
-                system_prompt  = system_prompt,
-                search_backend = search_backend,
-                search_engine  = search_engine,
-                force_memory   = force_memory,
-                use_planner    = resolved_use_planner,
-                loop_mode      = resolved_loop_mode,
-                max_tool_calls = max_tool_calls,
-                max_turns      = max_turns,
-                planner_model  = resolved_planner_model,
-                context_model  = resolved_context_model,
-                forced_tools   = forced_tools,
-                images         = image_b64s or None,
-                owner_id       = owner_id,
-                agent_revision = getattr(profile, "revision", None),
-            ):
+            run_request = RunEngineRequest(
+                session_id=effective_session_id,
+                owner_id=owner_id,
+                agent_id=agent_id or "default",
+                user_message=full_message,
+                model=model or (profile.model if profile else FALLBACK_CHAT_MODEL),
+                system_prompt=system_prompt or (profile.system_prompt if profile else ""),
+                context_mode=resolved_context_mode,
+                allowed_tools=tuple(getattr(profile, "tools", []) or []),
+                use_planner=resolved_use_planner,
+                max_tool_calls=max_tool_calls,
+                max_turns=max_turns,
+                planner_model=resolved_planner_model,
+                context_model=resolved_context_model,
+                embed_model=resolved_embed_model,
+                images=image_b64s or None,
+                search_backend=search_backend,
+                search_engine=search_engine,
+                agent_revision=getattr(profile, "revision", None),
+                forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
+            )
+            async for event in run_engine.stream(run_request):
                 yield f"data: {json.dumps(event)}\n\n"
+            return
 
         except asyncio.CancelledError:
-            log("agent", "stream", "Stream cancelled (shutdown/interrupt)", level="info")
+            log(
+                "agent",
+                "stream",
+                "Stream cancelled (shutdown/interrupt)",
+                level="info",
+                owner_id=owner_id,
+            )
             raise
         except Exception as e:
-            log("agent", "stream", f"Generator error: {e}", level="error")
+            log(
+                "agent",
+                "stream",
+                f"Generator error: {e}",
+                level="error",
+                owner_id=owner_id,
+            )
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
     return StreamingResponse(
@@ -604,9 +573,11 @@ async def set_context_mode(session_id: str, payload: dict):
 
     session_manager.set_context_mode(session_id, mode)
 
-    # Keep the warm cached agent instance aligned with the selected mode.
+    # Managed runtime reads context_mode from session state each turn.
+    # Native compatibility instances may still support eager engine switching.
     agent = agent_manager.get_agent_instance(session.agent_id or "default", owner_id=owner_id)
-    agent.set_context_engine(mode)
+    if hasattr(agent, "set_context_engine"):
+        agent.set_context_engine(mode)
     return {"session_id": session_id, "context_mode": mode}
 
 @app.get("/sessions")
@@ -655,6 +626,7 @@ async def get_session(session_id: str, owner_id: Optional[str] = None):
         raise HTTPException(404, "Session not found")
     return {
         "id": s.id, "title": s.title or "New Chat", "model": s.model,
+        "agent_id": s.agent_id,
         "created_at": s.created_at, "updated_at": s.updated_at,
         "message_count": s.message_count, "compressed_context": s.compressed_context,
         "context_lines": _count_context_items(s.compressed_context),

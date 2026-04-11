@@ -27,11 +27,11 @@ The runtime already supports:
 
 ### Runtime
 
-- [run_engine/engine.py](/Users/theshovonsaha/Developer/Github/agent/run_engine/engine.py)
+- [run_engine/engine.py](../../run_engine/engine.py)
   - managed runtime execution path
   - phase packet flow, pass ledger writes, and verification-gated memory commit
 
-- [engine/core.py](/Users/theshovonsaha/Developer/Github/agent/engine/core.py)
+- [engine/core.py](../../engine/core.py)
   - legacy/native execution kernel
   - prompt construction
   - loop control
@@ -41,28 +41,27 @@ The runtime already supports:
 
 Current state:
 - managed runtime is canonical and default (`runtime_kind=managed`)
-- legacy/native runtime remains compatibility-only (`runtime_kind=native`)
-- `/chat/stream` legacy path is env-gated via `ALLOW_LEGACY_CHAT_RUNTIME=true`
-- publish-direction is one canonical runtime contract with legacy reliability preserved behind explicit compatibility controls
+- legacy/native code remains only as low-level compatibility/test coverage, not as a live route selection path
+- publish-direction is one canonical runtime contract with observable state, evidence, and memory policies converged on the managed runtime
 
-- [engine/context_schema.py](/Users/theshovonsaha/Developer/Github/agent/engine/context_schema.py)
+- [engine/context_schema.py](../../engine/context_schema.py)
   - typed context item model
 
-- [engine/context_compiler.py](/Users/theshovonsaha/Developer/Github/agent/engine/context_compiler.py)
+- [engine/context_compiler.py](../../engine/context_compiler.py)
   - phase-specific context compilation
 
-- [engine/fact_guard.py](/Users/theshovonsaha/Developer/Github/agent/engine/fact_guard.py)
+- [engine/fact_guard.py](../../engine/fact_guard.py)
   - grounded fact filtering
 
 ### Orchestration
 
-- [orchestration/orchestrator.py](/Users/theshovonsaha/Developer/Github/agent/orchestration/orchestrator.py)
+- [orchestration/orchestrator.py](../../orchestration/orchestrator.py)
   - planner, observer, verifier prompts
 
-- [orchestration/agent_manager.py](/Users/theshovonsaha/Developer/Github/agent/orchestration/agent_manager.py)
+- [orchestration/agent_manager.py](../../orchestration/agent_manager.py)
   - runtime management and adapter parity wiring
 
-- [orchestration/run_store.py](/Users/theshovonsaha/Developer/Github/agent/orchestration/run_store.py)
+- [orchestration/run_store.py](../../orchestration/run_store.py)
   - run records
   - loop checkpoints
   - artifacts
@@ -70,26 +69,26 @@ Current state:
 
 ### Memory
 
-- [orchestration/session_manager.py](/Users/theshovonsaha/Developer/Github/agent/orchestration/session_manager.py)
-- [memory/semantic_graph.py](/Users/theshovonsaha/Developer/Github/agent/memory/semantic_graph.py)
-- [memory/vector_engine.py](/Users/theshovonsaha/Developer/Github/agent/memory/vector_engine.py)
-- [memory/session_rag.py](/Users/theshovonsaha/Developer/Github/agent/memory/session_rag.py)
-- [memory/task_tracker.py](/Users/theshovonsaha/Developer/Github/agent/memory/task_tracker.py)
-- [engine/deterministic_facts.py](/Users/theshovonsaha/Developer/Github/agent/engine/deterministic_facts.py)
-- [engine/direct_fact_policy.py](/Users/theshovonsaha/Developer/Github/agent/engine/direct_fact_policy.py)
-- [engine/compression_fact_policy.py](/Users/theshovonsaha/Developer/Github/agent/engine/compression_fact_policy.py)
-- [shovs_memory/memory.py](/Users/theshovonsaha/Developer/Github/agent/shovs_memory/memory.py)
+- [orchestration/session_manager.py](../../orchestration/session_manager.py)
+- [memory/semantic_graph.py](../../memory/semantic_graph.py)
+- [memory/vector_engine.py](../../memory/vector_engine.py)
+- [memory/session_rag.py](../../memory/session_rag.py)
+- [memory/task_tracker.py](../../memory/task_tracker.py)
+- [engine/deterministic_facts.py](../../engine/deterministic_facts.py)
+- [engine/direct_fact_policy.py](../../engine/direct_fact_policy.py)
+- [engine/compression_fact_policy.py](../../engine/compression_fact_policy.py)
+- [shovs_memory/memory.py](../../shovs_memory/memory.py)
 
 ### Tools
 
-- [plugins/tool_registry.py](/Users/theshovonsaha/Developer/Github/agent/plugins/tool_registry.py)
-- [plugins/tools.py](/Users/theshovonsaha/Developer/Github/agent/plugins/tools.py)
-- [plugins/tools_web.py](/Users/theshovonsaha/Developer/Github/agent/plugins/tools_web.py)
+- [plugins/tool_registry.py](../../plugins/tool_registry.py)
+- [plugins/tools.py](../../plugins/tools.py)
+- [plugins/tools_web.py](../../plugins/tools_web.py)
 
 ### Providers
 
-- [llm/adapter_factory.py](/Users/theshovonsaha/Developer/Github/agent/llm/adapter_factory.py)
-- [llm/openai_adapter.py](/Users/theshovonsaha/Developer/Github/agent/llm/openai_adapter.py)
+- [llm/adapter_factory.py](../../llm/adapter_factory.py)
+- [llm/openai_adapter.py](../../llm/openai_adapter.py)
 - other adapters in `/llm`
 
 ## Execution Model
@@ -236,7 +235,7 @@ Guidelines:
 
 ## Adding an Agent Profile
 
-Profiles live in [orchestration/agent_profiles.py](/Users/theshovonsaha/Developer/Github/agent/orchestration/agent_profiles.py).
+Profiles live in [orchestration/agent_profiles.py](../../orchestration/agent_profiles.py).
 
 Keep them narrow:
 - model
@@ -251,7 +250,7 @@ Do not overload profiles with runtime logic that belongs in the kernel.
 ## Adding a Provider
 
 Provider wiring should go through:
-- [llm/adapter_factory.py](/Users/theshovonsaha/Developer/Github/agent/llm/adapter_factory.py)
+- [llm/adapter_factory.py](../../llm/adapter_factory.py)
 - the specific adapter in `/llm`
 
 Expectations:
@@ -300,11 +299,11 @@ Useful test areas:
 - memory provider and embedding transport compatibility
 
 Representative test files:
-- [tests/test_tool_loop_guards.py](/Users/theshovonsaha/Developer/Github/agent/tests/test_tool_loop_guards.py)
-- [tests/test_layer_data_flow.py](/Users/theshovonsaha/Developer/Github/agent/tests/test_layer_data_flow.py)
-- [tests/test_state_integrity.py](/Users/theshovonsaha/Developer/Github/agent/tests/test_state_integrity.py)
-- [tests/test_context_compiler.py](/Users/theshovonsaha/Developer/Github/agent/tests/test_context_compiler.py)
-- [tests/test_vector_engine.py](/Users/theshovonsaha/Developer/Github/agent/tests/test_vector_engine.py)
+- [tests/test_tool_loop_guards.py](../../tests/test_tool_loop_guards.py)
+- [tests/test_layer_data_flow.py](../../tests/test_layer_data_flow.py)
+- [tests/test_state_integrity.py](../../tests/test_state_integrity.py)
+- [tests/test_context_compiler.py](../../tests/test_context_compiler.py)
+- [tests/test_vector_engine.py](../../tests/test_vector_engine.py)
 
 ## Design Principles
 

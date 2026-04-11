@@ -6,8 +6,8 @@ This page reflects the current project as implemented, not the older marketing f
 
 ### 1. Language OS Runtime
 
-- canonical managed runtime in [run_engine/engine.py](/Users/theshovonsaha/Developer/Github/agent/run_engine/engine.py)
-- compatibility-native runtime in [engine/core.py](/Users/theshovonsaha/Developer/Github/agent/engine/core.py)
+- canonical managed runtime in [run_engine/engine.py](../../run_engine/engine.py)
+- compatibility-native runtime in [engine/core.py](../../engine/core.py)
 - phase-aware context compilation
 - selectable execution modes:
   - `single`
@@ -116,7 +116,7 @@ The contract exists and managed runtime is default, but provider-specific behavi
 
 ### 3. Runtime Decomposition
 
-The behavior is right, but too much control logic still lives in [engine/core.py](/Users/theshovonsaha/Developer/Github/agent/engine/core.py).
+The behavior is right, but too much control logic still lives in [engine/core.py](../../engine/core.py).
 
 ### 4. Stronger Small-Model Tool Obedience
 

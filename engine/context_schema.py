@@ -8,6 +8,7 @@ from typing import Any
 class ContextKind(str, Enum):
     INSTRUCTION = "instruction"
     OBJECTIVE = "objective"
+    META = "meta"
     EVIDENCE = "evidence"
     WORKING = "working"
     MEMORY = "memory"

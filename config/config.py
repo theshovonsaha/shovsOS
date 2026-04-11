@@ -18,9 +18,17 @@ load_dotenv()
 
 @dataclass
 class Config:
-    # ── LLM ───────────────────────────────────────────────────────────────
-    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "auto")  # auto|ollama|openai|groq
-    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "llama3.2")
+    # ── LLM Models ────────────────────────────────────────────────────────
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "auto")  # auto|ollama|openai|groq|gemini
+    DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "qwen2.5-coder:latest")
+    
+    # Provider-Specific Fallbacks
+    OLLAMA_DEFAULT_MODEL: str = os.getenv("OLLAMA_DEFAULT_MODEL", "qwen2.5-coder:latest")
+    OPENAI_DEFAULT_MODEL: str = os.getenv("OPENAI_DEFAULT_MODEL", "gpt-4o-mini")
+    GROQ_DEFAULT_MODEL: str = os.getenv("GROQ_DEFAULT_MODEL", "llama-3.3-70b-versatile")
+    GEMINI_DEFAULT_MODEL: str = os.getenv("GEMINI_DEFAULT_MODEL", "gemini-1.5-flash")
+    ANTHROPIC_DEFAULT_MODEL: str = os.getenv("ANTHROPIC_DEFAULT_MODEL", "claude-3-5-sonnet-latest")
+    
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
     # ── Search Backends ───────────────────────────────────────────────────
@@ -43,7 +51,7 @@ class Config:
     SESSIONS_DB: str = os.getenv("SESSIONS_DB", "sessions.db")
     AGENTS_DB: str = os.getenv("AGENTS_DB", "agents.db")
     CHROMA_DB_PATH: str = os.getenv("CHROMA_DB_PATH", "./chroma_db")
-    EMBED_MODEL: str = os.getenv("EMBED_MODEL", "nomic-embed-text")
+    EMBED_MODEL: str = os.getenv("EMBED_MODEL", "qwen3-embedding:latest")
     EMBEDDING_HTTP_TIMEOUT: float = float(os.getenv("EMBEDDING_HTTP_TIMEOUT", "20"))
     EMBEDDING_HTTP_RETRIES: int = int(os.getenv("EMBEDDING_HTTP_RETRIES", "2"))
     EMBEDDING_CACHE_SIZE: int = int(os.getenv("EMBEDDING_CACHE_SIZE", "512"))

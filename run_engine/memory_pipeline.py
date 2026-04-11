@@ -57,6 +57,7 @@ def plan_memory_commit(
     existing_candidate_signals: Optional[list[dict[str, str]]],
     existing_candidate_context: str,
     new_candidate_signals: Optional[list[dict[str, Any]]] = None,
+    current_turn: Optional[int] = None,
 ) -> MemoryCommitPlan:
     new_context = context_result[0] if context_result else ""
     compression_keyed_facts = list(context_result[1] or []) if len(context_result) > 1 else []
@@ -73,6 +74,7 @@ def plan_memory_commit(
         blocked_keyed_facts,
         extra_signals=new_candidate_signals,
         supersede_matching_stances=has_correction_signal(user_message),
+        current_turn=current_turn,
     )
     rendered_candidate_context = render_candidate_signals(candidate_signals) if candidate_signals else merge_candidate_context(existing_candidate_context, blocked_keyed_facts)
     return MemoryCommitPlan(
@@ -97,12 +99,14 @@ def build_deterministic_memory_commit(
     existing_candidate_context: str,
     user_message: str = "",
     new_candidate_signals: Optional[list[dict[str, Any]]] = None,
+    current_turn: Optional[int] = None,
 ) -> MemoryCommitPlan:
     candidate_signals = merge_candidate_signals(
         list(existing_candidate_signals or []),
         [],
         extra_signals=new_candidate_signals,
         supersede_matching_stances=has_correction_signal(user_message),
+        current_turn=current_turn,
     )
     rendered_candidate_context = render_candidate_signals(candidate_signals) if candidate_signals else str(existing_candidate_context or "")
     return MemoryCommitPlan(

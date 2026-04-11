@@ -190,6 +190,45 @@ async def test_tool_registry_rejects_malformed_json_payloads():
 
 
 @pytest.mark.asyncio
+async def test_tool_registry_honors_explicit_json_failure_payloads():
+    from plugins.tool_registry import ToolRegistry, Tool, ToolCall
+
+    registry = ToolRegistry()
+    registry.register(Tool(
+        name="file_create",
+        description="create",
+        parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        handler=AsyncMock(return_value=json.dumps({"success": False, "status": "HARD_FAILURE", "message": "missing"})),
+        response_format="json",
+    ))
+
+    result = await registry.execute(ToolCall(
+        tool_name="file_create",
+        arguments={"path": "demo.txt"},
+        raw_json='{"tool":"file_create","arguments":{"path":"demo.txt"}}',
+    ))
+
+    assert result.success is False
+    assert "HARD_FAILURE" in result.content
+
+
+@pytest.mark.asyncio
+async def test_bash_returns_hard_failure_when_expected_write_target_is_missing(monkeypatch):
+    from plugins.tools import _bash
+
+    async def _fake_run_in_docker(command: str, timeout: int = 30, workdir=None):
+        return ""
+
+    monkeypatch.setattr("plugins.docker_sandbox.run_in_docker", _fake_run_in_docker)
+
+    payload = json.loads(await _bash("touch missing.txt"))
+
+    assert payload["success"] is False
+    assert payload["status"] == "HARD_FAILURE"
+    assert payload["verification"]["missing_paths"] == ["missing.txt"]
+
+
+@pytest.mark.asyncio
 async def test_web_search_returns_json_error_payload_for_invalid_backend():
     from plugins.tools_web import _web_search
 
@@ -416,16 +455,17 @@ async def test_delegation_inherits_parent_adapter_when_model_is_bare():
         agent_id="default",
     )
 
-    captured = {}
+    # The runtime adapter's run_task is what actually executes.
+    # We verify that the adapter passed into the runtime context is the parent adapter.
+    captured_context = {}
 
-    class FakeAgentCore:
-        def __init__(self, *args, **kwargs):
-            captured["adapter"] = kwargs.get("adapter")
-        async def chat_stream(self, **kwargs):
-            yield {"type": "token", "content": "delegated-ok"}
+    original_run_task = manager.get_runtime_adapter("managed").run_task
 
-    with patch("engine.core.AgentCore", FakeAgentCore), \
-         patch("llm.adapter_factory.create_adapter") as mock_create_adapter:
+    async def _capture_run_task(context, task, **kwargs):
+        captured_context["adapter"] = context.adapter
+        return "delegated-ok"
+
+    with patch.object(manager.get_runtime_adapter("managed"), "run_task", side_effect=_capture_run_task):
         result = await manager.run_agent_task(
             agent_id="writer_test",
             task="create a file",
@@ -433,8 +473,7 @@ async def test_delegation_inherits_parent_adapter_when_model_is_bare():
         )
 
     assert result == "delegated-ok"
-    assert captured.get("adapter") is parent_adapter
-    mock_create_adapter.assert_not_called()
+    assert captured_context.get("adapter") is parent_adapter
 
 
 @pytest.mark.asyncio

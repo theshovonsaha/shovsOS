@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from typing import Optional
 
-from api.memory_inspector import build_session_memory_payload
 from engine.deterministic_facts import extract_user_stated_fact_updates
 from memory.semantic_graph import SemanticGraph
 from orchestration.session_manager import SessionManager
+from shovs_memory.inspector import build_memory_payload
 
 
 def _simple_context_preview(raw_context: str) -> list[str]:
@@ -119,7 +119,7 @@ class ShovsMemory:
         session = self.session_manager.get(self.session_id, owner_id=self.owner_id)
         if session is None:
             raise ValueError(f"Session not found: {self.session_id}")
-        return build_session_memory_payload(
+        return build_memory_payload(
             session=session,
             owner_id=self.owner_id or "",
             graph=self.graph,

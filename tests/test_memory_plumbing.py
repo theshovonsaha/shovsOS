@@ -240,6 +240,21 @@ def test_deterministic_fact_extractor_supports_more_user_preferences():
     assert ("pronouns", "he/him") in pairs
 
 
+def test_deterministic_fact_extractor_captures_task_state_and_constraints():
+    facts, voids = extract_user_stated_fact_updates(
+        "Use staging environment mode. Keep scope to engine/ and tests/. "
+        "Keep it under two hours. Do not use web_search. Follow up tomorrow on packaging."
+    )
+
+    assert voids == []
+    pairs = {(item["predicate"], item["object"]) for item in facts}
+    assert ("environment_mode", "staging") in pairs
+    assert ("scope_boundary", "engine/") in pairs
+    assert ("budget_limit", "two hours") in pairs
+    assert ("task_constraint", "Do not use web_search") in pairs
+    assert ("followup_directive", "Follow up tomorrow on packaging") in pairs
+
+
 def test_direct_fact_memory_guard_supports_preference_queries_beyond_name_and_location():
     current_facts = [
         ("User", "timezone", "EST"),
@@ -258,6 +273,22 @@ def test_direct_fact_memory_guard_supports_preference_queries_beyond_name_and_lo
     assert should_answer_direct_fact_from_memory("What response style do I prefer?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What operating system do I use?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What are my pronouns?", current_facts) is True
+
+
+def test_direct_fact_memory_guard_supports_task_state_queries():
+    current_facts = [
+        ("Task", "environment_mode", "staging"),
+        ("Task", "scope_boundary", "engine/"),
+        ("Task", "budget_limit", "two hours"),
+        ("Task", "task_constraint", "Do not use web_search"),
+        ("Task", "followup_directive", "Follow up tomorrow on packaging"),
+    ]
+
+    assert should_answer_direct_fact_from_memory("Which environment did I ask for?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What scope did I set?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What budget did I set?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What constraints did I set?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What follow up directive did I set?", current_facts) is True
 
 
 def test_finalize_compression_fact_records_blocks_alias_noise_after_grounding():

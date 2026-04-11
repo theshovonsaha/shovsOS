@@ -113,6 +113,7 @@ async def test_api_requires_owner_and_denies_cross_owner_session_access():
         denied = await ac.get(f"/sessions/{session_id}", params={"owner_id": "owner-b"})
 
         assert allowed.status_code == 200
+        assert allowed.json()["agent_id"] == "default"
         assert denied.status_code == 404
 
         await ac.delete(f"/sessions/{session_id}", params={"owner_id": "owner-a"})

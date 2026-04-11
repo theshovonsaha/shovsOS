@@ -1,4 +1,4 @@
-from engine.candidate_signals import extract_stance_signals
+from engine.candidate_signals import extract_stance_signals, merge_candidate_signals
 from orchestration.session_manager import SessionManager
 
 
@@ -61,3 +61,25 @@ def test_extract_stance_signals_builds_structured_stance_candidates():
     assert signals[0]["confidence"] == "hedged"
     assert signals[0]["turn_index"] == 7
     assert "Stance [" in signals[0]["text"]
+
+
+def test_candidate_signal_lifecycle_promotes_then_expires_stale_review_items():
+    signals = merge_candidate_signals(
+        [],
+        [{"fact": "General working_on Secret roadmap", "grounding_reason": "not_grounded"}],
+        current_turn=1,
+    )
+
+    assert signals[0]["promotion_state"] == "candidate"
+    assert signals[0]["prompt_eligible"] is True
+
+    promoted = merge_candidate_signals(
+        signals,
+        [{"fact": "General working_on Secret roadmap", "grounding_reason": "not_grounded"}],
+        current_turn=2,
+    )
+    assert promoted[0]["promotion_state"] == "promoted"
+    assert promoted[0]["expired"] is False
+
+    decayed = merge_candidate_signals(promoted, [], current_turn=25)
+    assert decayed == []

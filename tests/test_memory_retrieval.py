@@ -4,7 +4,7 @@ from memory.retrieval import unified_memory_search
 
 
 class _FakeGraph:
-    async def traverse(self, query, top_k=5, threshold=0.5, owner_id=None):
+    async def traverse(self, query, top_k=5, threshold=0.5, owner_id=None, locus_id=None):
         return [
             {
                 "id": 1,
@@ -21,6 +21,12 @@ class _FakeGraph:
             ("User", "location", "Berlin"),
             ("User", "preferred_editor", "Cursor"),
         ]
+
+    def list_loci(self, owner_id=None):
+        return []
+
+    def get_compiled_drawer(self, locus_id):
+        return None
 
 
 @pytest.mark.asyncio

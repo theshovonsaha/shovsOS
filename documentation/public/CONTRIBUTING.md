@@ -21,7 +21,7 @@ Shovs LLM OS is an open-source Language OS project focused on explicit runtime c
 4. Submit a PR.
 
 ## Development Setup
-1. Standard installation (see [README](/Users/theshovonsaha/Developer/Github/agent/README.md) and [Setup](/Users/theshovonsaha/Developer/Github/agent/documentation/public/SETUP.md)).
+1. Standard installation (see [README](../../README.md) and [Setup](SETUP.md)).
 2. Run tests: `pytest`.
 3. Keep logic modular: add new LLM providers to `llm/` and new tools to `plugins/`.
 

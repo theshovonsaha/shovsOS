@@ -8,4 +8,4 @@ Read the full policy here:
 ## Reporting
 
 Report abusive or unacceptable behavior to:
-- theshovonsaha@gmail.com
+- the project maintainers via [GitHub Issues](https://github.com/shovsOS/shovsOS/issues)

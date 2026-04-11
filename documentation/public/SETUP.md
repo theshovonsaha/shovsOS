@@ -58,7 +58,6 @@ HOST=0.0.0.0
 PORT=8000
 DEBUG=True
 DEFAULT_MODEL=llama3.2
-ALLOW_LEGACY_CHAT_RUNTIME=false
 ```
 
 ### Provider Options
@@ -91,8 +90,6 @@ EMBED_MODEL=ollama:nomic-embed-text
 ```
 
 The runtime supports both current Ollama embedding transport (`/api/embed`) and legacy (`/api/embeddings`) automatically.
-
-`ALLOW_LEGACY_CHAT_RUNTIME` controls whether `/chat/stream` may route to the older `engine/core.py` path via `runtime_path=legacy`. Keep this `false` unless you are explicitly testing compatibility behavior.
 
 ### LM Studio
 

@@ -394,9 +394,10 @@ async def test_file_create_and_view():
     content = "Real-world test payload 🚀"
 
     create_result = await _file_create(path=fname, content=content)
-    assert "Created" in create_result or fname in create_result, (
-        f"Unexpected create result: {create_result}"
-    )
+    create_payload = json.loads(create_result)
+    assert create_payload["success"] is True, f"Unexpected create result: {create_result}"
+    assert create_payload["verification"]["exists_after"] is True
+    assert create_payload["path"] == fname
 
     view_result = await _file_view(path=fname)
     assert content in view_result, f"File content not found in view: {view_result}"
