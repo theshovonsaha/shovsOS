@@ -16,6 +16,9 @@ dependencies = [
   "httpx",
   "numpy",
   "python-dotenv",
+  "pydantic",
+  "chromadb",
+  "tiktoken",
 ]
 
 [project.urls]
@@ -29,8 +32,11 @@ where = ["."]
 include = [
   "config*",
   "engine*",
+  "llm*",
   "memory*",
   "orchestration*",
+  "plugins*",
+  "run_engine*",
   "shovs_memory*",
 ]
 namespaces = true

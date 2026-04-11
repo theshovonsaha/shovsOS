@@ -38,8 +38,11 @@ class _FallbackBdistWheel(Command):
 PACKAGE_PATTERNS = [
     "config*",
     "engine*",
+    "llm*",
     "memory*",
     "orchestration*",
+    "plugins*",
+    "run_engine*",
     "shovs_memory*",
 ]
 
@@ -59,8 +62,10 @@ setup(
         "httpx",
         "numpy",
         "python-dotenv",
+        "pydantic",
+        "chromadb",
+        "tiktoken",
     ],
     include_package_data=True,
     packages=find_namespace_packages(where=".", include=PACKAGE_PATTERNS),
-    cmdclass={"bdist_wheel": _FallbackBdistWheel},
 )
