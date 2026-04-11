@@ -50,6 +50,7 @@ Memory wedge: [documentation/public/SHOVS_MEMORY.md](documentation/public/SHOVS_
 
 Use it when you want:
 - deterministic user fact writes
+- deterministic task-state capture (constraints, scope, follow-up directives)
 - correction-aware temporal memory
 - semantic retrieval
 - an inspectable memory state view

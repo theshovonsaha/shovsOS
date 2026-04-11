@@ -146,23 +146,24 @@ def strip_provider_prefix(model_name: str) -> str:
 
 def get_default_model(adapter: BaseLLMAdapter) -> str:
     """Return sensible default model for each provider type."""
+    from config.config import cfg
     from llm.llm_adapter import OllamaAdapter
     from llm.openai_adapter import OpenAIAdapter
     from llm.groq_adapter import GroqLLMAdapter
 
     if isinstance(adapter, OllamaAdapter):
-        return os.getenv("DEFAULT_MODEL", "llama3.2")
+        return cfg.OLLAMA_DEFAULT_MODEL
     if isinstance(adapter, OpenAIAdapter):
-        return os.getenv("DEFAULT_MODEL", "gpt-4o-mini")
+        return cfg.OPENAI_DEFAULT_MODEL
     if isinstance(adapter, GroqLLMAdapter):
-        return os.getenv("DEFAULT_MODEL", "llama-3.3-70b-versatile")
+        return cfg.GROQ_DEFAULT_MODEL
     
     from llm.gemini_adapter import GeminiAdapter
     if isinstance(adapter, GeminiAdapter):
-        return os.getenv("DEFAULT_MODEL", "gemini-1.5-flash")
+        return cfg.GEMINI_DEFAULT_MODEL
     
     from llm.anthropic_adapter import AnthropicAdapter
     if isinstance(adapter, AnthropicAdapter):
-        return os.getenv("DEFAULT_MODEL", "claude-3-5-sonnet-latest")
+        return cfg.ANTHROPIC_DEFAULT_MODEL
 
-    return "llama3.2"
+    return cfg.DEFAULT_MODEL

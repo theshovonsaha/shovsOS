@@ -54,6 +54,7 @@ from api.memory_inspector import build_session_memory_payload
 from api.owner import require_owner_id
 from services.storage_admin import StorageAdminService, StoreSelection
 from services.consumer_store import ConsumerStoreService
+from plugins.shovs_meta_gateway import inject_gateway_dependencies, register_gateway_tools
 
 from guardrails import GuardrailMiddleware
 from guardrails.api_routes import make_guardrail_router
@@ -61,8 +62,9 @@ from orchestration.run_store import get_run_store
 from config.trace_store import get_trace_store
 from run_engine import RunEngine, RunEngineRequest
 
-# ── Config ────────────────────────────────────────────────────────────────────
-FALLBACK_CHAT_MODEL = "llama3.2"
+from config.config import cfg
+from engine.fact_guard import is_grounded_fact_record
+FALLBACK_CHAT_MODEL = cfg.DEFAULT_MODEL
 CHAT_RATE_LIMIT = os.getenv("CHAT_RATE_LIMIT", "30/minute")
 
 
@@ -158,6 +160,8 @@ consumer_store = ConsumerStoreService(
 )
 
 # ── Register tools ────────────────────────────────────────────────────────────
+inject_gateway_dependencies(tool_registry, semantic_graph)
+register_gateway_tools(tool_registry)
 register_all_tools(tool_registry, agent_manager=agent_manager)
 
 
@@ -195,7 +199,7 @@ def _seed_standard_profiles():
         AgentProfile(
             id="researcher",
             name="Research Specialist",
-            model="groq:llama-3.3-70b-versatile",
+            model=cfg.DEFAULT_MODEL,
             tools=["web_search", "web_fetch", "rag_search", "query_memory", "store_memory"],
             system_prompt=(
                 "You are a meticulous research agent. Always verify claims across multiple sources. "
@@ -205,8 +209,8 @@ def _seed_standard_profiles():
         ),
         AgentProfile(
             id="analyst",
-            name="Data Analyst Agent",
-            model="groq:llama-3.3-70b-versatile",
+            name="Data Analyst",
+            model=cfg.DEFAULT_MODEL,
             tools=["file_create", "file_view", "file_str_replace", "rag_search", "bash"],
             system_prompt=(
                 "You are a data analyst. Write clean, well-structured markdown reports and Python scripts. "

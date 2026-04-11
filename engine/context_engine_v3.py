@@ -18,6 +18,8 @@ from llm.base_adapter import BaseLLMAdapter
 from engine.context_engine import ContextEngine
 from engine.context_engine_v2 import ContextEngineV2
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
+from config.config import cfg
+from engine.fact_guard import is_grounded_fact_record
 
 
 class ContextEngineV3:
@@ -25,10 +27,10 @@ class ContextEngineV3:
         self,
         adapter: BaseLLMAdapter,
         semantic_graph=None,
-        compression_model: str = "llama3.2",
+        compression_model: Optional[str] = None,
     ):
         self.adapter = adapter
-        self.compression_model = compression_model
+        self.compression_model = compression_model or cfg.DEFAULT_MODEL
         self._v1 = ContextEngine(adapter=adapter, compression_model=compression_model)
         self._v2 = ContextEngineV2(
             adapter=adapter,

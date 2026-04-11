@@ -8,7 +8,7 @@ Security fixes are applied to the latest version on the default branch.
 
 Please do not open public issues for security vulnerabilities.
 
-Report vulnerabilities privately by emailing theshovonsaha@gmail.com with:
+Report vulnerabilities privately via [GitHub Security Advisories](https://github.com/shovsOS/shovsOS/security/advisories) with:
 
 - A clear description of the issue
 - Reproduction steps or proof of concept

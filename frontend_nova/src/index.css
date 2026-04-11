@@ -3967,7 +3967,9 @@ body,
   background: rgba(21, 27, 36, 0.92);
   padding: 12px clamp(12px, 2vw, 24px);
   max-height: min(44vh, 360px);
-  overflow-y: auto;
+  overflow: visible;
+  position: relative;
+  z-index: 10;
   overscroll-behavior: contain;
 }
 
@@ -4057,16 +4059,16 @@ body,
 .nova-tool-menu {
   position: absolute;
   right: 0;
-  bottom: calc(100% + 10px);
+  bottom: calc(100% + 12px);
   width: 300px;
-  max-height: 300px;
+  max-height: 400px;
   overflow: auto;
   border: 1px solid var(--border-hi);
   border-radius: 12px;
-  background: #1a2330;
-  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.34);
+  background: #111820; /* Darker, more solid background */
+  box-shadow: 0 16px 38px rgba(0, 0, 0, 0.5);
   padding: 8px;
-  z-index: 30;
+  z-index: 100;
 }
 
 .nova-tool-menu button {

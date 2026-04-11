@@ -9,7 +9,7 @@ Security fixes are applied to the latest code on the default branch.
 Do not open public issues for security vulnerabilities.
 
 Report privately to:
-- theshovonsaha@gmail.com
+- Open a [GitHub Security Advisory](../../.github/SECURITY.md) on this repository
 
 Include:
 - issue description

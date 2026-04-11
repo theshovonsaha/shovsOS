@@ -116,14 +116,28 @@ def make_consumer_router(
         payload = payload or {}
         owner_id = _require_owner_id(payload.get("owner_id"))
         options = consumer_store.get_options()
-        model = payload.get("model") or options.get("model")
+        profile = profile_manager.get(CONSUMER_AGENT_ID, owner_id=owner_id) or profile_manager.get(
+            "default",
+            owner_id=owner_id,
+        )
+        model = payload.get("model") or options.get("model") or getattr(profile, "model", None)
+        context_mode = payload.get("context_mode") or getattr(profile, "default_context_mode", "v2")
+        if context_mode not in {"v1", "v2", "v3"}:
+            context_mode = "v2"
         s = sessions.create(
             model=model,
-            system_prompt="",
+            system_prompt=getattr(profile, "system_prompt", "") or "",
             agent_id=CONSUMER_AGENT_ID,
             owner_id=owner_id,
         )
-        return {"id": s.id, "model": s.model, "agent_id": s.agent_id, "created_at": s.created_at}
+        sessions.set_context_mode(s.id, context_mode)
+        return {
+            "id": s.id,
+            "model": s.model,
+            "agent_id": s.agent_id,
+            "created_at": s.created_at,
+            "context_mode": context_mode,
+        }
 
     @router.post("/chat/stream")
     async def consumer_chat_stream(
@@ -159,6 +173,9 @@ def make_consumer_router(
 
             tool_events = 0
             sid = session_id
+            resolved_context_mode = getattr(profile, "default_context_mode", "v2")
+            if resolved_context_mode not in {"v1", "v2", "v3"}:
+                resolved_context_mode = "v2"
             if not sid:
                 created = sessions.create(
                     model=active_model,
@@ -167,6 +184,11 @@ def make_consumer_router(
                     owner_id=owner_id,
                 )
                 sid = created.id
+                sessions.set_context_mode(sid, resolved_context_mode)
+            else:
+                existing = sessions.get(sid, owner_id=owner_id)
+                if existing and getattr(existing, "context_mode", "") != resolved_context_mode:
+                    sessions.set_context_mode(sid, resolved_context_mode)
 
             run_request = RunEngineRequest(
                 session_id=sid,
@@ -175,8 +197,10 @@ def make_consumer_router(
                 user_message=full_message,
                 model=active_model,
                 system_prompt=getattr(profile, "system_prompt", "") or "",
+                context_mode=resolved_context_mode,
                 allowed_tools=tuple(getattr(profile, "tools", []) or []),
                 use_planner=bool(getattr(profile, "default_use_planner", True)),
+                embed_model=getattr(profile, "embed_model", None),
                 images=image_b64s or None,
                 agent_revision=getattr(profile, "revision", None),
             )
@@ -209,6 +233,8 @@ def make_consumer_router(
                     yield f"data: {json.dumps({'type': 'verification_warning', 'issues': event.get('issues', []), 'confidence': event.get('confidence', 0)})}\n\n"
                 elif event_type == "conversation_tension":
                     yield f"data: {json.dumps({'type': 'tension', 'summary': event.get('summary', ''), 'challenge_level': event.get('challenge_level', '')})}\n\n"
+                elif event_type == "logical_stall_alert":
+                    yield f"data: {json.dumps({'type': 'activity_detail', 'text': 'logical stall alert', 'detail': event.get('message', '')[:400]})}\n\n"
                 elif event_type == "done":
                     sid = event.get("session_id", sid)
                     last_run_id = event.get("run_id", last_run_id)

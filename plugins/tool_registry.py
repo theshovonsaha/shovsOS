@@ -508,7 +508,10 @@ class ToolRegistry:
     def _serialize_tool_output(self, tool: Tool, raw: Any) -> tuple[bool, str]:
         if tool.response_format == "json":
             if isinstance(raw, (dict, list)):
-                return True, json.dumps(raw)
+                success = True
+                if isinstance(raw, dict) and isinstance(raw.get("success"), bool):
+                    success = bool(raw.get("success"))
+                return success, json.dumps(raw)
 
             if isinstance(raw, str):
                 try:
@@ -529,10 +532,15 @@ class ToolRegistry:
                         "raw_preview": raw[:500],
                     }
                     return False, json.dumps(error_payload)
-                return True, raw
+                success = True
+                if isinstance(parsed, dict) and isinstance(parsed.get("success"), bool):
+                    success = bool(parsed.get("success"))
+                return success, raw
 
             return True, json.dumps(raw)
 
+        if isinstance(raw, dict) and isinstance(raw.get("success"), bool):
+            return bool(raw.get("success")), json.dumps(raw)
         return True, raw if isinstance(raw, str) else json.dumps(raw)
 
     async def _run_after_hooks(self, tool_name: str, arguments: dict, result: ToolResult) -> ToolResult:

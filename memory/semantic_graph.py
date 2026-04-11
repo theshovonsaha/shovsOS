@@ -25,9 +25,9 @@ class SemanticGraph:
     _embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
     _cache_lock = threading.RLock()
 
-    def __init__(self, db_path: str = "memory_graph.db", embedding_model: str = "nomic-embed-text"):
+    def __init__(self, db_path: str = "memory_graph.db", embedding_model: Optional[str] = None):
         self.db_path = db_path
-        self.embedding_model = embedding_model
+        self.embedding_model = embedding_model or cfg.EMBED_MODEL
         self.embedding_timeout = float(getattr(cfg, "EMBEDDING_HTTP_TIMEOUT", 20.0))
         self.embedding_retries = max(0, int(getattr(cfg, "EMBEDDING_HTTP_RETRIES", 2)))
         self.embedding_cache_size = max(64, int(getattr(cfg, "EMBEDDING_CACHE_SIZE", 512)))
@@ -108,15 +108,23 @@ class SemanticGraph:
     def _init_db(self):
         """Initialize the SQLite schema."""
         with sqlite3.connect(self.db_path) as conn:
-            # We store the embedding as a JSON string for simplicity,
-            # since a personal agent DB will easily fit in memory for numpy cosine sim.
-            # In a production scaled system, we would use sqlite-vec or chroma,
-            # but for a portable agent OS, native SQLite + numpy is 0-dependency exact math.
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS loci (
+                    id TEXT PRIMARY KEY,
+                    owner_id TEXT,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    compiled_drawer TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            ''')
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     owner_id TEXT,
                     run_id TEXT,
+                    locus_id TEXT,
                     subject TEXT NOT NULL,
                     predicate TEXT NOT NULL,
                     object TEXT NOT NULL,
@@ -130,6 +138,7 @@ class SemanticGraph:
                     session_id TEXT NOT NULL,
                     owner_id TEXT,
                     run_id TEXT,
+                    locus_id TEXT,
                     subject TEXT NOT NULL,
                     predicate TEXT NOT NULL,
                     object TEXT NOT NULL,
@@ -147,6 +156,10 @@ class SemanticGraph:
             except sqlite3.OperationalError:
                 pass
             try:
+                conn.execute("ALTER TABLE memories ADD COLUMN locus_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
                 conn.execute("ALTER TABLE facts ADD COLUMN owner_id TEXT")
             except sqlite3.OperationalError:
                 pass
@@ -154,38 +167,32 @@ class SemanticGraph:
                 conn.execute("ALTER TABLE facts ADD COLUMN run_id TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN locus_id TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.commit()
 
     async def _get_embedding(self, text: str) -> List[float]:
         """Fetch an embedding from the provider."""
         normalized = self._normalize_text(text)
-        model_name = str(self.embedding_model or "").strip()
+        model_name = str(self.embedding_model or cfg.EMBED_MODEL).strip()
         provider = ""
         clean_model = model_name
-        if ":" in model_name:
-            provider, clean_model = model_name.split(":", 1)
-            provider = provider.strip().lower()
-        elif "/" in model_name:
-            maybe_provider, maybe_model = model_name.split("/", 1)
-            if maybe_provider.strip().lower() in {"openai", "local_openai", "lmstudio", "llamacpp", "ollama"}:
-                provider = maybe_provider.strip().lower()
-                clean_model = maybe_model
 
-        if not provider:
-            llm_provider = str(cfg.LLM_PROVIDER or "").strip().lower()
-            if llm_provider == "auto":
-                if getattr(cfg, "LMSTUDIO_BASE_URL", ""):
-                    provider = "lmstudio"
-                elif getattr(cfg, "LLAMACPP_BASE_URL", ""):
-                    provider = "llamacpp"
-                elif getattr(cfg, "OPENAI_BASE_URL", ""):
-                    provider = "local_openai"
-                elif getattr(cfg, "OPENAI_API_KEY", ""):
-                    provider = "openai"
-                else:
-                    provider = "ollama"
+        # Detect Provider Prefix (e.g., "openai:text-embedding-3")
+        known_providers = {"openai", "local_openai", "lmstudio", "llamacpp", "ollama"}
+        if ":" in model_name:
+            prefix, rest = model_name.split(":", 1)
+            if prefix.lower() in known_providers:
+                provider = prefix.lower()
+                clean_model = rest
             else:
-                provider = llm_provider or "ollama"
+                # This was likely a model tag (e.g., "nomic-embed-text:latest")
+                pass
+        
+        if not provider:
+            provider = cfg.LLM_PROVIDER.lower() if cfg.LLM_PROVIDER != "auto" else "ollama"
 
         cache_key = f"{provider}:{self.embedding_model}:{normalized}"
         cached = self._cache_get(cache_key)
@@ -212,19 +219,36 @@ class SemanticGraph:
         else:
             base_url = cfg.OLLAMA_BASE_URL or "http://localhost:11434"
             try:
-                payload = {"model": clean_model or self.embedding_model, "input": normalized}
-                data = await self._post_with_retry(base_url, "/api/embed", payload)
-                embeddings = data.get("embeddings")
-                embedding = embeddings[0] if isinstance(embeddings, list) and embeddings else None
-            except RuntimeError as e:
-                if "404" not in str(e):
-                    raise
+                # 1. Try stable /api/embeddings logic with 'prompt' key
                 payload = {"model": clean_model or self.embedding_model, "prompt": normalized}
                 data = await self._post_with_retry(base_url, "/api/embeddings", payload)
-                embedding = data.get("embedding")
+                
+                if "embedding" in data:
+                    embedding = data["embedding"]
+                elif "embeddings" in data:
+                    embedding = data["embeddings"]
+                else:
+                    embedding = None
+
+                if isinstance(embedding, list) and embedding and isinstance(embedding[0], list):
+                    embedding = embedding[0]
+            except RuntimeError as e:
+                # 2. Fallback to /api/embed with 'input' if 404 or other failure
+                payload = {"model": clean_model or self.embedding_model, "input": [normalized]}
+                data = await self._post_with_retry(base_url, "/api/embed", payload)
+                
+                if "embeddings" in data:
+                    embedding = data["embeddings"]
+                elif "embedding" in data:
+                    embedding = data["embedding"]
+                else:
+                    embedding = None
+
+                if isinstance(embedding, list) and embedding and isinstance(embedding[0], list):
+                    embedding = embedding[0]
 
         if not isinstance(embedding, list):
-            raise RuntimeError("Embedding payload missing vector data.")
+            raise RuntimeError(f"Embedding failed. Model: {clean_model}. Data: {data}")
 
         self._cache_set(cache_key, embedding, self.embedding_cache_size)
         return embedding
@@ -247,12 +271,13 @@ class SemanticGraph:
         object_: str,
         owner_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        locus_id: Optional[str] = None,
     ) -> int:
         """
         Embed the relationship and store the triplet.
         We embed the string: "subject predicate object"
         """
-        text_to_embed = f"{subject} {predicate} {object_}"
+        text_to_embed = f"search_document: {subject} {predicate} {object_}"
         try:
             vector = await self._get_embedding(text_to_embed)
         except Exception as e:
@@ -262,9 +287,9 @@ class SemanticGraph:
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO memories (owner_id, run_id, subject, predicate, object, embedding, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (owner_id, run_id, subject.strip(), predicate.strip(), object_.strip(), json.dumps(vector), now))
+                INSERT INTO memories (owner_id, run_id, locus_id, subject, predicate, object, embedding, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (owner_id, run_id, locus_id, subject.strip(), predicate.strip(), object_.strip(), json.dumps(vector), now))
             conn.commit()
             return cursor.lastrowid
 
@@ -274,6 +299,7 @@ class SemanticGraph:
         top_k: int = 5,
         threshold: float = 0.5,
         owner_id: Optional[str] = None,
+        locus_id: Optional[str] = None,
     ) -> List[Dict]:
         """
         Perform a semantic traversal:
@@ -282,7 +308,9 @@ class SemanticGraph:
         3. Return the top_k matching relationships.
         """
         try:
-            query_vector = await self._get_embedding(query)
+            # For retrieval, we use 'search_query: ' prefix
+            query_to_embed = f"search_query: {query}" if query else "search_query: "
+            query_vector = await self._get_embedding(query_to_embed)
         except Exception as e:
             print(f"[SemanticGraph] Embedding error: {e}")
             return []
@@ -290,14 +318,16 @@ class SemanticGraph:
         results = []
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            if owner_id is None:
-                cursor.execute("SELECT id, subject, predicate, object, embedding, created_at FROM memories")
-            else:
-                cursor.execute(
-                    "SELECT id, subject, predicate, object, embedding, created_at FROM memories "
-                    "WHERE COALESCE(owner_id, '') = COALESCE(?, '')",
-                    (owner_id,),
-                )
+            query_str = "SELECT id, subject, predicate, object, embedding, created_at FROM memories WHERE 1=1"
+            params = []
+            if owner_id is not None:
+                query_str += " AND COALESCE(owner_id, '') = COALESCE(?, '')"
+                params.append(owner_id)
+            if locus_id is not None:
+                query_str += " AND COALESCE(locus_id, '') = COALESCE(?, '')"
+                params.append(locus_id)
+            
+            cursor.execute(query_str, tuple(params))
             all_memories = cursor.fetchall()
 
             for row in all_memories:
@@ -396,14 +426,15 @@ class SemanticGraph:
         turn: int,
         owner_id: Optional[str] = None,
         run_id: Optional[str] = None,
+        locus_id: Optional[str] = None,
     ):
         """Insert a new fact valid from exactly this turn forward."""
         now = datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
-                INSERT INTO facts (session_id, owner_id, run_id, subject, predicate, object, valid_from, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (session_id, owner_id, run_id, subject.strip(), predicate.strip(), object_.strip(), turn, now))
+                INSERT INTO facts (session_id, owner_id, run_id, locus_id, subject, predicate, object, valid_from, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (session_id, owner_id, run_id, locus_id, subject.strip(), predicate.strip(), object_.strip(), turn, now))
             conn.commit()
 
     def void_temporal_fact(
@@ -486,6 +517,120 @@ class SemanticGraph:
                 )
             rows = cursor.fetchall()
 
+        return [
+            {
+                "subject": row["subject"],
+                "predicate": row["predicate"],
+                "object": row["object"],
+                "valid_from": row["valid_from"],
+                "valid_to": row["valid_to"],
+                "created_at": row["created_at"],
+                "run_id": row["run_id"],
+                "status": "current" if row["valid_to"] is None else "superseded",
+            }
+            for row in rows
+        ]
+
+    # ── Locus / Spatial Registry Logic ──────────────────────────────────────
+    def register_locus(
+        self,
+        locus_id: str,
+        name: str,
+        description: str = "",
+        owner_id: Optional[str] = None,
+    ):
+        """Register a new spatial room (Locus) with the graph."""
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                INSERT OR REPLACE INTO loci (id, owner_id, name, description, created_at, updated_at)
+                VALUES (?, ?, ?, ?, COALESCE((SELECT created_at FROM loci WHERE id = ?), ?), ?)
+            ''', (locus_id, owner_id, name, description, locus_id, now, now))
+            conn.commit()
+
+    def get_locus(self, locus_id: str, owner_id: Optional[str] = None) -> Optional[Dict]:
+        """Fetch details of a specific Locus."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if owner_id is None:
+                cursor.execute("SELECT * FROM loci WHERE id = ?", (locus_id,))
+            else:
+                cursor.execute(
+                    "SELECT * FROM loci WHERE id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')",
+                    (locus_id, owner_id),
+                )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_compiled_drawer(self, locus_id: str, compiled_markdown: str):
+        """Update the Karpathy-style compiled context (Executable Wiki) for a Locus."""
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute('''
+                UPDATE loci SET compiled_drawer = ?, updated_at = ? WHERE id = ?
+            ''', (compiled_markdown, now, locus_id))
+            conn.commit()
+
+    def get_compiled_drawer(self, locus_id: str) -> Optional[str]:
+        """Get the compiled document for a specific Locus."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT compiled_drawer FROM loci WHERE id = ?", (locus_id,))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+            return None
+
+    def list_loci(self, owner_id: Optional[str] = None) -> List[Dict]:
+        """List all registered spatial Loci."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if owner_id is None:
+                cursor.execute("SELECT * FROM loci ORDER BY name ASC")
+            else:
+                cursor.execute(
+                    "SELECT * FROM loci WHERE COALESCE(owner_id, '') = COALESCE(?, '') ORDER BY name ASC",
+                    (owner_id,),
+                )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def list_temporal_facts_by_locus(
+        self,
+        locus_id: str,
+        owner_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """Return the fact timeline for a specific Locus."""
+        safe_limit = max(1, int(limit))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            if owner_id is None:
+                cursor.execute(
+                    '''
+                    SELECT subject, predicate, object, valid_from, valid_to, created_at, run_id
+                    FROM facts
+                    WHERE locus_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    ''',
+                    (locus_id, safe_limit),
+                )
+            else:
+                cursor.execute(
+                    '''
+                    SELECT subject, predicate, object, valid_from, valid_to, created_at, run_id
+                    FROM facts
+                    WHERE locus_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')
+                    ORDER BY id DESC
+                    LIMIT ?
+                    ''',
+                    (locus_id, owner_id, safe_limit),
+                )
+            rows = cursor.fetchall()
+        
         return [
             {
                 "subject": row["subject"],

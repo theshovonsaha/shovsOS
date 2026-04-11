@@ -30,6 +30,8 @@ def test_consumer_session_route_creates_consumer_scoped_session():
     session = consumer_session_manager.get(payload["id"], owner_id=owner_id)
     assert session is not None
     assert session.agent_id == "consumer"
+    assert payload["context_mode"] == "v2"
+    assert session.context_mode == "v2"
 
 
 def test_consumer_chat_stream_uses_managed_run_engine_contract(monkeypatch):
@@ -57,6 +59,7 @@ def test_consumer_chat_stream_uses_managed_run_engine_contract(monkeypatch):
     assert request.agent_id == "consumer"
     assert request.owner_id == "consumer-chat-owner"
     assert request.use_planner is True
+    assert request.context_mode == "v2"
     assert "query_memory" in request.allowed_tools
     assert "Hello from consumer." in response.text
     assert '"phase": "working"' in response.text

@@ -30,11 +30,12 @@ class ManagedRuntimeInstance:
         forced_tools: Optional[list[str]] = None,
         **kw,
     ):
-        del force_memory  # managed runtime currently does not consume this knob directly
+        del force_memory  # compatibility shim; managed runtime consumes typed request state instead
         context = self._context
         owner_id = kw.get("owner_id", context.owner_id)
         requested_agent_id = agent_id or context.agent_id
         effective_model = model or context.model_override or context.profile.model
+        resolved_context_mode = kw.get("context_mode") or getattr(context.profile, "default_context_mode", "v2")
         request = RunEngineRequest(
             session_id=session_id or str(uuid.uuid4()),
             owner_id=str(owner_id or ""),
@@ -42,6 +43,7 @@ class ManagedRuntimeInstance:
             user_message=user_message,
             model=effective_model,
             system_prompt=system_prompt or context.profile.system_prompt or "",
+            context_mode=resolved_context_mode,
             allowed_tools=tuple(getattr(context.profile, "tools", []) or []),
             use_planner=bool(
                 kw.get("use_planner")
@@ -109,11 +111,13 @@ class ManagedAgentRuntimeAdapter:
         owner_id = str(context.owner_id or "")
         child_sid = f"delegated_{uuid.uuid4().hex[:8]}"
         effective_model = context.model_override or context.profile.model
+        resolved_context_mode = getattr(context.profile, "default_context_mode", "v2")
 
         if parent_id:
             parent_session = context.sessions.get(parent_id, owner_id=context.owner_id)
             if parent_session and parent_session.model:
                 effective_model = parent_session.model
+                resolved_context_mode = getattr(parent_session, "context_mode", resolved_context_mode)
 
         context.sessions.get_or_create(
             session_id=child_sid,
@@ -131,6 +135,7 @@ class ManagedAgentRuntimeAdapter:
             user_message=task,
             model=effective_model,
             system_prompt=context.profile.system_prompt or "",
+            context_mode=resolved_context_mode,
             allowed_tools=tuple(getattr(context.profile, "tools", []) or []),
             use_planner=bool(getattr(context.profile, "default_use_planner", True)),
             agent_revision=getattr(context.profile, "revision", None),

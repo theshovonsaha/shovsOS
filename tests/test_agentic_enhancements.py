@@ -121,11 +121,17 @@ def test_tool_registry_validate_tool_call():
 @pytest.mark.asyncio
 async def test_query_memory_uses_session_facts(monkeypatch):
     class FakeGraph:
-        async def traverse(self, topic, top_k=5, threshold=0.5, owner_id=None):
+        async def traverse(self, topic, top_k=5, threshold=0.5, owner_id=None, locus_id=None):
             return []
 
         def get_current_facts(self, session_id, owner_id=None):
             return [("User", "likes", "blue")]
+
+        def list_loci(self, owner_id=None):
+            return []
+
+        def get_compiled_drawer(self, locus_id):
+            return None
 
     monkeypatch.setattr("memory.semantic_graph.SemanticGraph", FakeGraph)
     result = await _query_memory("blue", _session_id="session-1")

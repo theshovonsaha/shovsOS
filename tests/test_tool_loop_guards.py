@@ -9,6 +9,7 @@ from engine.core import (
     _normalize_forced_tools_for_task_state,
     _tool_turn_budget,
 )
+from engine.tool_loop_guard import ToolLoopGuard, is_null_bash_result
 from plugins.tool_registry import Tool, ToolCall, ToolRegistry
 
 
@@ -221,3 +222,32 @@ def test_select_followup_tool_results_prioritizes_exact_domain_fetch_over_noisy_
 
     assert selected[0]["tool_name"] == "web_fetch"
     assert "wigglebudget.com" in str(selected[0]["content"]).lower()
+
+
+def test_tool_loop_guard_flags_same_null_bash_command_twice():
+    guard = ToolLoopGuard()
+    payload = '{"type":"bash_result","success":true,"status":"SUCCESS","verification":{"mode":"not_applicable","existing_paths":[],"missing_paths":[],"exists_after":true,"bytes_written":null},"output":""}'
+
+    first = guard.observe_result(
+        tool_name="bash",
+        arguments={"command": "pwd"},
+        success=True,
+        content=payload,
+    )
+    second = guard.observe_result(
+        tool_name="bash",
+        arguments={"command": "pwd"},
+        success=True,
+        content=payload,
+    )
+
+    assert first is None
+    assert second is not None
+    assert second["type"] == "logical_stall_alert"
+    assert second["command"] == "pwd"
+
+
+def test_null_bash_result_ignores_verified_write_commands():
+    payload = '{"type":"bash_result","success":true,"status":"SUCCESS","verification":{"mode":"filesystem_check","existing_paths":["demo.txt"],"missing_paths":[],"exists_after":true,"bytes_written":10},"output":""}'
+
+    assert is_null_bash_result("bash", True, payload) is False

@@ -30,6 +30,8 @@ from engine.context_memory_items import build_context_engine_memory_items
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from engine.compression_fact_policy import finalize_compression_fact_records
 from engine.conversation_tension import ConversationTension, analyze_conversation_tension, render_conversation_tension
+from memory.semantic_graph  import SemanticGraph
+from memory.memory_compiler import MemoryCompiler
 from engine.direct_fact_policy import should_answer_direct_fact_from_memory
 from engine.tool_contract import (
     canonical_tool_call,
@@ -39,6 +41,7 @@ from engine.tool_contract import (
     summarize_tool_results,
     tool_call_signature as shared_tool_call_signature,
 )
+from engine.tool_loop_guard import ToolLoopGuard
 from engine.deterministic_facts import (
     extract_user_stated_fact_updates,
     is_redundant_user_alias_text,
@@ -88,7 +91,7 @@ MAX_OLDEST_MESSAGE_TRUNCATION_CHARS = 1500
 RAG_INDEX_TIMEOUT_SECONDS = 2.0
 SEMANTIC_GRAPH_THRESHOLD = 0.4
 DEDUP_PREFIX_LENGTH = 60
-DEFAULT_PLANNER_FALLBACK_MODEL = "groq:llama-3.3-70b-versatile"
+DEFAULT_PLANNER_FALLBACK_MODEL = cfg.DEFAULT_MODEL
 SYSTEM_PROMPT_CHAR_BUDGET = max(4000, int(getattr(cfg, "SYSTEM_PROMPT_CHAR_BUDGET", 9000)))
 CANDIDATE_CONTEXT_MAX_LINES = 12
 COMPRESSION_INTERVAL = max(1, int(getattr(cfg, "COMPRESSION_INTERVAL", 4)))
@@ -1359,6 +1362,7 @@ class AgentCore:
 
         self.circuit_breaker = CircuitBreaker(threshold=3)
         self.graph = SemanticGraph()
+        self.compiler = None  # lazy init in _get_compiler()
         self._v1_engine = context_engine
         self._v2_engine = None  # lazy init
         self._v3_engine = None  # lazy init
@@ -1431,6 +1435,29 @@ class AgentCore:
             clearer(session_id)
         except Exception:
             pass
+
+    def _get_compiler(self) -> MemoryCompiler:
+        if self.compiler is None:
+            self.compiler = MemoryCompiler(self.graph, self.adapter)
+        return self.compiler
+
+    def _resolve_active_locus_id(self) -> Optional[str]:
+        """Resolves the active spatial Locus based on the current workspace path."""
+        if not self.workspace_path:
+            return None
+        
+        # Heuristic: Match the terminal directory name and check if it exists in the graph
+        path_obj = Path(self.workspace_path)
+        candidate_id = path_obj.name.lower().replace(" ", "-")
+        
+        # Verify if this locus exists in the graph registry
+        locus = self.graph.get_locus(candidate_id)
+        if locus:
+            return candidate_id
+        
+        # Fallback: check if any registered locus has a description or name matching the path
+        # (This is more expensive, keep it simple for now)
+        return None
 
     def _direct_tool_hints(
         self,
@@ -1651,6 +1678,26 @@ class AgentCore:
             ctx_eng.set_adapter(current_use_adapter)
             if self.orch:
                 self.orch.set_adapter(current_use_adapter)
+            
+            # ── Spatial Memory Grounding (Executive Drawer) ───────────────────
+            active_locus_id = self._resolve_active_locus_id()
+            if active_locus_id:
+                trace_event("spatial_grounding_activated", {
+                    "locus_id": active_locus_id,
+                    "workspace": self.workspace_path
+                })
+                # If no compiled drawer exists, or this is a fresh run, trigger synthesis
+                if not self.graph.get_compiled_drawer(active_locus_id) or not loop_checkpoint:
+                    comp_start = datetime.now()
+                    log("mem", sid, f"Compiling Executive Drawer for locus: {active_locus_id}...")
+                    yield _emit(_ev("compiling_spatial_memory", locus_id=active_locus_id))
+                    success = await self._get_compiler().compile_locus(active_locus_id)
+                    comp_end = datetime.now()
+                    trace_event("spatial_memory_compiled", {
+                        "locus_id": active_locus_id,
+                        "success": success,
+                        "duration_ms": (comp_end - comp_start).total_seconds() * 1000
+                    })
             
             # ── Sanitization ─────────
             user_message = sanitize_user_message(user_message)
@@ -2602,6 +2649,7 @@ class AgentCore:
                     existing_candidate_signals=list(getattr(session, "candidate_signals", []) or []),
                     existing_candidate_context=getattr(session, "candidate_context", ""),
                     new_candidate_signals=stance_signals,
+                    current_turn=session.message_count,
                 )
                 outcome = await apply_memory_commit(
                     sessions=self.sessions,
@@ -2685,6 +2733,7 @@ class AgentCore:
                 existing_candidate_context=getattr(session, "candidate_context", ""),
                 user_message=user_message,
                 new_candidate_signals=stance_signals,
+                current_turn=session.message_count,
             )
             outcome = await apply_memory_commit(
                 sessions=self.sessions,
@@ -2995,6 +3044,7 @@ class AgentCore:
         llm_turn = 0
         tool_call_count = 0
         repeated_tool_signatures: dict[str, int] = {}
+        tool_loop_guard = ToolLoopGuard()
         instability_score = 0
         failed_tools: dict[str, int] = {}
         prompt_retry_count = 0
@@ -3357,6 +3407,7 @@ class AgentCore:
             # Execute all tools concurrently or sequentially
             combined_results = []
             tool_results_batch: list[dict[str, Any]] = []
+            stall_alert_for_turn: Optional[dict[str, Any]] = None
             
             for call in calls:
                 signature = _tool_call_signature(call.tool_name, call.arguments)
@@ -3575,6 +3626,36 @@ class AgentCore:
                     "content": result.content,
                     "arguments": dict(call.arguments),
                 })
+                stall_alert = tool_loop_guard.observe_result(
+                    tool_name=call.tool_name,
+                    arguments=dict(call.arguments),
+                    success=bool(result.success),
+                    content=str(result.content or ""),
+                )
+                if stall_alert:
+                    tools_enabled = False
+                    stall_alert_for_turn = dict(stall_alert)
+                    yield _ev(
+                        "logical_stall_alert",
+                        tool_name="bash",
+                        command=stall_alert.get("command", ""),
+                        message=stall_alert["message"],
+                        suggested_pivot=stall_alert.get("suggested_pivot", ""),
+                    )
+                    _trace(
+                        agent_id or "default",
+                        sid,
+                        "logical_stall_alert",
+                        {
+                            "turn": tool_turn,
+                            "tool_name": "bash",
+                            "command": stall_alert.get("command", ""),
+                            "message": stall_alert["message"],
+                            "suggested_pivot": stall_alert.get("suggested_pivot", ""),
+                        },
+                        run_id=run_id,
+                        owner_id=owner_id,
+                    )
                 if result.success and run_id:
                     try:
                         for artifact_candidate in _build_run_artifact_candidates(
@@ -3689,6 +3770,18 @@ class AgentCore:
                 "Either call the next needed tool with one valid JSON tool invocation, or answer the user directly if the evidence is enough. "
                 "Do not repeat tool JSON, schemas, hidden packet names, or internal notes."
             )
+            if stall_alert_for_turn:
+                observation_reminder = (
+                    "\n\n<system-reminder>\n"
+                    + str(stall_alert_for_turn["message"])
+                    + "\n"
+                    + str(stall_alert_for_turn.get("suggested_pivot") or "")
+                    + "\n</system-reminder>"
+                )
+                post_tool_instruction = (
+                    "Recent bash attempts produced no observable output twice. "
+                    "Do not call more tools in this run unless you can name a different observable check."
+                )
             priority_reminder = shared_build_evidence_priority_reminder(
                 user_message,
                 followup_tool_results,
@@ -4079,6 +4172,33 @@ class AgentCore:
                         }),
                         trace_id=f"environment:bootstrap:{doc['name']}",
                         provenance={"path": doc["path"]},
+                    )
+                )
+
+        # ── Spatial Memory Injection (Executive Drawer) ───────────────────
+        active_locus_id = self._resolve_active_locus_id()
+        if active_locus_id:
+            compiled_drawer = self.graph.get_compiled_drawer(active_locus_id)
+            if compiled_drawer:
+                locus_data = self.graph.get_locus(active_locus_id)
+                locus_name = locus_data.get("name", active_locus_id)
+                items.append(
+                    ContextItem(
+                        item_id=f"executive_drawer_{active_locus_id}",
+                        kind=ContextKind.ENVIRONMENT,
+                        title=f"Executive Drawer: {locus_name}",
+                        content=compiled_drawer,
+                        source=f"spatial_memory:{active_locus_id}",
+                        priority=15, # High priority, positioned just below instructions
+                        max_chars=6000,
+                        phase_visibility=frozenset({
+                            ContextPhase.PLANNING,
+                            ContextPhase.ACTING,
+                            ContextPhase.RESPONSE,
+                            ContextPhase.VERIFICATION,
+                        }),
+                        trace_id=f"environment:locus:{active_locus_id}",
+                        provenance={"locus_id": active_locus_id, "name": locus_name},
                     )
                 )
 

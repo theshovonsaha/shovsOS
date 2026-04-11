@@ -44,6 +44,11 @@ async def test_deep_groq_simulation(mock_index, mock_query):
     adapter = create_adapter("groq")
     if not await adapter.health():
         pytest.skip("Groq API unavailable (missing credentials or network).")
+
+    # This test also requires at least one search backend for web_search
+    from plugins.tools_web import SEARXNG_URL, BRAVE_KEY, TAVILY_KEY, EXA_KEY, GROQ_KEY
+    if not any([SEARXNG_URL, BRAVE_KEY, TAVILY_KEY, EXA_KEY, GROQ_KEY]):
+        pytest.skip("No search backends configured (need SEARXNG_URL, BRAVE_SEARCH_KEY, TAVILY_API_KEY, EXA_API_KEY, or GROQ_API_KEY).")
     
     # Strongest reasoning model for the Main Agents
     mother_model = "llama-3.3-70b-versatile"

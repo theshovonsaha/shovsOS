@@ -52,6 +52,7 @@ import json
 from typing import Optional
 from llm.base_adapter import BaseLLMAdapter
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
+from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
 
 
@@ -146,10 +147,10 @@ class ContextEngineV2:
         self,
         adapter: BaseLLMAdapter,
         semantic_graph=None,           # Pass your SemanticGraph instance
-        compression_model: str = "llama3.2",
+        compression_model: Optional[str] = None,
     ):
         self.adapter           = adapter
-        self.compression_model = compression_model
+        self.compression_model = compression_model or cfg.DEFAULT_MODEL
         self.graph             = semantic_graph  # Optional — used for cross-session persistence
 
         # In-memory state (rebuilt from SemanticGraph on restore if needed)

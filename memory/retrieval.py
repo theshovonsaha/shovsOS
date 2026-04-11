@@ -7,6 +7,7 @@ import re
 
 from memory.semantic_graph import SemanticGraph
 from memory.vector_engine import VectorEngine
+from config.logger import log
 
 
 _STOPWORDS = {
@@ -42,6 +43,31 @@ _STOPWORDS = {
 def _tokenize(text: str) -> set[str]:
     cleaned = re.sub(r"[^\w\s]", " ", (text or "").lower())
     return {token for token in cleaned.split() if len(token) > 2 and token not in _STOPWORDS}
+
+
+def _detect_locus_from_query(query: str, graph: SemanticGraph, owner_id: Optional[str] = None) -> Optional[str]:
+    """
+    Perform a 'Spatial Scan' on the query to see if it targets a specific Locus.
+    Matches against locus_id and name.
+    """
+    loci = graph.list_loci(owner_id=owner_id)
+    if not loci:
+        return None
+    
+    q_tokens = _tokenize(query)
+    for locus in loci:
+        lid = str(locus.get("id", "")).lower()
+        lname = str(locus.get("name", "")).lower()
+        if lid in q_tokens or lname in q_tokens:
+            return locus.get("id")
+            
+    # Phrases like "in the <name>"
+    for locus in loci:
+        lname = str(locus.get("name", "")).lower()
+        if f"in the {lname}" in query.lower() or f"in {lname}" in query.lower():
+            return locus.get("id")
+            
+    return None
 
 
 def _lexical_overlap_score(query: str, text: str) -> float:
@@ -97,13 +123,14 @@ async def unified_memory_search(
     *,
     owner_id: Optional[str],
     session_id: Optional[str] = None,
+    locus_id: Optional[str] = None,
     top_k: int = 5,
     threshold: float = 0.5,
     graph: Optional[SemanticGraph] = None,
 ) -> dict:
     """
     Canonical retrieval lane used by tools and APIs.
-    Merges semantic graph hits, deterministic session facts, and vector-session hits.
+    Merges compiled drawers, semantic graph hits, deterministic facts, and vector hits.
     """
     started = perf_counter()
     safe_top_k = max(1, min(int(top_k or 5), 50))
@@ -111,14 +138,38 @@ async def unified_memory_search(
     graph = graph or SemanticGraph()
     owner_scope = owner_id if owner_id is not None else None
 
+    # Step 0: Spatial Scan (Auto-detect Locus if not explicitly provided)
+    if not locus_id:
+        locus_id = _detect_locus_from_query(query, graph, owner_id=owner_scope)
+        if locus_id:
+            log("memory", "retrieval", f"Spatial scan detected Locus target: {locus_id}")
+
     merged: dict[str, _Hit] = {}
-    source_counts = {"semantic_graph": 0, "deterministic_fact": 0, "vector_engine": 0}
+    source_counts = {"compiled_drawer": 0, "semantic_graph": 0, "deterministic_fact": 0, "vector_engine": 0}
+
+    # Step 1: Karpathy Pattern - Prioritize Compiled Drawers (High-Density Context)
+    if locus_id:
+        drawer_content = graph.get_compiled_drawer(locus_id)
+        if drawer_content:
+            _upsert_hit(
+                merged,
+                dedupe_key=f"drawer|{locus_id}",
+                score=1.0, # Absolute priority
+                source="compiled_drawer",
+                payload={
+                    "kind": "compiled_drawer",
+                    "locus_id": locus_id,
+                    "content": drawer_content,
+                },
+            )
+            source_counts["compiled_drawer"] += 1
 
     semantic_hits = await graph.traverse(
         query,
         top_k=search_limit,
         threshold=max(0.0, float(threshold)),
         owner_id=owner_scope,
+        locus_id=locus_id,
     )
     for item in semantic_hits:
         subject = str(item.get("subject") or "").strip()

@@ -76,6 +76,39 @@ _PRONOUN_PATTERNS = [
     re.compile(r"\bmy pronouns are (?P<value>[a-z]+/[a-z]+(?:/[a-z]+)?)\b", re.IGNORECASE),
     re.compile(r"\bi use (?P<value>[a-z]+/[a-z]+(?:/[a-z]+)?) pronouns\b", re.IGNORECASE),
 ]
+_ENVIRONMENT_PATTERNS = [
+    re.compile(
+        r"\buse (?P<value>production|prod|development|dev|staging|test|testing|local)\s+(?:not|instead of|over)\s+(?:production|prod|development|dev|staging|test|testing|local)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:use|target|run in|work in)\s+(?P<value>production|prod|development|dev|staging|test|testing|local)\s+(?:environment|mode)\b",
+        re.IGNORECASE,
+    ),
+]
+_SCOPE_PATTERNS = [
+    re.compile(r"\b(?:keep|limit)\s+(?:the\s+)?scope\s+to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bonly\s+(?:touch|modify|change|work in)\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_BUDGET_PATTERNS = [
+    re.compile(r"\b(?:my\s+|the\s+)?(?:budget|time budget|cost cap)\s+is\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bkeep\s+(?:it|this|the work)\s+under\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\blimit\s+(?:this|the work)\s+to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_TASK_CONSTRAINT_PATTERNS = [
+    re.compile(
+        r"\b(?:do not|don't|never|avoid)\s+(?P<value>(?:use|edit|change|touch|rewrite|refactor|browse|search|fetch|install|delete)\b[^.!?\n]*)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:must|need to|be sure to)\s+(?P<value>(?:use|preserve|keep|include|avoid|skip)\b[^.!?\n]*)",
+        re.IGNORECASE,
+    ),
+]
+_FOLLOWUP_DIRECTIVE_PATTERNS = [
+    re.compile(r"\b(?:follow up|check back|revisit)\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bremind me to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
 
 _SPLIT_TRAILING_RE = re.compile(r"\b(?:but|and|because|so|what|where|who|please)\b", re.IGNORECASE)
 _TRAILING_LOCATION_NOISE_RE = re.compile(r"(?:\s+(?:now|currently|today|instead|actually|too))+$", re.IGNORECASE)
@@ -96,6 +129,17 @@ _LANGUAGE_NORMALIZATION = {
     "csharp": "C#",
     "c++": "C++",
 }
+_ENVIRONMENT_NORMALIZATION = {
+    "prod": "production",
+    "production": "production",
+    "dev": "development",
+    "development": "development",
+    "staging": "staging",
+    "test": "test",
+    "testing": "test",
+    "local": "local",
+}
+_MULTI_VALUE_PREDICATES = {"task_constraint", "followup_directive"}
 
 
 def _normalize(text: str) -> str:
@@ -187,6 +231,11 @@ def _clean_pronouns(raw: str) -> str:
     if re.fullmatch(r"[a-z]+/[a-z]+(?:/[a-z]+)?", value):
         return value
     return ""
+
+
+def _clean_environment_mode(raw: str) -> str:
+    value = _clean_generic_value(raw).lower()
+    return _ENVIRONMENT_NORMALIZATION.get(value, "")
 
 
 def _build_fact(subject: str, predicate: str, object_: str) -> dict:
@@ -319,6 +368,46 @@ def extract_user_stated_fact_updates(
                 extracted.append(_build_fact("User", "pronouns", value))
             break
 
+    for pattern in _ENVIRONMENT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_environment_mode(match.group("value"))
+            if value:
+                extracted.append(_build_fact("Task", "environment_mode", value))
+            break
+
+    for pattern in _SCOPE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("Task", "scope_boundary", value))
+            break
+
+    for pattern in _BUDGET_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("Task", "budget_limit", value))
+            break
+
+    for pattern in _TASK_CONSTRAINT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group(0))
+            if value:
+                extracted.append(_build_fact("Task", "task_constraint", value))
+            break
+
+    for pattern in _FOLLOWUP_DIRECTIVE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group(0))
+            if value:
+                extracted.append(_build_fact("Task", "followup_directive", value))
+            break
+
     current_index: dict[tuple[str, str], set[str]] = {}
     for subject, predicate, object_ in current_facts or []:
         key = (_normalize(subject).lower(), _normalize(predicate).lower())
@@ -332,7 +421,7 @@ def extract_user_stated_fact_updates(
         new_object = _normalize(fact.get("object", "")).lower()
         if new_object and new_object in current_objects:
             continue
-        if current_objects:
+        if current_objects and fact["predicate"] not in _MULTI_VALUE_PREDICATES:
             voids.append({
                 "subject": fact["subject"],
                 "predicate": fact["predicate"],

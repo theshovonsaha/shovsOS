@@ -288,6 +288,123 @@ _BLOCKED_COMMANDS = re.compile(
 )
 
 
+def _verification_payload(
+    *,
+    mode: str,
+    expected_paths: Optional[list[str]] = None,
+    existing_paths: Optional[list[str]] = None,
+    missing_paths: Optional[list[str]] = None,
+    bytes_written: Optional[int] = None,
+) -> dict:
+    return {
+        "mode": mode,
+        "expected_paths": list(expected_paths or []),
+        "existing_paths": list(existing_paths or []),
+        "missing_paths": list(missing_paths or []),
+        "exists_after": not bool(missing_paths),
+        "bytes_written": bytes_written,
+    }
+
+
+def _resolve_sandbox_target(path_str: str, *, workdir: Optional[str] = None) -> Optional[Path]:
+    raw = str(path_str or "").strip().strip("'\"")
+    if not raw:
+        return None
+    if raw.startswith("/sandbox/") or raw == "/sandbox":
+        return _safe_path(raw)
+    if raw.startswith("/workspace/"):
+        raw = raw[len("/workspace/"):]
+    elif raw == "/workspace":
+        raw = "."
+    if raw.startswith("/"):
+        return None
+    try:
+        base = _safe_path(workdir or ".")
+    except ValueError:
+        base = _safe_path(".")
+    target = (base / raw).resolve()
+    if not str(target).startswith(str(SANDBOX_DIR)):
+        return None
+    return target
+
+
+def _extract_write_targets(command: str, *, workdir: Optional[str] = None) -> list[Path]:
+    text = str(command or "").strip()
+    if not text:
+        return []
+
+    targets: list[Path] = []
+    seen: set[str] = set()
+
+    def add_target(raw_path: str) -> None:
+        target = _resolve_sandbox_target(raw_path, workdir=workdir)
+        if target is None:
+            return
+        key = str(target)
+        if key in seen:
+            return
+        seen.add(key)
+        targets.append(target)
+
+    try:
+        parts = shlex.split(text)
+    except ValueError:
+        parts = []
+
+    for idx, token in enumerate(parts):
+        if token == "touch":
+            for maybe_path in parts[idx + 1:]:
+                if maybe_path.startswith("-"):
+                    continue
+                if maybe_path in {"&&", "||", ";"}:
+                    break
+                add_target(maybe_path)
+            break
+        if token == "mkdir":
+            for maybe_path in parts[idx + 1:]:
+                if maybe_path.startswith("-"):
+                    continue
+                if maybe_path in {"&&", "||", ";"}:
+                    break
+                add_target(maybe_path)
+            break
+        if token in {"cp", "mv"} and idx + 2 < len(parts):
+            add_target(parts[idx + 2])
+            break
+        if token == "tee" and idx + 1 < len(parts):
+            add_target(parts[idx + 1])
+            break
+
+    for match in re.finditer(r"(?:^|[^\w])>>?\s*(?P<path>[^\s;&|]+)", text):
+        add_target(match.group("path"))
+
+    return targets
+
+
+def _verify_expected_paths(paths: list[Path]) -> dict:
+    if not paths:
+        return _verification_payload(mode="not_applicable")
+
+    existing: list[str] = []
+    missing: list[str] = []
+    bytes_written = 0
+    for target in paths:
+        rel = str(target.relative_to(SANDBOX_DIR))
+        if target.exists():
+            existing.append(rel)
+            if target.is_file():
+                bytes_written += int(target.stat().st_size)
+        else:
+            missing.append(rel)
+    return _verification_payload(
+        mode="filesystem_check",
+        expected_paths=[str(target.relative_to(SANDBOX_DIR)) for target in paths],
+        existing_paths=existing,
+        missing_paths=missing,
+        bytes_written=bytes_written,
+    )
+
+
 async def _bash(command: str, timeout: int = BASH_TIMEOUT, workdir: Optional[str] = None) -> str:
     """
     Execute a bash command in a throwaway Docker container.
@@ -295,12 +412,57 @@ async def _bash(command: str, timeout: int = BASH_TIMEOUT, workdir: Optional[str
     """
     # STRICT SAFETY: Block dangerous commands before they hit Docker
     if _BLOCKED_COMMANDS.search(command):
-        return "[denied] Bash command blocked for safety (contains destructive patterns)."
+        return json.dumps(
+            {
+                "type": "bash_result",
+                "success": False,
+                "status": "DENIED",
+                "message": "Bash command blocked for safety (contains destructive patterns).",
+                "command": command,
+                "verification": _verification_payload(mode="not_applicable"),
+                "output": "[denied] Bash command blocked for safety (contains destructive patterns).",
+            }
+        )
 
     from plugins.docker_sandbox import run_in_docker
-    # Propagate VIRTUAL_ENV hint if present
-    venv_path = os.getenv("VIRTUAL_ENV")
-    return await run_in_docker(command, timeout=timeout, workdir=workdir)
+    output = await run_in_docker(command, timeout=timeout, workdir=workdir)
+    try:
+        effective_workdir = str(_safe_path(workdir or ".").relative_to(SANDBOX_DIR))
+    except ValueError:
+        effective_workdir = "."
+    verification = _verify_expected_paths(_extract_write_targets(command, workdir=workdir))
+    hard_failure = bool(verification.get("missing_paths"))
+    denied = str(output or "").lower().startswith("[denied]")
+    execution_error = str(output or "").lower().startswith("[error]") or str(output or "").lower().startswith("[timeout]")
+    success = not hard_failure and not denied and not execution_error
+    status = (
+        "HARD_FAILURE"
+        if hard_failure
+        else "DENIED"
+        if denied
+        else "FAILED"
+        if execution_error
+        else "SUCCESS"
+    )
+    message = (
+        "Expected write targets were not present after bash execution."
+        if hard_failure
+        else "Bash command executed."
+        if success
+        else "Bash command did not complete successfully."
+    )
+    return json.dumps(
+        {
+            "type": "bash_result",
+            "success": success,
+            "status": status,
+            "message": message,
+            "command": command,
+            "workdir": effective_workdir,
+            "verification": verification,
+            "output": output,
+        }
+    )
 
 
 
@@ -323,6 +485,7 @@ BASH_TOOL = Tool(
     },
     handler=_bash,
     tags=["code", "shell"],
+    response_format="json",
 )
 
 
@@ -348,28 +511,66 @@ async def _file_create(path: Optional[str] = None, content: str = "", filename: 
     try:
         target_path = path or filename
         if not target_path:
-            return "file_create error: either 'path' or 'filename' is required"
+            return json.dumps(
+                {
+                    "type": "file_create_result",
+                    "success": False,
+                    "status": "FAILED",
+                    "message": "either 'path' or 'filename' is required",
+                    "verification": _verification_payload(mode="not_applicable"),
+                }
+            )
         target = _safe_path(target_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding=encoding)
-        
+
         rel_path = target.relative_to(SANDBOX_DIR)
-        
-        # If it's an HTML file, return a JSON preview object for the frontend
+        verification = _verify_expected_paths([target])
+        hard_failure = bool(verification.get("missing_paths"))
+        payload = {
+            "type": "file_create_result",
+            "success": not hard_failure,
+            "status": "HARD_FAILURE" if hard_failure else "SUCCESS",
+            "message": (
+                "Expected file was not present after write."
+                if hard_failure
+                else f"Created: {rel_path} ({len(content)} chars)"
+            ),
+            "path": str(rel_path),
+            "encoding": encoding,
+            "verification": verification,
+        }
+
         if str(rel_path).lower().endswith(".html"):
-            return json.dumps({
+            payload["preview"] = {
                 "status": "success",
                 "type": "app_view",
                 "title": str(rel_path),
                 "filename": str(rel_path),
-                "path": f"/sandbox/{rel_path}"
-            })
-            
-        return f"Created: {rel_path} ({len(content)} chars)"
+                "path": f"/sandbox/{rel_path}",
+            }
+
+        return json.dumps(payload)
     except ValueError as e:
-        return f"file_create error: {e}"
+        return json.dumps(
+            {
+                "type": "file_create_result",
+                "success": False,
+                "status": "FAILED",
+                "message": f"file_create error: {e}",
+                "verification": _verification_payload(mode="not_applicable"),
+            }
+        )
     except Exception as e:
-        return f"file_create error: {e}"
+        return json.dumps(
+            {
+                "type": "file_create_result",
+                "success": False,
+                "status": "FAILED",
+                "message": f"file_create error: {e}",
+                "verification": _verification_payload(mode="not_applicable"),
+            }
+        )
 
 
 FILE_CREATE_TOOL = Tool(
@@ -394,6 +595,7 @@ FILE_CREATE_TOOL = Tool(
     },
     handler=_file_create,
     tags=["files"],
+    response_format="json",
 )
 
 
@@ -883,23 +1085,22 @@ def _build_runtime_graph(kwargs):
         return SemanticGraph()
 
 
-async def _store_memory(subject: str, predicate: str, object_: str, **kwargs) -> str:
+async def _store_memory(subject: str, predicate: str, object_: str, locus_id: Optional[str] = None, **kwargs) -> str:
     """Explicitly store a factual triplet into the semantic graph memory."""
     try:
         graph = _build_runtime_graph(kwargs)
         owner_id = kwargs.get("_owner_id")
         run_id = kwargs.get("_run_id")
-        if owner_id is None and run_id is None:
-            await graph.add_triplet(subject, predicate, object_)
-        else:
-            await graph.add_triplet(
-                subject,
-                predicate,
-                object_,
-                owner_id=owner_id,
-                run_id=run_id,
-            )
-        return f"Successfully stored memory: [{subject}] --[{predicate}]--> [{object_}]"
+        await graph.add_triplet(
+            subject,
+            predicate,
+            object_,
+            owner_id=owner_id,
+            run_id=run_id,
+            locus_id=locus_id
+        )
+        locus_note = f" (Locus: {locus_id})" if locus_id else ""
+        return f"Successfully stored memory: [{subject}] --[{predicate}]--> [{object_}]{locus_note}"
     except Exception as e:
         return f"Failed to store memory: {e}"
 
@@ -915,7 +1116,8 @@ STORE_MEMORY_TOOL = Tool(
         "properties": {
             "subject": {"type": "string", "description": "The entity the fact is about (e.g., 'User', 'System', 'John')"},
             "predicate": {"type": "string", "description": "The relationship (e.g., 'likes', 'is allergic to', 'works at')"},
-            "object_": {"type": "string", "description": "The target of the relationship (e.g., 'spicy food', 'peanuts', 'Google')"}
+            "object_": {"type": "string", "description": "The target of the relationship (e.g., 'spicy food', 'peanuts', 'Google')"},
+            "locus_id": {"type": "string", "description": "Optional: Anchor this memory to a specific spatial room (Locus ID)."}
         },
         "required": ["subject", "predicate", "object_"]
     },
@@ -926,6 +1128,7 @@ STORE_MEMORY_TOOL = Tool(
 async def _query_memory(
     topic: str,
     session_id: Optional[str] = None,
+    locus_id: Optional[str] = None,
     **kwargs,
 ) -> str:
     """Traverse the semantic graph memory for facts related to a topic."""
@@ -939,6 +1142,7 @@ async def _query_memory(
             topic,
             owner_id=owner_id,
             session_id=active_session_id,
+            locus_id=locus_id,
             top_k=5,
             graph=graph,
         )
@@ -985,7 +1189,8 @@ QUERY_MEMORY_TOOL = Tool(
     parameters={
         "type": "object",
         "properties": {
-            "topic": {"type": "string", "description": "The broad topic or specific entity to search for (e.g., 'food preferences', 'John')"}
+            "topic": {"type": "string", "description": "The broad topic or specific entity to search for (e.g., 'food preferences', 'John')"},
+            "locus_id": {"type": "string", "description": "Optional: Limit search to a specific spatial room (Locus ID)."}
         },
         "required": ["topic"]
     },

@@ -36,15 +36,10 @@ class _FallbackBdistWheel(Command):
 
 
 PACKAGE_PATTERNS = [
-    "api*",
     "config*",
     "engine*",
-    "guardrails*",
-    "llm*",
     "memory*",
     "orchestration*",
-    "plugins*",
-    "services*",
     "shovs_memory*",
 ]
 

@@ -24,6 +24,16 @@ def direct_fact_predicates(query: str) -> set[str]:
         predicates.add("operating_system")
     if any(token in q for token in ("pronouns", "my pronoun", "what pronouns do i use")):
         predicates.add("pronouns")
+    if any(token in q for token in ("environment", "prod", "production", "staging", "dev", "development", "test mode", "local mode")):
+        predicates.add("environment_mode")
+    if any(token in q for token in ("scope", "in scope", "out of scope", "only touch", "only modify")):
+        predicates.add("scope_boundary")
+    if any(token in q for token in ("budget", "time budget", "cost cap", "limit this to", "keep it under")):
+        predicates.add("budget_limit")
+    if any(token in q for token in ("constraint", "constraints", "must use", "do not use", "don't use", "avoid", "what did i say not to")):
+        predicates.add("task_constraint")
+    if any(token in q for token in ("directive", "follow up", "followup", "check back", "remind me")):
+        predicates.add("followup_directive")
     return predicates
 
 
