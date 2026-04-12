@@ -23,10 +23,10 @@ The full Shovs runtime is powerful, but it is a large first ask.
 
 ## Current Shape
 
-Install locally from this repo:
+Install directly from PyPI:
 
 ```bash
-pip install -e .
+pip install shovs-memory
 ```
 
 ```python
