@@ -17,12 +17,29 @@ def build_context_engine_memory_items(
     context_engine: Optional[object],
     current_context: str,
     *,
+    context_governor: Optional[object] = None,
+    current_facts: Optional[list[tuple[str, str, str]]] = None,
     fallback_trace_id: str = "memory:context_engine",
     fallback_source: str = "context_engine",
     fallback_provenance: Optional[dict[str, Any]] = None,
 ) -> list[ContextItem]:
     if not current_context.strip() or context_engine is None:
         return []
+
+    if context_governor is not None and hasattr(context_governor, "build_memory_items"):
+        try:
+            items = context_governor.build_memory_items(
+                engine=context_engine,
+                context=current_context,
+                current_facts=current_facts,
+                trace_prefix=fallback_trace_id,
+            )
+            if isinstance(items, list):
+                valid = [item for item in items if isinstance(item, ContextItem)]
+                if valid:
+                    return valid
+        except Exception:
+            pass
 
     build_items = getattr(context_engine, "build_context_items", None)
     if callable(build_items):

@@ -12,6 +12,7 @@ Existing V1/V2 sessions are bootstrapped on first use.
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 from llm.base_adapter import BaseLLMAdapter
@@ -83,6 +84,54 @@ class ContextEngineV3:
             deduped.append(record)
         return deduped
 
+    def _durable_line_score(self, line: str, index: int, total: int) -> float:
+        normalized = line.strip().lower()
+        score = 0.0
+
+        if "first message:" in normalized:
+            score += 5.0
+        if re.search(r"\b(actually|correction|updated?|moved|changed|instead)\b", normalized):
+            score += 4.0
+        if re.search(r"\b(prefer|preferred|timezone|pronouns|editor|language|package manager)\b", normalized):
+            score += 3.0
+        if re.search(r"\b(do not|don't|must|constraint|scope|budget|deadline|follow up)\b", normalized):
+            score += 3.0
+        if re.search(r"\b(name|location|os|operating system|environment|task)\b", normalized):
+            score += 1.5
+
+        # Favor newer durable lines without letting recency override stronger anchors.
+        recency = (index + 1) / max(total, 1)
+        score += recency * 1.5
+        return score
+
+    def _select_durable_lines(self, durable_lines: list[str], max_items: int = 8) -> list[str]:
+        if len(durable_lines) <= max_items:
+            return durable_lines
+
+        chosen_indices: set[int] = {
+            idx for idx, line in enumerate(durable_lines) if "first message:" in line.lower()
+        }
+        if len(chosen_indices) > max_items:
+            chosen_indices = set(sorted(chosen_indices)[:max_items])
+
+        scored = sorted(
+            (
+                (self._durable_line_score(line, idx, len(durable_lines)), idx, line)
+                for idx, line in enumerate(durable_lines)
+            ),
+            reverse=True,
+        )
+
+        for _score, idx, line in scored:
+            if len(chosen_indices) >= max_items:
+                break
+            chosen_indices.add(idx)
+
+        if len(chosen_indices) < max_items and durable_lines:
+            chosen_indices.add(len(durable_lines) - 1)
+
+        return [durable_lines[idx] for idx in sorted(chosen_indices)[:max_items]]
+
     async def compress_exchange(
         self,
         user_message: str,
@@ -129,8 +178,7 @@ class ContextEngineV3:
         if durable_context:
             durable_lines = [line for line in durable_context.split("\n") if line.strip()]
             if durable_lines:
-                # Keep durable memory concise: preserve only the strongest anchors.
-                chosen = durable_lines[:8]
+                chosen = self._select_durable_lines(durable_lines, max_items=8)
                 parts.append(
                     "--- Durable Memory (V3) ---\n"
                     + "\n".join(chosen)
@@ -170,7 +218,7 @@ class ContextEngineV3:
         if durable_context:
             durable_lines = [line for line in durable_context.split("\n") if line.strip()]
             if durable_lines:
-                chosen = durable_lines[:8]
+                chosen = self._select_durable_lines(durable_lines, max_items=8)
                 durable_block = (
                     "--- Durable Memory (V3) ---\n"
                     + "\n".join(chosen)

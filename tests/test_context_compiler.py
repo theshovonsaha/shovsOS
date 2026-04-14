@@ -244,7 +244,7 @@ def test_agent_core_uses_shared_context_engine_memory_fallback_shape():
     )
 
     memory_item = next(
-        item for item in agent._last_context_compilation["included"] if item["item_id"] == "context_engine_memory"
+        item for item in agent._last_context_compilation["included"] if item["item_id"] == "context_governor_v1_memory"
     )
-    assert memory_item["trace_id"] == "memory:context_engine"
-    assert memory_item["source"] == "context_engine"
+    assert memory_item["trace_id"] == "memory:context_engine:governor:v1"
+    assert memory_item["source"] == "context_governor"

@@ -88,6 +88,7 @@ class AgentProfile(BaseModel):
     embed_model:   str = cfg.EMBED_MODEL
     system_prompt: str = GENERAL_SYSTEM_PROMPT
     tools:         List[str] = Field(default_factory=lambda: ["web_search", "web_fetch"])
+    skills:        List[str] = Field(default_factory=list)
     avatar_url:    Optional[str] = None
     workspace_path: Optional[str] = None
     bootstrap_files: List[str] = Field(default_factory=lambda: ["AGENTS.md", "IDENTITY.md", "SOUL.md", "TOOLS.md"])
@@ -172,6 +173,10 @@ class ProfileManager:
             except sqlite3.OperationalError:
                 pass
             try:
+                conn.execute("ALTER TABLE agent_profiles ADD COLUMN skills TEXT DEFAULT '[]'")
+            except sqlite3.OperationalError:
+                pass
+            try:
                 conn.execute(
                     "UPDATE agent_profiles SET runtime_kind = ? WHERE runtime_kind IS NULL OR TRIM(runtime_kind) = ''",
                     (DEFAULT_RUNTIME_KIND,),
@@ -253,6 +258,7 @@ class ProfileManager:
                     "embed_model",
                     "system_prompt",
                     "tools",
+                    "skills",
                     "avatar_url",
                     "workspace_path",
                     "bootstrap_files",
@@ -269,11 +275,11 @@ class ProfileManager:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO agent_profiles
-                (id, owner_id, name, description, runtime_kind, model, embed_model, system_prompt, tools, avatar_url, workspace_path, bootstrap_files, bootstrap_max_chars, default_use_planner, default_loop_mode, default_context_mode, revision, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, owner_id, name, description, runtime_kind, model, embed_model, system_prompt, tools, skills, avatar_url, workspace_path, bootstrap_files, bootstrap_max_chars, default_use_planner, default_loop_mode, default_context_mode, revision, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 p.id, p.owner_id, p.name, p.description, p.runtime_kind, p.model, p.embed_model, p.system_prompt,
-                json.dumps(p.tools), p.avatar_url, p.workspace_path, json.dumps(p.bootstrap_files), p.bootstrap_max_chars,
+                json.dumps(p.tools), json.dumps(p.skills), p.avatar_url, p.workspace_path, json.dumps(p.bootstrap_files), p.bootstrap_max_chars,
                 1 if p.default_use_planner else 0, p.default_loop_mode, p.default_context_mode,
                 p.revision, p.created_at, p.updated_at
             ))
@@ -314,6 +320,16 @@ class ProfileManager:
             bootstrap_files = ["AGENTS.md", "IDENTITY.md", "SOUL.md", "TOOLS.md"]
         bootstrap_files = bootstrap_files[:8]
 
+        skills: list[str] = []
+        seen_skills: set[str] = set()
+        for skill in p.skills or []:
+            normalized = str(skill or "").strip()
+            if not normalized or normalized in seen_skills:
+                continue
+            seen_skills.add(normalized)
+            skills.append(normalized)
+        skills = skills[:16]
+
         bootstrap_max_chars = max(1000, min(20000, int(p.bootstrap_max_chars or 8000)))
         default_loop_mode = str(p.default_loop_mode or "auto").strip().lower()
         if default_loop_mode not in {"auto", "single", "managed"}:
@@ -331,6 +347,7 @@ class ProfileManager:
             "runtime_kind": runtime_kind,
             "system_prompt": system_prompt,
             "tools": tools,
+            "skills": skills,
             "workspace_path": workspace_path,
             "bootstrap_files": bootstrap_files,
             "bootstrap_max_chars": bootstrap_max_chars,
@@ -419,6 +436,7 @@ class ProfileManager:
             embed_model=r["embed_model"] if "embed_model" in r.keys() else cfg.EMBED_MODEL,
             system_prompt=r["system_prompt"],
             tools=json.loads(r["tools"]),
+            skills=json.loads(r["skills"]) if "skills" in r.keys() and r["skills"] else [],
             avatar_url=r["avatar_url"],
             workspace_path=r["workspace_path"] if "workspace_path" in r.keys() else None,
             bootstrap_files=json.loads(r["bootstrap_files"]) if "bootstrap_files" in r.keys() and r["bootstrap_files"] else ["AGENTS.md", "IDENTITY.md", "SOUL.md", "TOOLS.md"],

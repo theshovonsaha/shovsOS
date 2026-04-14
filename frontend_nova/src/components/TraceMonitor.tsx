@@ -1,4 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  buildMonitorOverview as buildNovaMonitorOverview,
+  buildReplaySections as buildNovaReplaySections,
+  buildTimelineEntries as buildNovaTimelineEntries,
+  describeTraceEvent as describeNovaTraceEvent,
+  humanizeTraceEvent as humanizeNovaTraceEvent,
+  parsePacketSections as parseNovaPacketSections,
+} from '../monitor/presentation';
 import { getOwnerId } from '../owner';
 import { OperatorInterventions } from './OperatorInterventions';
 
@@ -156,7 +164,6 @@ const AUTO_REFRESH_KEY = 'shovs_trace_auto';
 const TRACE_FOCUS_KEY = 'shovs_trace_focus';
 
 const BASE_EVENT_TYPES = [
-  'story',
   'all',
   'conversation_tension',
   'stance_signals_extracted',
@@ -170,248 +177,6 @@ const BASE_EVENT_TYPES = [
   'prompt_components',
   'assistant_response',
 ] as const;
-
-const IMPORTANT_EVENT_TYPES = new Set([
-  'runtime_loop_mode',
-  'route_decision',
-  'conversation_tension',
-  'stance_signals_extracted',
-  'plan',
-  'phase_context',
-  'compiled_context',
-  'tool_call',
-  'tool_result',
-  'manager_observation',
-  'verification_result',
-  'verification_warning',
-  'assistant_response',
-]);
-
-interface StoryGroup {
-  id: string;
-  dominantEventId: string;
-  passLabel: string;
-  startedAt?: number;
-  stageLabels: string[];
-  headline: string;
-  lines: string[];
-}
-
-interface MonitorInsight {
-  id: string;
-  title: string;
-  summary: string;
-  tone: 'neutral' | 'good' | 'warn';
-}
-
-const HUMAN_EVENT_LABELS: Record<string, string> = {
-  conversation_tension: 'Conversation tension detected',
-  stance_signals_extracted: 'Stance candidates extracted',
-  phase_context: 'Phase packet compiled',
-  compiled_context: 'Message prompt compiled',
-  llm_pass_start: 'Model pass started',
-  llm_prompt: 'Prompt sent to model',
-  llm_pass_complete: 'Model pass completed',
-  tool_call: 'Tool called',
-  tool_result: 'Tool returned',
-  prompt_components: 'Prompt context built',
-  assistant_response: 'Assistant response finalized',
-};
-
-function humanizeEventType(eventType: string): string {
-  if (eventType === 'story') return 'Readable Timeline';
-  return HUMAN_EVENT_LABELS[eventType] || eventType.replace(/_/g, ' ');
-}
-
-function summarizeIncludedItems(data: Record<string, any>): {
-  count: number;
-  hasTension: boolean;
-  preview: string;
-} {
-  const included = Array.isArray(data.included) ? data.included : [];
-  const itemIds = included
-    .map((item) =>
-      item && typeof item === 'object' ? String(item.item_id || '').trim() : '',
-    )
-    .filter(Boolean);
-  return {
-    count: itemIds.length,
-    hasTension: itemIds.includes('conversation_tension'),
-    preview: itemIds.slice(0, 4).join(', '),
-  };
-}
-
-function describeTraceEvent(event: TraceEventSummary): string {
-  const data = (
-    event.data && typeof event.data === 'object' ? event.data : {}
-  ) as Record<string, any>;
-  switch (event.event_type) {
-    case 'runtime_loop_mode':
-      return `Loop mode: ${data.effective || data.requested || 'unknown'}`;
-    case 'route_decision':
-      return `Route: ${data.route_type || 'unknown'}`;
-    case 'conversation_tension': {
-      const summary = String(data.summary || event.preview || '').trim();
-      const challenge = String(data.challenge_level || 'low').trim();
-      const conflicts = Array.isArray(data.conflicting_facts)
-        ? data.conflicting_facts.length
-        : 0;
-      if (summary) {
-        return `Tension: ${summary} · challenge=${challenge}${conflicts ? ` · conflicts=${conflicts}` : ''}`;
-      }
-      return `Tension detected · challenge=${challenge}${conflicts ? ` · conflicts=${conflicts}` : ''}`;
-    }
-    case 'stance_signals_extracted': {
-      const count = Number(data.count || 0);
-      const signals = Array.isArray(data.signals) ? data.signals : [];
-      const preview = signals
-        .slice(0, 2)
-        .map((item) => String(item?.topic || item?.position || '').trim())
-        .filter(Boolean)
-        .join(', ');
-      return `Stance candidates: ${count || signals.length}${preview ? ` · ${preview}` : ''}`;
-    }
-    case 'plan':
-      return String(
-        data.strategy || event.preview || 'Planner issued a strategy.',
-      );
-    case 'phase_context':
-    case 'compiled_context': {
-      const { count, hasTension, preview } = summarizeIncludedItems(data);
-      const phase = String(data.phase || 'unknown');
-      const scope = String(data.trace_scope || '').trim();
-      const label =
-        event.event_type === 'compiled_context'
-          ? 'message prompt'
-          : 'phase packet';
-      const suffix = [
-        `${count} item${count === 1 ? '' : 's'}`,
-        hasTension ? 'tension visible' : '',
-        preview ? `includes ${preview}` : '',
-        scope ? `scope=${scope}` : '',
-      ]
-        .filter(Boolean)
-        .join(' · ');
-      return `${phase} ${label} compiled${suffix ? ` · ${suffix}` : ''}`;
-    }
-    case 'tool_call':
-      return `${data.tool_name || 'tool'}: ${data.arguments_summary || 'starting'}`;
-    case 'tool_result':
-      return `${data.tool_name || 'tool'} ${data.success === false ? 'failed' : 'returned'}${data.content_preview ? ` · ${data.content_preview}` : ''}`;
-    case 'manager_observation':
-      return `${data.status || 'observation'}${data.strategy ? ` · ${data.strategy}` : ''}`;
-    case 'verification_result':
-      return data.supported === false
-        ? `Verification flagged issues${Array.isArray(data.issues) && data.issues.length ? ` · ${data.issues[0]}` : ''}`
-        : 'Verification passed';
-    case 'verification_warning':
-      return Array.isArray(data.issues) && data.issues.length
-        ? `Warning: ${data.issues.join('; ')}`
-        : 'Verification warning';
-    case 'assistant_response':
-      return String(data.content || event.preview || 'Final response saved.');
-    default:
-      return event.preview || humanizeEventType(event.event_type);
-  }
-}
-
-function labelForStoryStage(eventType: string): string | null {
-  switch (eventType) {
-    case 'runtime_loop_mode':
-      return 'Loop';
-    case 'route_decision':
-      return 'Route';
-    case 'conversation_tension':
-      return 'Tension';
-    case 'stance_signals_extracted':
-      return 'Tension';
-    case 'plan':
-      return 'Plan';
-    case 'phase_context':
-    case 'compiled_context':
-      return 'Context';
-    case 'tool_call':
-      return 'Act';
-    case 'tool_result':
-      return 'Observe';
-    case 'manager_observation':
-      return 'Observe';
-    case 'verification_result':
-    case 'verification_warning':
-      return 'Verify';
-    case 'assistant_response':
-      return 'Respond';
-    default:
-      return null;
-  }
-}
-
-function buildStoryGroups(events: TraceEventSummary[]): StoryGroup[] {
-  const chronological = [...events]
-    .filter((event) => IMPORTANT_EVENT_TYPES.has(event.event_type))
-    .sort((a, b) => a.ts - b.ts);
-
-  const groups = new Map<string, TraceEventSummary[]>();
-  for (const event of chronological) {
-    const key =
-      typeof event.pass_index === 'number'
-        ? `pass-${event.pass_index}`
-        : `event-${event.id}`;
-    const bucket = groups.get(key) || [];
-    bucket.push(event);
-    groups.set(key, bucket);
-  }
-
-  return Array.from(groups.entries())
-    .map(([key, bucket]) => {
-      const passIndex = bucket.find(
-        (event) => typeof event.pass_index === 'number',
-      )?.pass_index;
-      const stageLabels = Array.from(
-        new Set(
-          bucket
-            .map((event) => labelForStoryStage(event.event_type))
-            .filter((value): value is string => Boolean(value)),
-        ),
-      );
-      const lines = bucket
-        .map((event) => describeTraceEvent(event))
-        .filter(Boolean);
-      const responseEvent =
-        [...bucket]
-          .reverse()
-          .find((event) => event.event_type === 'assistant_response') ||
-        [...bucket]
-          .reverse()
-          .find((event) => event.event_type === 'verification_warning') ||
-        bucket[bucket.length - 1];
-      return {
-        id: key,
-        dominantEventId: responseEvent.id,
-        passLabel:
-          typeof passIndex === 'number'
-            ? passIndex === 0
-              ? 'Pass 0'
-              : `Pass ${passIndex}`
-            : 'Run step',
-        startedAt: bucket[0]?.ts,
-        stageLabels,
-        headline: describeTraceEvent(responseEvent),
-        lines: lines.slice(-4),
-      };
-    })
-    .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
-}
-
-function latestEventOf(
-  events: TraceEventSummary[],
-  eventTypes: string[],
-): TraceEventSummary | null {
-  for (const event of events) {
-    if (eventTypes.includes(event.event_type)) return event;
-  }
-  return null;
-}
 
 function formatTime(ts?: number): string {
   if (!ts) return '--';
@@ -449,22 +214,6 @@ function mergeEvents(
   return merged;
 }
 
-function parsePacketSections(content: string): PacketSection[] {
-  const text = String(content || '').trim();
-  if (!text) return [];
-
-  const sections: PacketSection[] = [];
-  const pattern = /--- (.+?) ---\n([\s\S]*?)\n--- End \1 ---/g;
-  for (const match of text.matchAll(pattern)) {
-    const title = String(match[1] || '').trim();
-    const body = String(match[2] || '').trim();
-    if (title && body) sections.push({ title, body });
-  }
-
-  if (sections.length > 0) return sections;
-  return [{ title: 'Compiled Context', body: text }];
-}
-
 export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   sessionId,
   isVisible,
@@ -474,16 +223,20 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   onDenyConfirmation,
   onStopExecution,
 }) => {
-  const [focusMode, setFocusMode] = useState<'story' | 'inspect'>(() => {
+  const [focusMode, setFocusMode] = useState<'overview' | 'timeline' | 'inspect'>(() => {
     const stored = localStorage.getItem(TRACE_FOCUS_KEY);
-    return stored === 'inspect' ? 'inspect' : 'story';
+    if (stored === 'inspect' || stored === 'timeline') return stored;
+    return 'overview';
   });
   const [scope, setScope] = useState<'session' | 'all'>(() => {
     const stored = localStorage.getItem(VIEW_SCOPE_KEY);
     return stored === 'all' ? 'all' : 'session';
   });
   const [eventType, setEventType] = useState<string>(
-    () => localStorage.getItem(EVENT_FILTER_KEY) || 'story',
+    () => {
+      const stored = localStorage.getItem(EVENT_FILTER_KEY) || 'all';
+      return stored === 'story' ? 'all' : stored;
+    },
   );
   const [autoRefresh, setAutoRefresh] = useState<boolean>(
     () => localStorage.getItem(AUTO_REFRESH_KEY) !== 'false',
@@ -516,9 +269,9 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
 
   const filteredEvents = useMemo(() => {
     const baseEvents =
-      eventType === 'story'
-        ? events.filter((event) => IMPORTANT_EVENT_TYPES.has(event.event_type))
-        : events;
+      eventType === 'all'
+        ? events
+        : events.filter((event) => event.event_type === eventType);
     if (!search.trim()) return baseEvents;
     const needle = search.trim().toLowerCase();
     return baseEvents.filter((event) => {
@@ -527,7 +280,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         event.session_id,
         event.agent_id,
         event.preview || '',
-        describeTraceEvent(event),
+        describeNovaTraceEvent(event),
       ]
         .join(' ')
         .toLowerCase();
@@ -536,64 +289,27 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   }, [events, search]);
 
   const oldestTs = events.length ? events[events.length - 1].ts : undefined;
-  const storyGroups = useMemo(() => buildStoryGroups(events), [events]);
-  const monitorInsights = useMemo(() => {
-    const runtime = latestEventOf(events, [
-      'route_decision',
-      'runtime_loop_mode',
-      'phase_context',
-    ]);
-    const tool = latestEventOf(events, ['tool_result', 'tool_call']);
-    const verification = latestEventOf(events, [
-      'verification_warning',
-      'verification_result',
-    ]);
-    const response = latestEventOf(events, ['assistant_response']);
-
-    const insights: MonitorInsight[] = [];
-    if (runtime) {
-      insights.push({
-        id: `runtime-${runtime.id}`,
-        title: 'Runtime',
-        summary: describeTraceEvent(runtime),
-        tone: runtime.event_type === 'route_decision' ? 'good' : 'neutral',
-      });
-    }
-    if (tool) {
-      insights.push({
-        id: `tool-${tool.id}`,
-        title: 'Latest Tool',
-        summary: describeTraceEvent(tool),
-        tone:
-          tool.event_type === 'tool_result' &&
-          (tool.data as Record<string, unknown> | undefined)?.success === false
-            ? 'warn'
-            : 'neutral',
-      });
-    }
-    if (verification) {
-      insights.push({
-        id: `verify-${verification.id}`,
-        title: 'Verification',
-        summary: describeTraceEvent(verification),
-        tone:
-          verification.event_type === 'verification_warning' ||
-          (verification.data as Record<string, unknown> | undefined)
-            ?.supported === false
-            ? 'warn'
-            : 'good',
-      });
-    }
-    if (response) {
-      insights.push({
-        id: `response-${response.id}`,
-        title: 'Response',
-        summary: describeTraceEvent(response),
-        tone: 'neutral',
-      });
-    }
-    return insights;
-  }, [events]);
+  const overview = useMemo(
+    () =>
+      buildNovaMonitorOverview({
+        events,
+        runReplay,
+        pendingConfirmation,
+      }),
+    [events, pendingConfirmation, runReplay],
+  );
+  const timelineEntries = useMemo(
+    () => buildNovaTimelineEntries(filteredEvents, 32),
+    [filteredEvents],
+  );
+  const recentTimelineEntries = useMemo(
+    () => buildNovaTimelineEntries(events, 6),
+    [events],
+  );
+  const replaySections = useMemo(
+    () => buildNovaReplaySections(runReplay),
+    [runReplay],
+  );
 
   const fetchRecent = useCallback(
     async (opts?: { append?: boolean; beforeTs?: number }) => {
@@ -601,7 +317,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
       params.set('limit', String(TRACE_PAGE_SIZE));
       params.set('owner_id', getOwnerId());
       if (scopedSessionId) params.set('session_id', scopedSessionId);
-      if (eventType && eventType !== 'all' && eventType !== 'story')
+      if (eventType && eventType !== 'all')
         params.set('event_type', eventType);
       if (opts?.beforeTs) params.set('before_ts', String(opts.beforeTs));
 
@@ -796,7 +512,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     return JSON.stringify(selectedEvent.data ?? {}, null, 2);
   }, [selectedEvent]);
   const selectedSummary = useMemo(
-    () => (selectedEvent ? describeTraceEvent(selectedEvent) : ''),
+    () => (selectedEvent ? describeNovaTraceEvent(selectedEvent) : ''),
     [selectedEvent],
   );
   const selectedPacketSections = useMemo(() => {
@@ -811,7 +527,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
       selectedEvent.data && typeof selectedEvent.data === 'object'
         ? (selectedEvent.data as Record<string, unknown>)
         : null;
-    return parsePacketSections(String(data?.content || ''));
+    return parseNovaPacketSections(String(data?.content || ''));
   }, [selectedEvent]);
   const selectedIncludedItems = useMemo(() => {
     if (!selectedEvent?.data || typeof selectedEvent.data !== 'object') return [];
@@ -844,10 +560,16 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         <div className='trace-controls'>
           <div className='trace-mode-switch'>
             <button
-              className={focusMode === 'story' ? 'active' : ''}
-              onClick={() => setFocusMode('story')}
+              className={focusMode === 'overview' ? 'active' : ''}
+              onClick={() => setFocusMode('overview')}
             >
-              Story
+              Overview
+            </button>
+            <button
+              className={focusMode === 'timeline' ? 'active' : ''}
+              onClick={() => setFocusMode('timeline')}
+            >
+              Timeline
             </button>
             <button
               className={focusMode === 'inspect' ? 'active' : ''}
@@ -877,7 +599,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             >
               {eventTypeOptions.map((type) => (
                 <option key={type} value={type}>
-                  {humanizeEventType(type)}
+                  {humanizeNovaTraceEvent(type)}
                 </option>
               ))}
             </select>
@@ -933,23 +655,174 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         </div>
       </div>
 
-      {monitorInsights.length > 0 && (
-        <div className='trace-insight-row'>
-          {monitorInsights.map((insight) => (
-            <div
-              key={insight.id}
-              className={`trace-insight-card tone-${insight.tone}`}
-            >
-              <div className='trace-insight-title'>{insight.title}</div>
-              <div className='trace-insight-summary'>{insight.summary}</div>
-            </div>
-          ))}
-        </div>
-      )}
-
       {error && <div className='trace-error'>{error}</div>}
+      {focusMode === 'overview' ? (
+        <div className='trace-overview-shell'>
+          <section className='trace-overview-section'>
+            <div className='trace-section-head'>
+              <div className='trace-section-title'>Overview</div>
+              <div className='trace-section-subtitle'>
+                Current run state in operator language
+              </div>
+            </div>
+            <div className='trace-overview-grid primary'>
+              {overview.primary.map((card) => (
+                <div key={card.id} className={`trace-overview-card tone-${card.tone}`}>
+                  <div className='trace-overview-eyebrow'>{card.eyebrow || card.title}</div>
+                  <div className='trace-overview-title'>{card.title}</div>
+                  <div className='trace-overview-summary'>{card.summary}</div>
+                  {card.detail ? (
+                    <div className='trace-overview-detail'>{card.detail}</div>
+                  ) : null}
+                </div>
+              ))}
+            </div>
+            {overview.secondary.length > 0 ? (
+              <div className='trace-overview-grid secondary'>
+                {overview.secondary.map((card) => (
+                  <div key={card.id} className={`trace-overview-card tone-${card.tone}`}>
+                    <div className='trace-overview-eyebrow'>{card.eyebrow || card.title}</div>
+                    <div className='trace-overview-title'>{card.title}</div>
+                    <div className='trace-overview-summary'>{card.summary}</div>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </section>
 
-      <div className={`trace-grid ${focusMode === 'story' ? 'story-focus' : 'inspect-focus'}`}>
+          <section className='trace-overview-section'>
+            <div className='trace-section-head'>
+              <div className='trace-section-title'>Recent Timeline</div>
+              <div className='trace-section-subtitle'>
+                The latest execution steps in plain language
+              </div>
+            </div>
+            <div className='trace-timeline-list compact'>
+              {recentTimelineEntries.length === 0 ? (
+                <div className='trace-empty'>No timeline activity yet.</div>
+              ) : (
+                recentTimelineEntries.map((entry) => (
+                  <button
+                    key={entry.id}
+                    className={`trace-timeline-card tone-${entry.tone}`}
+                    onClick={() => {
+                      setSelectedId(entry.id);
+                      setFocusMode('inspect');
+                    }}
+                  >
+                    <div className='trace-timeline-top'>
+                      <span className='trace-timeline-stage'>{entry.stage}</span>
+                      <span className='trace-timeline-time'>{formatTime(entry.ts)}</span>
+                    </div>
+                    <div className='trace-timeline-headline'>{entry.headline}</div>
+                    <div className='trace-timeline-lines'>
+                      {entry.lines.map((line, index) => (
+                        <div key={`${entry.id}-line-${index}`} className='trace-timeline-line'>
+                          {line}
+                        </div>
+                      ))}
+                    </div>
+                    <div className='trace-timeline-meta'>
+                      {entry.passLabel ? <span>{entry.passLabel}</span> : null}
+                      {entry.toolName ? <span>{entry.toolName}</span> : null}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          </section>
+
+          {replaySections.length > 0 ? (
+            <section className='trace-overview-section'>
+              <div className='trace-section-head'>
+                <div className='trace-section-title'>Run Replay Snapshot</div>
+                <div className='trace-section-subtitle'>
+                  Evidence, passes, and artifacts without leaving overview
+                </div>
+              </div>
+              <div className='trace-replay-grid'>
+                {replaySections.map((section) => (
+                  <div key={section.id} className='trace-replay-panel'>
+                    <div className='trace-replay-panel-title'>{section.title}</div>
+                    <div className='trace-replay-panel-list'>
+                      {section.entries.map((entry) => (
+                        <div key={entry.id} className={`trace-replay-card tone-${entry.tone}`}>
+                          <div className='trace-replay-card-top'>
+                            <span>{entry.title}</span>
+                            <span>{entry.eyebrow || ''}</span>
+                          </div>
+                          <div className='trace-replay-card-summary'>{entry.summary}</div>
+                          {entry.detail ? (
+                            <div className='trace-replay-card-detail'>{entry.detail}</div>
+                          ) : null}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          ) : null}
+        </div>
+      ) : focusMode === 'timeline' ? (
+        <div className='trace-overview-shell'>
+          <section className='trace-overview-section'>
+            <div className='trace-list-head timeline-head'>
+              <input
+                className='trace-search'
+                placeholder='search timeline'
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+              <span className='trace-count'>{timelineEntries.length}</span>
+            </div>
+            <div className='trace-timeline-list'>
+              {timelineEntries.length === 0 ? (
+                <div className='trace-empty'>No timeline events for this filter.</div>
+              ) : (
+                timelineEntries.map((entry) => (
+                  <button
+                    key={entry.id}
+                    className={`trace-timeline-card tone-${entry.tone}`}
+                    onClick={() => {
+                      setSelectedId(entry.id);
+                      setFocusMode('inspect');
+                    }}
+                  >
+                    <div className='trace-timeline-top'>
+                      <span className='trace-timeline-stage'>{entry.stage}</span>
+                      <span className='trace-timeline-time'>{formatTime(entry.ts)}</span>
+                    </div>
+                    <div className='trace-timeline-headline'>{entry.headline}</div>
+                    <div className='trace-timeline-lines'>
+                      {entry.lines.map((line, index) => (
+                        <div key={`${entry.id}-line-${index}`} className='trace-timeline-line'>
+                          {line}
+                        </div>
+                      ))}
+                    </div>
+                    <div className='trace-timeline-meta'>
+                      {entry.passLabel ? <span>{entry.passLabel}</span> : null}
+                      {entry.toolName ? <span>{entry.toolName}</span> : null}
+                      {entry.runId ? <span>{entry.runId.slice(0, 10)}</span> : null}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+            <div className='trace-list-foot'>
+              <button
+                className='trace-action'
+                onClick={loadOlder}
+                disabled={!oldestTs || loadingOlder}
+              >
+                {loadingOlder ? 'loading...' : 'load older'}
+              </button>
+            </div>
+          </section>
+        </div>
+      ) : (
+      <div className='trace-grid inspect-focus'>
         <section className='trace-list-pane'>
           <div className='trace-list-head'>
             <input
@@ -962,77 +835,37 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
           </div>
 
           <div className='trace-list'>
-            {filteredEvents.length === 0 && (
-              <div className='trace-empty'>
-                No trace events for this filter.
-              </div>
+            {filteredEvents.length === 0 ? (
+              <div className='trace-empty'>No trace events for this filter.</div>
+            ) : (
+              filteredEvents.map((event) => (
+                <button
+                  key={event.id}
+                  className={`trace-row ${selectedId === event.id ? 'active' : ''}`}
+                  onClick={() => setSelectedId(event.id)}
+                >
+                  <div className='trace-row-top'>
+                    <span className='t-type'>
+                      {humanizeNovaTraceEvent(event.event_type)}
+                    </span>
+                    <span className='t-time'>{formatTime(event.ts)}</span>
+                  </div>
+                  <div className='trace-row-meta'>
+                    <span>
+                      pass{' '}
+                      {typeof event.pass_index === 'number'
+                        ? event.pass_index
+                        : '--'}
+                    </span>
+                    <span>{formatBytes(event.size_bytes || 0)}</span>
+                    <span>{event.payload_ref ? 'blob' : 'inline'}</span>
+                  </div>
+                  <div className='trace-row-preview'>
+                    {describeNovaTraceEvent(event)}
+                  </div>
+                </button>
+              ))
             )}
-
-            {eventType === 'story'
-              ? storyGroups.map((group) => (
-                  <button
-                    key={group.id}
-                    className={`trace-story-card ${selectedId === group.dominantEventId ? 'active' : ''}`}
-                    onClick={() => setSelectedId(group.dominantEventId)}
-                  >
-                    <div className='trace-story-top'>
-                      <span className='trace-story-pass'>
-                        {group.passLabel}
-                      </span>
-                      <span className='trace-story-time'>
-                        {formatTime(group.startedAt)}
-                      </span>
-                    </div>
-                    <div className='trace-story-headline'>{group.headline}</div>
-                    <div className='trace-story-badges'>
-                      {group.stageLabels.map((label) => (
-                        <span
-                          key={`${group.id}-${label}`}
-                          className='trace-story-badge'
-                        >
-                          {label}
-                        </span>
-                      ))}
-                    </div>
-                    <div className='trace-story-lines'>
-                      {group.lines.map((line, index) => (
-                        <div
-                          key={`${group.id}-line-${index}`}
-                          className='trace-story-line'
-                        >
-                          {line}
-                        </div>
-                      ))}
-                    </div>
-                  </button>
-                ))
-              : filteredEvents.map((event) => (
-                  <button
-                    key={event.id}
-                    className={`trace-row ${selectedId === event.id ? 'active' : ''}`}
-                    onClick={() => setSelectedId(event.id)}
-                  >
-                    <div className='trace-row-top'>
-                      <span className='t-type'>
-                        {humanizeEventType(event.event_type)}
-                      </span>
-                      <span className='t-time'>{formatTime(event.ts)}</span>
-                    </div>
-                    <div className='trace-row-meta'>
-                      <span>
-                        pass{' '}
-                        {typeof event.pass_index === 'number'
-                          ? event.pass_index
-                          : '--'}
-                      </span>
-                      <span>{formatBytes(event.size_bytes || 0)}</span>
-                      <span>{event.payload_ref ? 'blob' : 'inline'}</span>
-                    </div>
-                    <div className='trace-row-preview'>
-                      {describeTraceEvent(event)}
-                    </div>
-                  </button>
-                ))}
           </div>
 
           <div className='trace-list-foot'>
@@ -1046,7 +879,6 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
           </div>
         </section>
 
-        {focusMode === 'inspect' ? (
         <section className='trace-detail-pane'>
           {!selectedEvent && !loadingDetail && (
             <div className='trace-empty'>
@@ -1060,7 +892,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             <>
               <div className='trace-detail-head'>
                 <div className='trace-detail-title'>
-                  {humanizeEventType(selectedEvent.event_type)}
+                  {humanizeNovaTraceEvent(selectedEvent.event_type)}
                 </div>
                 <div className='trace-detail-meta'>
                   <span>session: {selectedEvent.session_id}</span>
@@ -1307,8 +1139,8 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             </>
           )}
         </section>
-        ) : null}
       </div>
+      )}
     </div>
   );
 };

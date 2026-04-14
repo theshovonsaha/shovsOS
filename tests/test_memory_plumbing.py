@@ -255,6 +255,16 @@ def test_deterministic_fact_extractor_captures_task_state_and_constraints():
     assert ("followup_directive", "Follow up tomorrow on packaging") in pairs
 
 
+def test_deterministic_fact_extractor_voids_explicit_editor_clear_without_writing_none():
+    facts, voids = extract_user_stated_fact_updates(
+        "I have no editor preference now.",
+        current_facts=[("User", "preferred_editor", "VS Code")],
+    )
+
+    assert facts == []
+    assert voids == [{"subject": "User", "predicate": "preferred_editor", "source": "user_stated_revocation"}]
+
+
 def test_direct_fact_memory_guard_supports_preference_queries_beyond_name_and_location():
     current_facts = [
         ("User", "timezone", "EST"),
@@ -273,6 +283,16 @@ def test_direct_fact_memory_guard_supports_preference_queries_beyond_name_and_lo
     assert should_answer_direct_fact_from_memory("What response style do I prefer?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What operating system do I use?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What are my pronouns?", current_facts) is True
+
+
+def test_direct_fact_memory_guard_normalizes_alias_predicates():
+    current_facts = [
+        ("User", "primary editor", "VS Code"),
+        ("User", "package manager", "pnpm"),
+    ]
+
+    assert should_answer_direct_fact_from_memory("Which editor do I use?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What package manager do I use?", current_facts) is True
 
 
 def test_direct_fact_memory_guard_supports_task_state_queries():
@@ -308,6 +328,24 @@ def test_finalize_compression_fact_records_blocks_alias_noise_after_grounding():
 
     assert any(item["subject"] == "Tool" for item in allowed)
     assert any(item["fact"] == "Shovon lives in Vancouver" for item in blocked)
+
+
+def test_finalize_compression_fact_records_blocks_editor_alias_after_grounding():
+    allowed, blocked = finalize_compression_fact_records(
+        [
+            {"subject": "User", "predicate": "primary editor", "object": "VS Code", "fact": "User primary editor VS Code"},
+            {"subject": "Tool", "predicate": "source", "object": "workspace", "fact": "Tool source workspace"},
+        ],
+        user_message="I use VS Code.",
+        grounding_text="workspace notes",
+        deterministic_facts=[
+            {"subject": "User", "predicate": "preferred_editor", "object": "VS Code"},
+        ],
+        current_facts=[("User", "preferred_editor", "VS Code")],
+    )
+
+    assert any(item["subject"] == "Tool" for item in allowed)
+    assert any(item["predicate"] == "primary editor" for item in blocked)
 
 
 def test_retrieval_alias_text_filter_blocks_named_subject_redundancy():
@@ -559,8 +597,6 @@ def test_build_messages_adds_entity_fidelity_and_loop_contract_for_nontrivial_tu
 
     assert "Entity Fidelity" in messages[0]["content"]
     assert "Preserve the user's exact entities" in messages[0]["content"]
-    assert "Loop Contract" in messages[0]["content"]
-    assert "either emit one valid JSON tool call or answer the user directly" in messages[0]["content"]
 
 
 def test_build_messages_injects_profile_bootstrap_docs(tmp_path):

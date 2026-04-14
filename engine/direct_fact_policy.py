@@ -3,6 +3,99 @@ from __future__ import annotations
 from typing import Optional
 
 
+_PREDICATE_ALIASES: dict[str, set[str]] = {
+    "preferred_name": {
+        "preferred name",
+        "name",
+        "is the user's name",
+        "user name",
+    },
+    "location": {
+        "location",
+        "lives in",
+        "live in",
+        "is based in",
+        "based in",
+        "moved to",
+        "is staying in",
+        "staying in",
+        "current location",
+    },
+    "timezone": {
+        "timezone",
+        "time zone",
+        "is in timezone",
+    },
+    "preferred_editor": {
+        "preferred editor",
+        "primary editor",
+        "uses editor",
+        "use editor",
+        "editor",
+        "editor preference",
+        "ide preference",
+        "has no editor preference for",
+    },
+    "package_manager": {
+        "package manager",
+        "uses package manager",
+        "package tool",
+    },
+    "primary_language": {
+        "primary language",
+        "main language",
+        "language",
+    },
+    "response_verbosity": {
+        "response verbosity",
+        "response style",
+        "verbosity",
+    },
+    "operating_system": {
+        "operating system",
+        "os",
+    },
+    "pronouns": {
+        "pronouns",
+        "pronoun",
+    },
+    "environment_mode": {
+        "environment mode",
+        "environment",
+    },
+    "scope_boundary": {
+        "scope boundary",
+        "scope",
+    },
+    "budget_limit": {
+        "budget limit",
+        "budget",
+        "time budget",
+        "cost cap",
+    },
+    "task_constraint": {
+        "task constraint",
+        "constraint",
+        "constraints",
+    },
+    "followup_directive": {
+        "followup directive",
+        "follow up directive",
+        "directive",
+    },
+}
+
+
+def normalize_memory_predicate(predicate: str) -> str:
+    normalized = " ".join((predicate or "").strip().lower().replace("_", " ").replace("-", " ").split())
+    if not normalized:
+        return ""
+    for canonical, aliases in _PREDICATE_ALIASES.items():
+        if normalized == canonical.lower() or normalized in aliases:
+            return canonical
+    return normalized.replace(" ", "_")
+
+
 def direct_fact_predicates(query: str) -> set[str]:
     q = (query or "").lower()
     predicates: set[str] = set()
@@ -45,7 +138,7 @@ def should_answer_direct_fact_from_memory(
     if not predicates or not current_facts:
         return False
     available = {
-        str(predicate or "").strip().lower()
+        normalize_memory_predicate(str(predicate or ""))
         for (_, predicate, _) in current_facts
         if str(predicate or "").strip()
     }

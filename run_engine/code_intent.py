@@ -1,0 +1,181 @@
+"""
+Code Intent Classifier
+-----------------------
+Heuristic-first classification of whether a user message implies
+code writing, what execution risk tier it carries, and whether
+scope clarification is needed before acting.
+
+Design rules:
+- Regex/pattern first — no LLM call by default.
+- Returns a typed dataclass, not raw strings.
+- Empty/neutral return when no code intent detected — zero impact on non-code turns.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Optional
+
+
+# ── Signals ──────────────────────────────────────────────────────────
+
+# Explicit code creation words
+EXPLICIT_CODE_SIGNAL = re.compile(
+    r"\b(write|create|build|make|generate|scaffold|implement|code|develop|program)\b"
+    r".*\b(script|function|class|module|app|application|program|file|component|api|endpoint|server|bot|tool|cli|page|website)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Implicit code intent — task that obviously needs code but doesn't say "create"
+IMPLICIT_CODE_SIGNAL = re.compile(
+    r"\b(analyze|parse|process|convert|transform|extract|scrape|crawl|automate|migrate|refactor|debug|fix|patch|deploy|test)\b"
+    r".*\b(csv|json|xml|html|pdf|data|file|database|db|api|logs?|table|spreadsheet|image|video|audio)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Destruction signals — risk tier escalation
+DESTRUCTIVE_SIGNAL = re.compile(
+    r"\b(delete|remove|drop|truncate|purge|wipe|destroy|erase|overwrite|replace all|rm -rf|rm -r|rmdir|unlink)\b",
+    re.IGNORECASE,
+)
+
+# Write signals — risk tier for file/database mutations
+WRITE_SIGNAL = re.compile(
+    r"\b(write|save|create|modify|update|insert|append|rename|move|copy|chmod|chown|pip install|npm install|apt install|brew install)\b",
+    re.IGNORECASE,
+)
+
+# Ambiguity signals — scope is underspecified
+AMBIGUOUS_SCOPE_SIGNAL = re.compile(
+    r"^(?:write|create|build|make|generate)\s+(?:me\s+)?(?:a|an|some|the)?\s*(?:script|app|tool|program|bot|thing|something)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+# Specific enough — has a concrete target/domain
+SPECIFIC_SCOPE_SIGNAL = re.compile(
+    r"\b(?:that|which|to|for|using|with|from|in|on)\b",
+    re.IGNORECASE,
+)
+
+# File type mentions
+FILE_TYPE_SIGNAL = re.compile(
+    r"\b(?:\.py|\.js|\.ts|\.tsx|\.jsx|\.html|\.css|\.sh|\.bash|\.sql|\.go|\.rs|\.java|\.rb|\.php|\.yaml|\.yml|\.toml|\.ini|\.cfg)\b",
+    re.IGNORECASE,
+)
+
+
+# ── Classifier ───────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CodeIntent:
+    """Classification of code-related intent in a user message."""
+
+    code_warranted: bool
+    reason: str
+    execution_risk_tier: str    # "none" | "read_only" | "write" | "destructive"
+    missing_context: Optional[str]  # one clarification question if scope is ambiguous
+    fallback_if_failed: str     # next best action if primary approach fails
+
+    def to_phase_note(self) -> str:
+        """Render as a compact note for phase_guidance injection."""
+        if not self.code_warranted:
+            return ""
+        parts = [f"Code intent detected: {self.reason}."]
+        if self.execution_risk_tier in ("write", "destructive"):
+            parts.append(f"Execution risk: {self.execution_risk_tier}.")
+        if self.fallback_if_failed:
+            parts.append(f"Fallback if primary approach fails: {self.fallback_if_failed}")
+        return " ".join(parts)
+
+    def to_risk_note(self) -> str:
+        """Render as a constraint note for loop_contract injection."""
+        if self.execution_risk_tier == "destructive":
+            return (
+                "WARNING: This task involves potentially destructive operations. "
+                "Confirm exact targets before executing. Prefer dry-run or preview first."
+            )
+        if self.execution_risk_tier == "write":
+            return (
+                "This task involves file or system writes. "
+                "Verify target paths and expected outcomes before execution."
+            )
+        return ""
+
+
+_NEUTRAL = CodeIntent(
+    code_warranted=False,
+    reason="",
+    execution_risk_tier="none",
+    missing_context=None,
+    fallback_if_failed="",
+)
+
+
+def classify_code_intent(
+    user_message: str,
+    effective_objective: str = "",
+    tool_results: Optional[list[dict]] = None,
+) -> CodeIntent:
+    """Classify code intent from user message using heuristic signals.
+
+    This is deliberately regex-first to avoid adding LLM latency.
+    Returns a neutral CodeIntent when no code signals are detected.
+    """
+    msg = (user_message or "").strip()
+    obj = (effective_objective or msg).strip()
+    combined = f"{msg} {obj}"
+
+    if not msg:
+        return _NEUTRAL
+
+    # ── Detect code intent ──
+    explicit_match = EXPLICIT_CODE_SIGNAL.search(combined)
+    implicit_match = IMPLICIT_CODE_SIGNAL.search(combined)
+    file_type_match = FILE_TYPE_SIGNAL.search(combined)
+
+    if not explicit_match and not implicit_match and not file_type_match:
+        return _NEUTRAL
+
+    # ── Classify reason ──
+    if explicit_match:
+        reason = "explicit code creation request"
+    elif file_type_match:
+        reason = f"file type reference ({file_type_match.group(0)}) implies code task"
+    else:
+        reason = "task domain implies code is needed"
+
+    # ── Classify risk tier ──
+    if DESTRUCTIVE_SIGNAL.search(combined):
+        risk_tier = "destructive"
+    elif WRITE_SIGNAL.search(combined):
+        risk_tier = "write"
+    else:
+        risk_tier = "read_only"
+
+    # ── Check for ambiguous scope ──
+    missing_context: Optional[str] = None
+    if explicit_match and AMBIGUOUS_SCOPE_SIGNAL.search(msg):
+        if not SPECIFIC_SCOPE_SIGNAL.search(msg) and not file_type_match:
+            missing_context = (
+                "What specific task should this script accomplish? "
+                "A concrete goal will produce much better code."
+            )
+
+    # ── Determine fallback ──
+    if risk_tier == "destructive":
+        fallback = "Show a preview/dry-run of what would be affected instead of executing."
+    elif risk_tier == "write":
+        fallback = "Output the code in chat for review instead of writing directly to disk."
+    elif implicit_match:
+        fallback = "Explain the approach and ask if the user wants code generated."
+    else:
+        fallback = "Provide a minimal working example before building the full solution."
+
+    return CodeIntent(
+        code_warranted=True,
+        reason=reason,
+        execution_risk_tier=risk_tier,
+        missing_context=missing_context,
+        fallback_if_failed=fallback,
+    )

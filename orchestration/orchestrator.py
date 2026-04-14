@@ -10,7 +10,7 @@ You are the [Shovs Orchestrator]. Choose the smallest reliable next-step plan fo
 Available Tools:
 {tools_docs}
 
-Session Signals:
+{skills_block}Session Signals:
 - session_has_history: {session_has_history}
 - current_fact_count: {current_fact_count}
 - recently_failed_tools: {failed_tools}
@@ -27,6 +27,7 @@ Rules:
 - For exact-domain product or company research, prefer first-party evidence before third-party commentary.
 - If the user asks what a product costs or what plans exist, prefer fetching the exact pricing page before concluding.
 - If the user asks whether a product is good, trustworthy, or recommendable, gather first-party feature/pricing evidence before finalizing.
+- If the task clearly matches an Available Skill, include "skill": "skill_name" in your response so the runtime can load specialized instructions.
 - Conversational queries ("hi", "how are you", opinions) → return []
 - Factual/current data → ["web_search"]
 - URL reading → ["web_fetch"]
@@ -42,6 +43,7 @@ Rules:
 Return ONLY JSON (no markdown). Preferred format:
 {{
   "strategy": "one-line plan",
+  "skill": "skill_name or omit if none",
   "tools": [
     {{"name": "tool_name", "priority": "high|medium|low", "reason": "short reason", "target_argument_clue": "specific clue for the executor to use (e.g. exact URL or search terms)"}}
   ],
@@ -414,11 +416,19 @@ class AgenticOrchestrator:
         current_fact_count: int = 0,
         failed_tools: Optional[List[str]] = None,
         compiled_context: Optional[str] = None,
+        skills_list: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """Analyze query and return structured execution guidance."""
         tools_docs = "\n".join([f"- {t['name']}: {t['description']}" for t in tools_list])
         known_tools = {t["name"] for t in tools_list if isinstance(t, dict) and t.get("name")}
         failed_set = set(failed_tools or [])
+
+        skills_block = ""
+        if skills_list:
+            skill_lines = [f"- {s['name']}: {s.get('description', '')}" for s in skills_list if isinstance(s, dict) and s.get('name')]
+            if skill_lines:
+                skills_block = "Available Skills:\n" + "\n".join(skill_lines) + "\n\n"
+
         route_type = self.classify_route(
             query,
             session_has_history=session_has_history,
@@ -430,6 +440,7 @@ class AgenticOrchestrator:
             return {
                 "strategy": "No tools needed for a trivial conversational turn.",
                 "tools": [],
+                "skill": "",
                 "force_memory": False,
                 "memory_topic": "",
                 "confidence": 0.98,
@@ -452,6 +463,7 @@ class AgenticOrchestrator:
             return {
                 "strategy": "Use deterministic route-selected tools before final answer.",
                 "tools": deterministic_tools,
+                "skill": "",
                 "force_memory": route_type == "memory_recall",
                 "memory_topic": query[:80],
                 "confidence": 0.9,
@@ -461,6 +473,7 @@ class AgenticOrchestrator:
 
         prompt = PLANNING_PROMPT.format(
             tools_docs=tools_docs,
+            skills_block=skills_block,
             query=query,
             session_has_history=str(bool(session_has_history)).lower(),
             current_fact_count=current_fact_count,
@@ -573,6 +586,7 @@ class AgenticOrchestrator:
             structured = {
                 "strategy": str(payload.get("strategy", "Use selected tools to gather evidence before final answer.")),
                 "tools": tools,
+                "skill": str(payload.get("skill", "")).strip(),
                 "force_memory": bool(payload.get("force_memory", session_has_history or current_fact_count > 0)),
                 "memory_topic": str(payload.get("memory_topic", query[:80])).strip(),
                 "confidence": float(payload.get("confidence", 0.5)),
@@ -586,6 +600,7 @@ class AgenticOrchestrator:
             return {
                 "strategy": "Planner failed; continue with direct reasoning.",
                 "tools": [],
+                "skill": "",
                 "force_memory": False,
                 "memory_topic": "",
                 "confidence": 0.0,

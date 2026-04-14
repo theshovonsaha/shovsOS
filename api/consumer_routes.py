@@ -203,6 +203,7 @@ def make_consumer_router(
                 embed_model=getattr(profile, "embed_model", None),
                 images=image_b64s or None,
                 agent_revision=getattr(profile, "revision", None),
+                workspace_path=getattr(profile, "workspace_path", None),
             )
             async for event in run_engine.stream(run_request):
                 event_type = event.get("type")

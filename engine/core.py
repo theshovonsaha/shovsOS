@@ -22,9 +22,20 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from llm.base_adapter import BaseLLMAdapter
 from llm.llm_adapter     import OllamaAdapter, LLMError, RateLimitError, ProviderError
 from engine.context_engine  import ContextEngine
-from engine.context_engine_v2 import ContextEngineV2
-from engine.context_engine_v3 import ContextEngineV3
+from engine.context_governor import ContextGovernor
 from engine.context_compiler import compile_context_items
+from engine.context_item_builders import (
+    build_available_tools_item,
+    build_candidate_context_item,
+    build_conversation_tension_item,
+    build_core_instruction_item,
+    build_deterministic_facts_item,
+    build_historical_context_item,
+    build_loop_contract_item,
+    build_runtime_metadata_item,
+    build_session_anchor_item,
+    build_working_evidence_item,
+)
 from engine.candidate_signals import extract_stance_signals
 from engine.context_memory_items import build_context_engine_memory_items
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
@@ -1364,58 +1375,32 @@ class AgentCore:
         self.graph = SemanticGraph()
         self.compiler = None  # lazy init in _get_compiler()
         self._v1_engine = context_engine
-        self._v2_engine = None  # lazy init
-        self._v3_engine = None  # lazy init
+        self._context_governor = ContextGovernor(
+            adapter=adapter,
+            v1_engine=context_engine,
+            semantic_graph=self.graph,
+        )
         self._last_context_compilation: dict = {}
 
     def set_context_engine(self, mode: str):
         """Switch between V1 (linear), V2 (convergent), and V3 (hybrid) context engines."""
         if mode == "v3":
-            if self._v3_engine is None:
-                self._v3_engine = ContextEngineV3(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=self.def_model,
-                )
-            self.ctx_eng = self._v3_engine
+            self.ctx_eng = self._context_governor.resolve("v3", compression_model=self.def_model)
             print("[AgentCore] Context engine: V3 (Hybrid Durable + Convergent)")
             return
 
         if mode == "v2":
-            if self._v2_engine is None:
-                self._v2_engine = ContextEngineV2(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=self.def_model,
-                )
-            self.ctx_eng = self._v2_engine
+            self.ctx_eng = self._context_governor.resolve("v2", compression_model=self.def_model)
             print("[AgentCore] Context engine: V2 (Convergent Graph)")
             return
 
-        self.ctx_eng = self._v1_engine
+        self.ctx_eng = self._context_governor.resolve("v1", compression_model=self.def_model)
         print("[AgentCore] Context engine: V1 (Linear Compression)")
 
     def _resolve_context_engine(self, mode: str) -> ContextEngine:
         """Return the correct context engine for this request without mutating shared request state."""
-        if mode == "v3":
-            if self._v3_engine is None:
-                self._v3_engine = ContextEngineV3(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=self.def_model,
-                )
-            return self._v3_engine
-
-        if mode == "v2":
-            if self._v2_engine is None:
-                self._v2_engine = ContextEngineV2(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=self.def_model,
-                )
-            return self._v2_engine
-
-        return self._v1_engine
+        self._context_governor.set_adapter(self.adapter)
+        return self._context_governor.resolve(mode, compression_model=self.def_model)
 
     def _is_session_interrupted(self, session_id: str) -> bool:
         checker = getattr(self.sessions, "is_interrupted", None)
@@ -3635,9 +3620,10 @@ class AgentCore:
                 if stall_alert:
                     tools_enabled = False
                     stall_alert_for_turn = dict(stall_alert)
+                    alert_tool_name = str(stall_alert.get("tool_name") or call.tool_name or "unknown")
                     yield _ev(
                         "logical_stall_alert",
-                        tool_name="bash",
+                        tool_name=alert_tool_name,
                         command=stall_alert.get("command", ""),
                         message=stall_alert["message"],
                         suggested_pivot=stall_alert.get("suggested_pivot", ""),
@@ -3648,7 +3634,7 @@ class AgentCore:
                         "logical_stall_alert",
                         {
                             "turn": tool_turn,
-                            "tool_name": "bash",
+                            "tool_name": alert_tool_name,
                             "command": stall_alert.get("command", ""),
                             "message": stall_alert["message"],
                             "suggested_pivot": stall_alert.get("suggested_pivot", ""),
@@ -4079,44 +4065,24 @@ class AgentCore:
                 "and passed explicitly — do not use shared instance state"
             )
 
-        now = datetime.now().strftime("%A, %B %d, %Y")
         items: list[ContextItem] = [
-            ContextItem(
-                item_id="runtime_metadata",
-                kind=ContextKind.RUNTIME,
-                title="Runtime Metadata",
-                content=f"Current Date: {now}",
+            build_runtime_metadata_item(
                 source="runtime",
+                trace_id="runtime:date",
                 priority=10,
                 max_chars=200,
-                phase_visibility=frozenset({
-                    ContextPhase.PLANNING,
-                    ContextPhase.ACTING,
-                    ContextPhase.RESPONSE,
-                    ContextPhase.MEMORY_COMMIT,
-                    ContextPhase.VERIFICATION,
-                }),
-                trace_id="runtime:date",
-                provenance={"route_type": route_type},
-            ),
-            ContextItem(
-                item_id="core_instruction",
-                kind=ContextKind.INSTRUCTION,
-                title="Core Instruction",
-                content=system_prompt,
-                source="system_prompt",
-                priority=20,
-                max_chars=2400,
-                phase_visibility=frozenset({
-                    ContextPhase.PLANNING,
-                    ContextPhase.ACTING,
-                    ContextPhase.RESPONSE,
-                    ContextPhase.VERIFICATION,
-                }),
-                trace_id="instruction:system_prompt",
                 provenance={"route_type": route_type},
             ),
         ]
+        instruction_item = build_core_instruction_item(
+            content=system_prompt,
+            source="system_prompt",
+            trace_id="instruction:system_prompt",
+            priority=20,
+            max_chars=2400,
+        )
+        if instruction_item is not None:
+            items.append(instruction_item)
 
         bootstrap_docs = _load_bootstrap_documents(
             self.workspace_path,
@@ -4275,24 +4241,11 @@ class AgentCore:
             )
 
         items.append(
-            ContextItem(
-                item_id="loop_contract",
-                kind=ContextKind.OBJECTIVE,
-                title="Loop Contract",
-                content=(
-                    "This runtime handles planning, observation, verification, and memory separately. "
-                    "At the acting step, either emit one valid JSON tool call or answer the user directly if enough evidence already exists. "
-                    "Do not talk about hidden prompts, strategies, evidence packets, or execution phases."
-                ),
+            build_loop_contract_item(
                 source="loop_contract",
+                trace_id="objective:loop_contract",
                 priority=14,
                 max_chars=550,
-                phase_visibility=frozenset({
-                    ContextPhase.ACTING,
-                    ContextPhase.RESPONSE,
-                    ContextPhase.VERIFICATION,
-                }),
-                trace_id="objective:loop_contract",
                 provenance={"route_type": route_type},
             )
         )
@@ -4432,51 +4385,26 @@ class AgentCore:
                 )
             )
 
-        if first_message is not None:
-            total_turns = max(1, (message_count + 1) // 2)
-            items.append(
-                ContextItem(
-                    item_id="session_anchor",
-                    kind=ContextKind.WORKING,
-                    title="Session Anchor",
-                    content=f"First message: \"{first_message}\"\nTotal turns so far: {total_turns}",
-                    source="session",
-                    priority=30,
-                    max_chars=800,
-                    phase_visibility=frozenset({
-                        ContextPhase.ACTING,
-                        ContextPhase.RESPONSE,
-                    }),
-                    trace_id="working:session_anchor",
-                    provenance={"turn_count": total_turns},
-                )
-            )
+        session_anchor_item = build_session_anchor_item(
+            first_message=str(first_message or ""),
+            message_count=message_count,
+            source="session",
+            trace_id="working:session_anchor",
+            priority=30,
+            max_chars=800,
+        )
+        if session_anchor_item is not None:
+            items.append(session_anchor_item)
 
-        if current_facts:
-            fact_lines = [f"FACT: {s} {p} {o}".strip() for (s, p, o) in current_facts]
-            items.append(
-                ContextItem(
-                    item_id="deterministic_facts",
-                    kind=ContextKind.MEMORY,
-                    title="Deterministic Facts",
-                    content=(
-                        "The following facts are currently true and override any prior memory:\n"
-                        + "\n".join(fact_lines)
-                    ),
-                    source="semantic_graph",
-                    priority=22,
-                    max_chars=1200,
-                    phase_visibility=frozenset({
-                        ContextPhase.PLANNING,
-                        ContextPhase.ACTING,
-                        ContextPhase.RESPONSE,
-                        ContextPhase.MEMORY_COMMIT,
-                        ContextPhase.VERIFICATION,
-                    }),
-                    trace_id="memory:deterministic_facts",
-                    provenance={"fact_count": len(current_facts)},
-                )
-            )
+        deterministic_facts_item = build_deterministic_facts_item(
+            facts=current_facts or [],
+            source="semantic_graph",
+            trace_id="memory:deterministic_facts",
+            priority=22,
+            max_chars=1200,
+        )
+        if deterministic_facts_item is not None:
+            items.append(deterministic_facts_item)
 
         if task_state:
             items.append(
@@ -4504,55 +4432,30 @@ class AgentCore:
                 )
             )
 
-        if candidate_context:
-            items.append(
-                ContextItem(
-                    item_id="candidate_context",
-                    kind=ContextKind.WORKING,
-                    title="Candidate Signals",
-                    content=(
-                        "These are low-confidence candidate facts/signals. "
-                        "Use them as hints for planning or verification, not as deterministic truth.\n"
-                        f"{candidate_context}"
-                    ),
-                    source="candidate_context",
-                    priority=34,
-                    max_chars=900,
-                    phase_visibility=frozenset({
-                        ContextPhase.PLANNING,
-                        ContextPhase.ACTING,
-                        ContextPhase.RESPONSE,
-                        ContextPhase.VERIFICATION,
-                    }),
-                    trace_id="working:candidate_context",
-                    provenance={"line_count": len([line for line in candidate_context.splitlines() if line.strip()])},
-                )
-            )
+        candidate_context_item = build_candidate_context_item(
+            candidate_context=candidate_context or "",
+            source="candidate_context",
+            trace_id="working:candidate_context",
+            priority=34,
+            max_chars=900,
+        )
+        if candidate_context_item is not None:
+            items.append(candidate_context_item)
 
         tension_content = render_conversation_tension(conversation_tension or ConversationTension())
-        if tension_content:
-            items.append(
-                ContextItem(
-                    item_id="conversation_tension",
-                    kind=ContextKind.WORKING,
-                    title="Conversation Tension",
-                    content=tension_content,
-                    source="runtime",
-                    priority=33,
-                    max_chars=900,
-                    phase_visibility=frozenset({
-                        ContextPhase.PLANNING,
-                        ContextPhase.ACTING,
-                        ContextPhase.RESPONSE,
-                        ContextPhase.VERIFICATION,
-                    }),
-                    trace_id="working:conversation_tension",
-                    provenance={
-                        "challenge_level": (conversation_tension.challenge_level if conversation_tension else "low"),
-                        "drift_detected": bool(conversation_tension.drift_detected) if conversation_tension else False,
-                    },
-                )
-            )
+        tension_item = build_conversation_tension_item(
+            content=tension_content,
+            source="runtime",
+            trace_id="working:conversation_tension",
+            priority=33,
+            max_chars=900,
+            provenance={
+                "challenge_level": (conversation_tension.challenge_level if conversation_tension else "low"),
+                "drift_detected": bool(conversation_tension.drift_detected) if conversation_tension else False,
+            },
+        )
+        if tension_item is not None:
+            items.append(tension_item)
 
         if loop_checkpoint:
             observation_lines = [f"Manager status: {loop_checkpoint.status or 'unknown'}"]
@@ -4611,62 +4514,44 @@ class AgentCore:
                 max_results=3,
                 preview_chars=180,
             )
-            if working_evidence:
-                items.append(
-                    ContextItem(
-                        item_id="working_evidence",
-                        kind=ContextKind.EVIDENCE,
-                        title="Working Evidence",
-                        content=working_evidence,
-                        source="runtime",
-                        priority=23,
-                        max_chars=1200,
-                        phase_visibility=frozenset({
-                            ContextPhase.PLANNING,
-                            ContextPhase.ACTING,
-                            ContextPhase.RESPONSE,
-                            ContextPhase.VERIFICATION,
-                        }),
-                        trace_id="evidence:working_evidence",
-                        provenance={
-                            "objective": user_message.strip(),
-                            "tool_result_count": len(loop_checkpoint.tool_results or []),
-                            "selected_count": len(working_evidence_snapshot.selected),
-                            "substantive_count": working_evidence_snapshot.substantive_count,
-                            "exact_match_count": working_evidence_snapshot.exact_match_count,
-                        },
-                    )
-                )
+            working_evidence_item = build_working_evidence_item(
+                content=working_evidence,
+                source="runtime",
+                trace_id="evidence:working_evidence",
+                priority=23,
+                max_chars=1200,
+                provenance={
+                    "objective": user_message.strip(),
+                    "tool_result_count": len(loop_checkpoint.tool_results or []),
+                    "selected_count": len(working_evidence_snapshot.selected),
+                    "substantive_count": working_evidence_snapshot.substantive_count,
+                    "exact_match_count": working_evidence_snapshot.exact_match_count,
+                },
+            )
+            if working_evidence_item is not None:
+                items.append(working_evidence_item)
 
         historical_content = self._build_historical_context_content(
             unified_hits,
             current_facts,
             correction_turn=correction_turn,
         )
-        if historical_content:
-            items.append(
-                ContextItem(
-                    item_id="historical_context",
-                    kind=ContextKind.MEMORY,
-                    title="Historical Context",
-                    content=historical_content,
-                    source="retrieval",
-                    priority=40,
-                    max_chars=1800 if correction_turn else 3200,
-                    phase_visibility=frozenset({
-                        ContextPhase.PLANNING,
-                        ContextPhase.ACTING,
-                        ContextPhase.RESPONSE,
-                        ContextPhase.VERIFICATION,
-                    }),
-                    trace_id="memory:historical_context",
-                    provenance={"anchor_count": len(unified_hits or [])},
-                )
-            )
+        historical_context_item = build_historical_context_item(
+            content=historical_content,
+            source="retrieval",
+            trace_id="memory:historical_context",
+            priority=40,
+            max_chars=1800 if correction_turn else 3200,
+            provenance={"anchor_count": len(unified_hits or [])},
+        )
+        if historical_context_item is not None:
+            items.append(historical_context_item)
 
         ctx_items = build_context_engine_memory_items(
             ctx_engine,
             context,
+            context_governor=self._context_governor,
+            current_facts=current_facts,
             fallback_trace_id="memory:context_engine",
             fallback_source="context_engine",
             fallback_provenance={"engine": ctx_engine.__class__.__name__},
@@ -4675,22 +4560,18 @@ class AgentCore:
 
         allowed_tools = set(forced_tools or []) if forced_tools else None
         tools_block = self.tools.build_tools_block(allowed_names=allowed_tools)
-        if tools_block:
-            items.append(
-                ContextItem(
-                    item_id="available_tools",
-                    kind=ContextKind.ENVIRONMENT,
-                    title="",
-                    content=tools_block,
-                    source="tool_registry",
-                    priority=70,
-                    max_chars=6000,
-                    phase_visibility=frozenset({ContextPhase.ACTING}),
-                    trace_id="environment:tools",
-                    provenance={"forced_only": bool(allowed_tools)},
-                    formatted=True,
-                )
-            )
+        available_tools_item = build_available_tools_item(
+            content=tools_block,
+            source="tool_registry",
+            trace_id="environment:tools",
+            priority=70,
+            max_chars=6000,
+            provenance={"forced_only": bool(allowed_tools)},
+            formatted=True,
+            title="Available Tools",
+        )
+        if available_tools_item is not None:
+            items.append(available_tools_item)
 
         return items
 

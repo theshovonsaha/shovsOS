@@ -514,6 +514,7 @@ async def chat_stream(
                 search_engine=search_engine,
                 agent_revision=getattr(profile, "revision", None),
                 forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
+                workspace_path=getattr(profile, "workspace_path", None),
             )
             async for event in run_engine.stream(run_request):
                 yield f"data: {json.dumps(event)}\n\n"
@@ -807,6 +808,7 @@ async def update_agent(agent_id: str, payload: dict):
         "embed_model",
         "system_prompt",
         "tools",
+        "skills",
         "avatar_url",
         "workspace_path",
         "bootstrap_files",

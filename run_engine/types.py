@@ -27,6 +27,7 @@ class RunEngineRequest:
     search_engine: Optional[str] = None
     agent_revision: Optional[int] = None
     forced_tools: tuple[str, ...] = field(default_factory=tuple)
+    workspace_path: Optional[str] = None
 
 
 @dataclass(frozen=True)

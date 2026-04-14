@@ -16,8 +16,7 @@ The core structure is:
 - eval
 
 The runtime already supports:
-- `single` loop execution
-- `managed` execution with `plan -> act -> observe -> verify -> commit`
+- managed-first execution with `plan -> act -> observe -> verify -> commit`
 - phase-aware context compilation
 - model-aware execution profiles and prompt budgets
 - truth-vs-candidate memory lanes
@@ -49,6 +48,9 @@ Current state:
 
 - [engine/context_compiler.py](../../engine/context_compiler.py)
   - phase-specific context compilation
+
+- [engine/context_governor.py](../../engine/context_governor.py)
+  - canonical selector for `v1` / `v2` / `v3` context policy modes across managed and compatibility runtimes
 
 - [engine/fact_guard.py](../../engine/fact_guard.py)
   - grounded fact filtering
@@ -93,25 +95,7 @@ Current state:
 
 ## Execution Model
 
-### Single Loop
-
-Use when:
-- model is small or local
-- task is bounded
-- you want minimal orchestration overhead
-
-Characteristics:
-- direct actor loop
-- fewer passes
-- better default for local OpenAI-compatible servers in `auto`
-- more aggressive prompt compression for smaller local profiles
-
 ### Managed Loop
-
-Use when:
-- task is multi-step
-- tool strategy matters
-- you want explicit controller behavior
 
 Characteristics:
 - planner phase
@@ -119,6 +103,72 @@ Characteristics:
 - observation over tool results
 - verification before memory commit
 - persisted loop checkpoints
+
+Current public reality:
+- `run_engine/engine.py` is the canonical runtime spine
+- `engine/core.py` remains for compatibility and test coverage
+- if you see `single` / `auto` in older surfaces, treat them as compatibility-oriented language, not the main product contract
+
+## Context Modes
+
+`context_mode` is about memory/context shaping, not route selection.
+
+### `v1`
+
+What it does:
+- linear durable summary
+- appends new memory bullets to older bullets
+- reinjects the stored summary directly
+
+Strength:
+- strongest conversational continuity
+- easiest to inspect and debug
+
+Weakness:
+- least selective
+- can carry too much old context forward
+
+### `v2`
+
+What it does:
+- extracts active goals
+- extracts reusable modules
+- ranks modules by convergence against the active-goal set
+- injects only the top-ranked subset
+
+Strength:
+- best attempt at relevance-first memory
+- better prompt efficiency than raw durable summary
+
+Weakness:
+- still less transparent than V1
+- older goals are retained for recoverability, so bad extraction can still influence the packet until retirement
+
+Current implementation detail:
+- active goals now decay by recency instead of contributing equally forever
+- module ranking favors overlap with newer active goals, then protected/durable modules
+
+### `v3`
+
+What it does:
+- runs V1 durable compression and V2 convergent ranking together
+- injects convergent memory plus a trimmed durable slice
+
+Strength:
+- best intended long-term direction
+- combines continuity with selective relevance
+
+Weakness:
+- still inherits some V2 extraction opacity
+- durable and convergent memory are still composed from separate internal stores rather than one fully unified governor-owned state
+
+Current implementation detail:
+- durable memory is now selected with a scored anchor heuristic
+- first-message anchors, corrections, preferences, constraints, and recent durable lines are favored over arbitrary earliest lines
+
+Architectural direction:
+- the runtime now already uses one shared `ContextGovernor` to select policy modes
+- the remaining convergence work is to move more commit, activation, and assembly policy behind that governor so the three modes become presets over one memory system rather than parallel architectures
 
 ## Model Execution Profiles
 
@@ -162,6 +212,13 @@ Current deterministic coverage includes explicit user statements for:
 - preferred editor
 - package manager
 - primary language
+- operating system
+- pronouns
+- environment mode
+- scope boundary
+- budget limit
+- task constraint
+- follow-up directive
 
 Direct-fact queries over these fields can now answer from trusted memory without unnecessary tool use when the fact is already present.
 

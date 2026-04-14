@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
+from engine.direct_fact_policy import normalize_memory_predicate
+
 
 _NAME_PATTERNS = [
     re.compile(
@@ -108,6 +110,20 @@ _TASK_CONSTRAINT_PATTERNS = [
 _FOLLOWUP_DIRECTIVE_PATTERNS = [
     re.compile(r"\b(?:follow up|check back|revisit)\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
     re.compile(r"\bremind me to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_CLEAR_EDITOR_PATTERNS = [
+    re.compile(
+        r"\b(?:clear|remove|delete)\s+(?:my\s+)?(?:editor|editor preference|preferred editor)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bi(?:\s+have|'ve got| got)?\s+no\s+(?:strong\s+)?(?:editor|editor preference|preferred editor)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bi do not have an?\s+(?:editor|editor preference|preferred editor)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 _SPLIT_TRAILING_RE = re.compile(r"\b(?:but|and|because|so|what|where|who|please)\b", re.IGNORECASE)
@@ -248,6 +264,36 @@ def _build_fact(subject: str, predicate: str, object_: str) -> dict:
         "key": f"{subject} {predicate}".strip(),
         "source": "user_stated",
     }
+
+
+def _matches_any_pattern(text: str, patterns: Iterable[re.Pattern[str]]) -> bool:
+    return any(pattern.search(text or "") for pattern in patterns)
+
+
+def _collect_current_fact_index(
+    current_facts: Optional[Iterable[tuple[str, str, str]]],
+) -> dict[tuple[str, str], set[str]]:
+    current_index: dict[tuple[str, str], set[str]] = {}
+    for subject, predicate, object_ in current_facts or []:
+        canonical_predicate = normalize_memory_predicate(predicate)
+        key = (_normalize(subject).lower(), canonical_predicate.lower())
+        current_index.setdefault(key, set()).add(_normalize(object_).lower())
+    return current_index
+
+
+def _extract_explicit_revocations(
+    text: str,
+    *,
+    current_index: dict[tuple[str, str], set[str]],
+) -> list[dict]:
+    voids: list[dict] = []
+    if _matches_any_pattern(text, _CLEAR_EDITOR_PATTERNS) and current_index.get(("user", "preferred_editor")):
+        voids.append({
+            "subject": "User",
+            "predicate": "preferred_editor",
+            "source": "user_stated_revocation",
+        })
+    return voids
 
 
 def merge_fact_records(*groups: Iterable[dict]) -> list[dict]:
@@ -408,23 +454,24 @@ def extract_user_stated_fact_updates(
                 extracted.append(_build_fact("Task", "followup_directive", value))
             break
 
-    current_index: dict[tuple[str, str], set[str]] = {}
-    for subject, predicate, object_ in current_facts or []:
-        key = (_normalize(subject).lower(), _normalize(predicate).lower())
-        current_index.setdefault(key, set()).add(_normalize(object_).lower())
+    current_index = _collect_current_fact_index(current_facts)
+    voids: list[dict] = _extract_explicit_revocations(text, current_index=current_index)
 
     new_facts: list[dict] = []
-    voids: list[dict] = []
     for fact in merge_fact_records(extracted):
-        key = (fact["subject"].lower(), fact["predicate"].lower())
+        canonical_predicate = normalize_memory_predicate(fact["predicate"])
+        fact["predicate"] = canonical_predicate
+        fact["fact"] = f"{fact['subject']} {canonical_predicate} {fact.get('object', '')}".strip()
+        fact["key"] = f"{fact['subject']} {canonical_predicate}".strip()
+        key = (fact["subject"].lower(), canonical_predicate.lower())
         current_objects = current_index.get(key, set())
         new_object = _normalize(fact.get("object", "")).lower()
         if new_object and new_object in current_objects:
             continue
-        if current_objects and fact["predicate"] not in _MULTI_VALUE_PREDICATES:
+        if current_objects and canonical_predicate not in _MULTI_VALUE_PREDICATES:
             voids.append({
                 "subject": fact["subject"],
-                "predicate": fact["predicate"],
+                "predicate": canonical_predicate,
                 "source": "user_stated",
             })
         new_facts.append(fact)
@@ -445,32 +492,38 @@ def filter_redundant_user_alias_facts(
     known_name = ""
     known_location = ""
     known_timezone = ""
+    known_canonical_values: dict[str, str] = {}
 
     for item in deterministic_facts or []:
-        predicate = _normalize_predicate(str(item.get("predicate") or ""))
+        predicate = normalize_memory_predicate(str(item.get("predicate") or ""))
         object_ = _normalize(str(item.get("object") or "")).lower()
-        if predicate == "preferred name" and object_:
+        if predicate == "preferred_name" and object_:
             known_name = object_
         elif predicate == "location" and object_:
             known_location = object_
         elif predicate == "timezone" and object_:
             known_timezone = object_
+        if predicate and object_:
+            known_canonical_values[predicate] = object_
 
     for subject, predicate, object_ in current_facts or []:
-        pred = _normalize_predicate(predicate)
+        pred = normalize_memory_predicate(predicate)
         obj = _normalize(object_).lower()
-        if pred == "preferred name" and obj:
+        if pred == "preferred_name" and obj:
             known_name = known_name or obj
         elif pred == "location" and obj:
             known_location = known_location or obj
         elif pred == "timezone" and obj:
             known_timezone = known_timezone or obj
+        if pred and obj:
+            known_canonical_values[pred] = known_canonical_values.get(pred, obj) or obj
 
     allowed: list[dict] = []
     blocked: list[dict] = []
     for record in records or []:
         subject = _normalize(str(record.get("subject") or "")).lower()
-        predicate = _normalize_predicate(str(record.get("predicate") or ""))
+        raw_predicate = _normalize_predicate(str(record.get("predicate") or ""))
+        predicate = normalize_memory_predicate(str(record.get("predicate") or ""))
         object_ = _normalize(str(record.get("object") or "")).lower()
 
         alias_noise = False
@@ -498,6 +551,8 @@ def filter_redundant_user_alias_facts(
             "timezone",
             "is in timezone",
         }:
+            alias_noise = True
+        if predicate in known_canonical_values and known_canonical_values.get(predicate) == object_ and raw_predicate != predicate:
             alias_noise = True
 
         if alias_noise:

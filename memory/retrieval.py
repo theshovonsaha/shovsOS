@@ -8,6 +8,7 @@ import re
 from memory.semantic_graph import SemanticGraph
 from memory.vector_engine import VectorEngine
 from config.logger import log
+from engine.direct_fact_policy import direct_fact_predicates, normalize_memory_predicate
 
 
 _STOPWORDS = {
@@ -81,6 +82,25 @@ def _lexical_overlap_score(query: str, text: str) -> float:
     return overlap / max(1, len(q_tokens))
 
 
+def _normalize_subject(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def _normalize_object(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
+def _build_direct_fact_index(
+    current_facts: list[tuple[str, str, str]],
+) -> dict[str, tuple[str, str, str]]:
+    indexed: dict[str, tuple[str, str, str]] = {}
+    for subject, predicate, object_ in current_facts or []:
+        canonical = normalize_memory_predicate(predicate)
+        if canonical:
+            indexed[canonical] = (subject, canonical, object_)
+    return indexed
+
+
 @dataclass
 class _Hit:
     dedupe_key: str
@@ -146,6 +166,14 @@ async def unified_memory_search(
 
     merged: dict[str, _Hit] = {}
     source_counts = {"compiled_drawer": 0, "semantic_graph": 0, "deterministic_fact": 0, "vector_engine": 0}
+    suppressed_conflicts = 0
+    target_predicates = direct_fact_predicates(query)
+    current_facts: list[tuple[str, str, str]] = []
+    direct_fact_index: dict[str, tuple[str, str, str]] = {}
+
+    if session_id:
+        current_facts = list(graph.get_current_facts(session_id, owner_id=owner_scope) or [])
+        direct_fact_index = _build_direct_fact_index(current_facts)
 
     # Step 1: Karpathy Pattern - Prioritize Compiled Drawers (High-Density Context)
     if locus_id:
@@ -175,7 +203,18 @@ async def unified_memory_search(
         subject = str(item.get("subject") or "").strip()
         predicate = str(item.get("predicate") or "").strip()
         object_ = str(item.get("object") or "").strip()
-        signature = f"{subject}|{predicate}|{object_}".lower()
+        canonical_predicate = normalize_memory_predicate(predicate)
+        if target_predicates and canonical_predicate in target_predicates:
+            active_fact = direct_fact_index.get(canonical_predicate)
+            if active_fact is not None:
+                active_subject, _, active_object = active_fact
+                if (
+                    _normalize_subject(active_subject) != _normalize_subject(subject)
+                    or _normalize_object(active_object) != _normalize_object(object_)
+                ):
+                    suppressed_conflicts += 1
+                    continue
+        signature = f"{subject}|{canonical_predicate or predicate}|{object_}".lower()
         score = float(item.get("similarity") or 0.0)
         _upsert_hit(
             merged,
@@ -186,7 +225,8 @@ async def unified_memory_search(
                 "kind": "triplet",
                 "id": item.get("id"),
                 "subject": subject,
-                "predicate": predicate,
+                "predicate": canonical_predicate or predicate,
+                "raw_predicate": predicate,
                 "object": object_,
                 "created_at": item.get("created_at"),
             },
@@ -194,13 +234,17 @@ async def unified_memory_search(
         source_counts["semantic_graph"] += 1
 
     if session_id:
-        current_facts = graph.get_current_facts(session_id, owner_id=owner_scope)
         for subject, predicate, object_ in current_facts:
+            canonical_predicate = normalize_memory_predicate(predicate)
+            if target_predicates and canonical_predicate not in target_predicates:
+                continue
             fact_text = f"{subject} {predicate} {object_}".strip()
             lexical = _lexical_overlap_score(query, fact_text)
             # Keep deterministic lane high-priority, but still rank by relevance.
             score = 0.62 + min(0.35, lexical * 0.35)
-            signature = f"{subject}|{predicate}|{object_}".lower()
+            if target_predicates and canonical_predicate in target_predicates:
+                score = max(score, 0.97)
+            signature = f"{subject}|{canonical_predicate}|{object_}".lower()
             _upsert_hit(
                 merged,
                 dedupe_key=signature,
@@ -209,7 +253,7 @@ async def unified_memory_search(
                 payload={
                     "kind": "fact",
                     "subject": subject,
-                    "predicate": predicate,
+                    "predicate": canonical_predicate,
                     "object": object_,
                     "created_at": None,
                 },
@@ -230,6 +274,12 @@ async def unified_memory_search(
             anchor = str(item.get("anchor") or "").strip()
             if not key and not anchor:
                 continue
+            vector_predicates = direct_fact_predicates(f"{key} {anchor}")
+            if target_predicates:
+                overlapping = vector_predicates & target_predicates
+                if overlapping and any(predicate in direct_fact_index for predicate in overlapping):
+                    suppressed_conflicts += 1
+                    continue
             signature = f"{key}|{anchor[:120]}".lower()
             rank_score = max(0.05, 0.45 - (index * 0.03))
             lexical = _lexical_overlap_score(query, f"{key} {anchor}")
@@ -266,7 +316,7 @@ async def unified_memory_search(
             "candidate_pool": len(merged),
             "duration_ms": duration_ms,
             "source_counts": source_counts,
+            "suppressed_conflicts": suppressed_conflicts,
             "session_scoped": bool(session_id),
         },
     }
-

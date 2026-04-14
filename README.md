@@ -5,7 +5,7 @@ Shovs LLM OS is a local-first, open-source control center for autonomous agents.
 It is not just a chatbot shell or a prompt wrapper. It is a runtime with:
 - phase-aware context compilation
 - run identity and checkpoints
-- single-loop and managed-loop execution
+- managed-first execution
 - tools, memory, traces, artifacts, and evals
 - local and cloud model adapters
 - Nova and consumer planes on top of the same kernel
@@ -43,6 +43,41 @@ That is the basis of the "Language OS" claim and the control-center product dire
 Read the public vision document: [documentation/public/VISION.md](documentation/public/VISION.md)
 
 Memory wedge: [documentation/public/SHOVS_MEMORY.md](documentation/public/SHOVS_MEMORY.md)
+
+## How To Understand Shovs
+
+The easiest way to understand the system is in layers:
+
+1. Language layer
+   - the user speaks in natural language
+   - the model also reasons in language
+
+2. Runtime layer
+   - the system turns language into typed runtime state
+   - runs explicit phases like `plan -> act -> observe -> verify -> commit`
+   - persists runs, traces, checkpoints, tool results, and artifacts
+
+3. Memory layer
+   - trusted facts
+   - candidate signals
+   - task state and follow-up directives
+   - semantic retrieval and compressed context
+
+4. Control-center layer
+   - Nova shows what happened
+   - Consumer gives a simpler end-user surface
+
+The important distinction is:
+
+- Shovs is not just "chat history + tools"
+- it is trying to become a stateful runtime where memory, evidence, and execution are inspectable
+
+That is also why context management matters so much. The hardest problem is not storing more text. It is deciding:
+
+- what is true
+- what is only a weak signal
+- what should stay active now
+- what should retire until needed again
 
 ## What `shovs-memory` Is
 
@@ -85,21 +120,19 @@ What makes it different:
 
 ## Current Runtime Model
 
-The backend supports two execution modes:
+The live product runtime is managed-first:
 
-- `single`
-  - direct actor loop
-  - lower overhead
-  - good for small local models and simple tasks
+- canonical path: `run_engine/engine.py`
+- canonical phase flow: `plan -> act -> observe -> verify -> commit`
+- canonical state surfaces: run records, checkpoints, traces, tool results, artifacts, memory lanes
 
-- `managed`
-  - explicit `plan -> act -> observe -> verify -> commit`
-  - still inside one run, not a swarm by default
-  - better for complex multi-step work
+Compatibility code still exists in `engine/core.py`, but it is no longer the normal product execution path.
 
-- `auto`
-  - resolves between the two based on runtime conditions
-  - local OpenAI-compatible runners prefer `single` by default
+The system still exposes some legacy-shaped knobs in compatibility surfaces, but the real public story is:
+
+- one managed runtime spine
+- multiple model profiles
+- multiple context-shaping policies
 
 Each turn can produce:
 - a first-class `run`
@@ -113,7 +146,7 @@ Each turn can produce:
 
 ### Runtime Kernel
 - phase-aware context compilation
-- managed and single loop control
+- managed-first loop control
 - run identity with `run_id` and optional parent runs
 - persisted loop checkpoints
 - prompt minimization and context-overflow retry
@@ -136,10 +169,24 @@ Each turn can produce:
 - runtime embed-model propagation into memory tools
 - provider-aware embedding transport for Ollama, LM Studio, llama.cpp, and OpenAI-compatible runners
 - memory benchmark harness + owner-scoped benchmark snapshots (`/memory/benchmark/run`, `/memory/benchmark/latest`)
-- context-engine variants:
-  - V1 linear durable memory
-  - V2 convergent context
-  - V3 hybrid
+- context-shaping policies:
+  - V1: linear durable memory
+  - V2: convergent/goal-ranked memory
+  - V3: hybrid durable + convergent memory
+
+Current reality:
+- V1 is best for raw continuity
+- V2 now uses weighted active-goal retrieval, so newer goals dominate older retained goals
+- V3 now combines V2 with scored durable anchors instead of a naive first-lines slice
+- the three modes still exist, but they are now selected through one shared context governor
+
+Current architecture:
+- one canonical `ContextGovernor` selects the policy mode
+- `v1` is the durable-summary preset
+- `v2` is the relevance/activation preset
+- `v3` is the hybrid preset
+
+The next architectural step is deeper convergence: move more storage, activation, and packet-assembly policy behind that governor so the system stops behaving like three partially separate memory engines.
 
 ### Tooling
 - web search and fetch

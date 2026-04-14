@@ -1,4 +1,8 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import {
+  buildTimelineEntries as buildNovaTimelineEntries,
+  describeTraceEvent as describeNovaTraceEvent,
+} from './monitor/presentation';
 import { getOwnerId } from './owner';
 import { OperatorInterventions } from './components/OperatorInterventions';
 
@@ -140,42 +144,6 @@ function clipText(text: string, max = 140): string {
   return `${text.slice(0, max - 3).trimEnd()}...`;
 }
 
-function describeTraceEvent(event: TraceEventSummary): string {
-  const data =
-    event.data && typeof event.data === 'object'
-      ? (event.data as Record<string, any>)
-      : {};
-
-  switch (event.event_type) {
-    case 'runtime_loop_mode':
-      return `Loop mode: ${data.effective || data.requested || 'unknown'}`;
-    case 'route_decision':
-      return `Route selected: ${data.route_type || 'unknown'}`;
-    case 'phase_context': {
-      const phase = String(data.phase || 'phase');
-      const included = Array.isArray(data.included) ? data.included : [];
-      const evidenceCount = included.filter((item) => item?.kind === 'evidence').length;
-      return `${phase} packet compiled${evidenceCount ? ` with ${evidenceCount} evidence item${evidenceCount === 1 ? '' : 's'}` : ''}`;
-    }
-    case 'tool_call':
-      return `${data.tool_name || 'tool'} starting${data.arguments_summary ? ` · ${data.arguments_summary}` : ''}`;
-    case 'tool_result':
-      return `${data.tool_name || 'tool'} ${data.success === false ? 'failed' : 'returned'}${data.content_preview ? ` · ${data.content_preview}` : ''}`;
-    case 'verification_result':
-      return data.supported === false
-        ? `Verification flagged issues${Array.isArray(data.issues) && data.issues.length ? ` · ${data.issues[0]}` : ''}`
-        : 'Verification passed';
-    case 'verification_warning':
-      return Array.isArray(data.issues) && data.issues.length
-        ? `Verification warning · ${data.issues[0]}`
-        : 'Verification warning';
-    case 'assistant_response':
-      return String(data.content || event.preview || 'Assistant response saved.');
-    default:
-      return String(event.preview || event.event_type.replace(/_/g, ' '));
-  }
-}
-
 function findLatestTrace(
   events: TraceEventSummary[],
   eventTypes: string[],
@@ -206,7 +174,7 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
       id: `runtime:${runtimeEvent.id}`,
       title: 'Runtime',
       eyebrow: runtimeEvent.event_type.replace(/_/g, ' '),
-      summary: clipText(describeTraceEvent(runtimeEvent), 150),
+      summary: clipText(describeNovaTraceEvent(runtimeEvent), 150),
       detail: runtimeEvent.run_id ? `run ${runtimeEvent.run_id.slice(0, 10)}` : undefined,
       tone: runtimeEvent.event_type === 'route_decision' ? 'good' : 'neutral',
     });
@@ -217,7 +185,7 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
       id: `tool:${toolEvent.id}`,
       title: 'Latest Tool',
       eyebrow: typeof toolEvent.pass_index === 'number' ? `pass ${toolEvent.pass_index}` : 'tool activity',
-      summary: clipText(describeTraceEvent(toolEvent), 150),
+      summary: clipText(describeNovaTraceEvent(toolEvent), 150),
       detail: toolEvent.event_type === 'tool_result' ? 'observe phase' : 'act phase',
       tone:
         toolEvent.event_type === 'tool_result' &&
@@ -232,7 +200,7 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
       id: `verify:${verifyEvent.id}`,
       title: 'Verification',
       eyebrow: verifyEvent.event_type.replace(/_/g, ' '),
-      summary: clipText(describeTraceEvent(verifyEvent), 150),
+      summary: clipText(describeNovaTraceEvent(verifyEvent), 150),
       tone:
         verifyEvent.event_type === 'verification_warning' ||
         verifyEvent.data?.supported === false
@@ -246,7 +214,7 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
       id: `response:${responseEvent.id}`,
       title: 'Response',
       eyebrow: 'latest output',
-      summary: clipText(describeTraceEvent(responseEvent), 150),
+      summary: clipText(describeNovaTraceEvent(responseEvent), 150),
       tone: 'neutral',
     });
   }
@@ -255,77 +223,15 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
 }
 
 function buildTimelineEntries(traceEvents: TraceEventSummary[]): TimelineEntry[] {
-  return traceEvents
-    .filter((event) =>
-      [
-        'plan',
-        'phase_context',
-        'tool_call',
-        'tool_result',
-        'manager_observation',
-        'verification_result',
-        'verification_warning',
-        'assistant_response',
-      ].includes(event.event_type),
-    )
-    .slice(0, 18)
-    .map((event) => {
-      const data =
-        event.data && typeof event.data === 'object'
-          ? (event.data as Record<string, any>)
-          : {};
-      let stage = 'runtime';
-      let title = event.event_type.replace(/_/g, ' ');
-      let tone: TimelineEntry['tone'] = 'neutral';
-
-      switch (event.event_type) {
-        case 'plan':
-          stage = 'planning';
-          title = 'planner';
-          break;
-        case 'phase_context':
-          stage = `${String(data.phase || 'context')}`;
-          title = 'compiled packet';
-          break;
-        case 'tool_call':
-          stage = 'acting';
-          title = data.tool_name || 'tool call';
-          break;
-        case 'tool_result':
-          stage = 'observing';
-          title = data.tool_name || 'tool result';
-          tone = data.success === false ? 'warn' : 'good';
-          break;
-        case 'manager_observation':
-          stage = 'observing';
-          title = 'manager observation';
-          break;
-        case 'verification_result':
-          stage = 'verifying';
-          title = 'verification';
-          tone = data.supported === false ? 'warn' : 'good';
-          break;
-        case 'verification_warning':
-          stage = 'verifying';
-          title = 'verification warning';
-          tone = 'warn';
-          break;
-        case 'assistant_response':
-          stage = 'responding';
-          title = 'assistant response';
-          break;
-      }
-
-      return {
-        id: event.id,
-        stage,
-        title,
-        summary: clipText(describeTraceEvent(event), 180),
-        toolName: data.tool_name || undefined,
-        ts: event.ts,
-        tone,
-      };
-    });
+  return buildNovaTimelineEntries(traceEvents, 18).map((entry) => ({
+    id: entry.id,
+    stage: entry.stage,
+    title: entry.headline,
+    summary: clipText(entry.lines.join(' '), 180),
+    toolName: entry.toolName,
+    ts: entry.ts,
+    tone: entry.tone,
+  }));
 }
 
 export const LogPanel: React.FC<LogPanelProps> = ({

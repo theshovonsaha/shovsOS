@@ -9,6 +9,7 @@ from config.logger import log
 from engine.candidate_signals import extract_stance_signals
 from engine.conversation_tension import analyze_conversation_tension
 from engine.context_schema import ContextPhase
+from engine.context_governor import ContextGovernor
 from engine.deterministic_facts import extract_user_stated_fact_updates
 from engine.tool_loop_guard import ToolLoopGuard
 from engine.tool_contract import (
@@ -27,6 +28,7 @@ from orchestration.run_store import RunStore
 from orchestration.session_manager import SessionManager
 from plugins.tool_registry import ToolCall, ToolRegistry
 from run_engine.context_packets import PacketBuildInputs, build_phase_packet
+from run_engine.code_intent import CodeIntent, classify_code_intent
 from run_engine.evidence_lane import (
     build_evidence_focus_lines,
     build_evidence_priority_reminder,
@@ -42,6 +44,7 @@ from run_engine.memory_pipeline import (
     build_grounding_text,
     plan_memory_commit,
 )
+from run_engine.skill_loader import list_available_skills, load_skill_context
 from run_engine.tool_selection import (
     build_actor_request_content,
     extract_tool_call,
@@ -105,9 +108,11 @@ class RunEngine:
         self.orchestrator = orchestrator
         self.context_engine = context_engine
         self.graph = graph
-        self._v1_engine = context_engine
-        self._v2_engine = None
-        self._v3_engine = None
+        self._context_governor = ContextGovernor(
+            adapter=adapter,
+            v1_engine=context_engine,
+            semantic_graph=graph,
+        )
 
     @staticmethod
     def _is_trivial_acknowledgement(message: str) -> bool:
@@ -164,39 +169,8 @@ class RunEngine:
         *,
         compression_model: Optional[str] = None,
     ):
-        normalized = str(mode or "v1").strip().lower()
-        if normalized not in {"v1", "v2", "v3"}:
-            normalized = "v1"
-
-        if normalized == "v2":
-            if self._v2_engine is None:
-                from engine.context_engine_v2 import ContextEngineV2
-
-                self._v2_engine = ContextEngineV2(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=compression_model or "llama3.2",
-                )
-            engine = self._v2_engine
-        elif normalized == "v3":
-            if self._v3_engine is None:
-                from engine.context_engine_v3 import ContextEngineV3
-
-                self._v3_engine = ContextEngineV3(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=compression_model or "llama3.2",
-                )
-            engine = self._v3_engine
-        else:
-            engine = self._v1_engine
-
-        if engine is not None:
-            if hasattr(engine, "set_adapter"):
-                engine.set_adapter(self.adapter)
-            if compression_model and hasattr(engine, "compression_model"):
-                engine.compression_model = compression_model
-        return engine
+        self._context_governor.set_adapter(self.adapter)
+        return self._context_governor.resolve(mode, compression_model=compression_model)
 
     async def stream(self, request: RunEngineRequest) -> AsyncIterator[dict[str, Any]]:
         session = self.sessions.get_or_create(
@@ -341,6 +315,61 @@ class RunEngine:
                     "conflict_count": len(conversation_tension.conflicting_facts),
                 }
 
+            # ── Skill discovery ──
+            available_skills: list[dict[str, str]] = []
+            active_skill_context = ""
+            active_skill_name = ""
+            workspace_path = str(getattr(request, "workspace_path", "") or "").strip() or None
+            if workspace_path:
+                skill_manifests = list_available_skills(workspace_path)
+                available_skills = [
+                    {"name": m.name, "description": m.description}
+                    for m in skill_manifests
+                ]
+                if available_skills:
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="skills_discovered",
+                        data={
+                            "count": len(available_skills),
+                            "skills": [s["name"] for s in available_skills],
+                        },
+                    )
+
+            # ── Code intent classification ──
+            code_intent = classify_code_intent(
+                user_message=request.user_message,
+                effective_objective=effective_objective,
+                tool_results=tool_results,
+            )
+            code_intent_note = code_intent.to_phase_note()
+            execution_risk_tier = code_intent.to_risk_note()
+            if code_intent.code_warranted:
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="code_intent_classified",
+                    data={
+                        "code_warranted": code_intent.code_warranted,
+                        "reason": code_intent.reason,
+                        "risk_tier": code_intent.execution_risk_tier,
+                        "has_missing_context": code_intent.missing_context is not None,
+                    },
+                )
+
+            # ── Clarification gate ──
+            if (
+                code_intent.missing_context
+                and not tool_results
+            ):
+                yield {
+                    "type": "clarification_needed",
+                    "question": code_intent.missing_context,
+                    "reason": code_intent.reason,
+                    "risk_tier": code_intent.execution_risk_tier,
+                }
+
             if not selected_tools and planner_enabled and self.orchestrator is not None:
                 planning_packet = self._compile_phase_packet(
                     context_engine=active_context_engine,
@@ -355,6 +384,10 @@ class RunEngine:
                     tool_results=tool_results,
                     current_facts=current_facts,
                     conversation_tension=conversation_tension,
+                    active_skill_context=active_skill_context,
+                    active_skill_name=active_skill_name,
+                    code_intent_note=code_intent_note,
+                    execution_risk_tier=execution_risk_tier,
                 )
                 structured_plan = await self.orchestrator.plan_with_context(
                     query=effective_objective,
@@ -364,7 +397,26 @@ class RunEngine:
                     current_fact_count=0,
                     failed_tools=[],
                     compiled_context=planning_packet.content,
+                    skills_list=available_skills if available_skills else None,
                 )
+
+                # ── Load selected skill ──
+                planned_skill = str(structured_plan.get("skill", "")).strip()
+                if planned_skill and workspace_path:
+                    loaded_context = load_skill_context(planned_skill, workspace_path)
+                    if loaded_context:
+                        active_skill_context = loaded_context
+                        active_skill_name = planned_skill
+                        self._trace(
+                            request=request,
+                            run_id=run.run_id,
+                            event_type="skill_loaded",
+                            data={
+                                "skill_name": planned_skill,
+                                "chars": len(loaded_context),
+                            },
+                        )
+
                 selected_tools = [
                     entry["name"]
                     for entry in structured_plan.get("tools", [])
@@ -508,6 +560,10 @@ class RunEngine:
                     notes=latest_notes,
                     current_facts=current_facts,
                     conversation_tension=conversation_tension,
+                    active_skill_context=active_skill_context,
+                    active_skill_name=active_skill_name,
+                    code_intent_note=code_intent_note,
+                    execution_risk_tier=execution_risk_tier,
                 )
                 tool_call = await self._select_tool_call(
                     adapter=current_adapter,
@@ -792,8 +848,9 @@ class RunEngine:
                 )
                 if stall_alert:
                     latest_notes = str(stall_alert["message"] or "")
+                    alert_tool_name = str(stall_alert.get("tool_name") or tool_result.tool_name or "unknown")
                     alert_payload = {
-                        "tool_name": "bash",
+                        "tool_name": alert_tool_name,
                         "success": False,
                         "content": latest_notes,
                         "arguments": dict(tool_call.arguments or {}),
@@ -805,7 +862,7 @@ class RunEngine:
                         tool_turn=tool_turn,
                         status="logical_stall_alert",
                         notes=latest_notes,
-                        tools=["bash"],
+                        tools=[alert_tool_name],
                         tool_results=summarize_tool_results([alert_payload], limit=1, preview_chars=220),
                     )
                     self._trace(
@@ -813,7 +870,7 @@ class RunEngine:
                         run_id=run.run_id,
                         event_type="logical_stall_alert",
                         data={
-                            "tool_name": "bash",
+                            "tool_name": alert_tool_name,
                             "command": stall_alert.get("command", ""),
                             "message": latest_notes,
                             "suggested_pivot": stall_alert.get("suggested_pivot", ""),
@@ -829,7 +886,7 @@ class RunEngine:
                         objective=effective_objective,
                         strategy=latest_strategy,
                         notes=latest_notes,
-                        selected_tools=["bash"],
+                        selected_tools=[alert_tool_name],
                         tool_results=tool_results[-3:],
                         packet=acting_packet,
                     )
@@ -1620,9 +1677,14 @@ class RunEngine:
         current_facts: Optional[list[tuple[str, str, str]]] = None,
         conversation_tension=None,
         trace_phase_label: Optional[str] = None,
+        active_skill_context: str = "",
+        active_skill_name: str = "",
+        code_intent_note: str = "",
+        execution_risk_tier: str = "",
     ) -> CompiledPassPacket:
         packet = build_phase_packet(
             context_engine=context_engine,
+            context_governor=self._context_governor,
             inputs=PacketBuildInputs(
                 request=request,
                 session=session,
@@ -1640,6 +1702,10 @@ class RunEngine:
                 final_response=final_response,
                 current_facts=current_facts,
                 conversation_tension=conversation_tension,
+                active_skill_context=active_skill_context,
+                active_skill_name=active_skill_name,
+                code_intent_note=code_intent_note,
+                execution_risk_tier=execution_risk_tier,
             ),
         )
         phase_trace = dict(packet.trace)
