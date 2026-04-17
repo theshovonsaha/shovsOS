@@ -17,6 +17,7 @@ from engine.tool_loop_guard import ToolLoopGuard
 from engine.tool_contract import (
     canonical_tool_call,
     clip_text,
+    enrich_tool_result_content,
     format_tool_result_line,
     is_retry_sensitive_tool,
     summarize_tool_results,
@@ -30,7 +31,7 @@ from orchestration.run_store import RunStore
 from orchestration.session_manager import SessionManager
 from plugins.tool_registry import ToolCall, ToolRegistry
 from run_engine.context_packets import PacketBuildInputs, build_phase_packet
-from run_engine.code_intent import CodeIntent, classify_code_intent
+from run_engine.code_intent import CodeIntent, classify_code_intent, check_research_ambiguity
 from run_engine.evidence_lane import (
     build_evidence_focus_lines,
     build_evidence_priority_reminder,
@@ -68,6 +69,15 @@ Rules:
 - Use only the allowed tools.
 - Do not create files or code unless the user explicitly asked for a file, script, app, or other artifact.
 - Return a tool call, not prose.
+
+Reading tool result signals:
+- [READ_MORE: <url>]    — call web_fetch with that exact URL as your next action.
+- [NEXT_PROBE: <q>]     — use that exact value as your next web_search query or web_fetch URL.
+- [KEY_FACT: <text>]    — note this fact; no further fetching needed for this fact alone.
+- [TRUNCATED: N chars]  — content was cut; call web_fetch on the same URL to get the rest.
+- [NO_RESULTS]          — previous tool found nothing; try a different query or source.
+- [AUTH_REQUIRED]       — page requires login; try web_search for cached or alternative source.
+When signals are present, act on the highest-priority one before inventing your own next step.
 """
 
 FINAL_RESPONSE_PROMPT = """\
@@ -384,6 +394,32 @@ class RunEngine:
                         },
                     )
 
+            # ── Loci discovery — surfaces Memory Palace rooms to the planner ──
+            available_loci: list[dict[str, str]] = []
+            try:
+                raw_loci = self.graph.list_loci(owner_id=request.owner_id)
+                available_loci = [
+                    {
+                        "id": str(l.get("id", "")),
+                        "name": str(l.get("name", "")),
+                        "description": str(l.get("description", "") or ""),
+                    }
+                    for l in raw_loci
+                    if l.get("id")
+                ]
+                if available_loci:
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="loci_discovered",
+                        data={
+                            "count": len(available_loci),
+                            "loci": [l["id"] for l in available_loci],
+                        },
+                    )
+            except Exception:
+                available_loci = []
+
             # ── Code intent classification ──
             code_intent = classify_code_intent(
                 user_message=request.user_message,
@@ -406,16 +442,33 @@ class RunEngine:
                 )
 
             # ── Clarification gate ──
-            if (
-                code_intent.missing_context
-                and not tool_results
-            ):
+            # Gate 1: code scope ambiguity (existing)
+            _clarification_question = code_intent.missing_context
+            _clarification_reason = code_intent.reason
+            _clarification_risk = code_intent.execution_risk_tier
+
+            # Gate 2: vague research/comparison queries — ask before wasting tool calls
+            if not _clarification_question and not tool_results:
+                _research_question = check_research_ambiguity(request.user_message)
+                if _research_question:
+                    _clarification_question = _research_question
+                    _clarification_reason = "research scope is underspecified"
+                    _clarification_risk = "none"
+
+            if _clarification_question and not tool_results:
                 yield {
                     "type": "clarification_needed",
-                    "question": code_intent.missing_context,
-                    "reason": code_intent.reason,
-                    "risk_tier": code_intent.execution_risk_tier,
+                    "question": _clarification_question,
+                    "reason": _clarification_reason,
+                    "risk_tier": _clarification_risk,
                 }
+
+            # Default locus_id — overwritten by planner if a locus is targeted.
+            planned_locus_id: str = ""
+            # Argument clues from the planner (tool_name → hint string for actor).
+            planned_argument_clues: dict[str, str] = {}
+            # Full structured plan — populated by planner, used by verify skip logic.
+            structured_plan: dict[str, Any] = {}
 
             if not selected_tools and not direct_fact_memory_only and planner_enabled and self.orchestrator is not None:
                 planning_packet = self._compile_phase_packet(
@@ -435,6 +488,7 @@ class RunEngine:
                     active_skill_name=active_skill_name,
                     code_intent_note=code_intent_note,
                     execution_risk_tier=execution_risk_tier,
+                    available_loci=available_loci if available_loci else None,
                 )
                 structured_plan = await self.orchestrator.plan_with_context(
                     query=effective_objective,
@@ -445,7 +499,21 @@ class RunEngine:
                     failed_tools=sorted(failed_tool_names),
                     compiled_context=planning_packet.content,
                     skills_list=available_skills if available_skills else None,
+                    available_loci=available_loci if available_loci else None,
+                    code_intent_note=code_intent_note or "none",
+                    risk_tier=execution_risk_tier or "standard",
+                    tension_summary=conversation_tension.summary or "none",
                 )
+
+                # ── Capture planned locus_id for spatial memory routing ──
+                planned_locus_id = str(structured_plan.get("locus_id", "")).strip()
+                if planned_locus_id:
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="locus_targeted",
+                        data={"locus_id": planned_locus_id},
+                    )
 
                 # ── Load selected skill ──
                 planned_skill = str(structured_plan.get("skill", "")).strip()
@@ -469,6 +537,14 @@ class RunEngine:
                     for entry in structured_plan.get("tools", [])
                     if isinstance(entry, dict) and isinstance(entry.get("name"), str)
                 ]
+                # Capture argument clues keyed by tool name for the actor.
+                planned_argument_clues: dict[str, str] = {
+                    entry["name"]: str(entry.get("target_argument_clue", "")).strip()
+                    for entry in structured_plan.get("tools", [])
+                    if isinstance(entry, dict)
+                    and isinstance(entry.get("name"), str)
+                    and str(entry.get("target_argument_clue", "")).strip()
+                }
                 if structured_plan.get("strategy"):
                     strategy = str(structured_plan.get("strategy"))
                     latest_strategy = strategy
@@ -611,6 +687,8 @@ class RunEngine:
                     active_skill_name=active_skill_name,
                     code_intent_note=code_intent_note,
                     execution_risk_tier=execution_risk_tier,
+                    available_loci=available_loci if available_loci else None,
+                    planned_locus_id=planned_locus_id,
                 )
                 tool_call = await self._select_tool_call(
                     adapter=current_adapter,
@@ -620,6 +698,7 @@ class RunEngine:
                     allowed_tools=selected_tools,
                     tool_results=tool_results,
                     context_block=acting_packet.content,
+                    argument_clues=planned_argument_clues if planned_argument_clues else None,
                 )
                 if tool_call is None:
                     break
@@ -850,10 +929,31 @@ class RunEngine:
                         "_runtime_path": "run_engine",
                     },
                 )
+                # Enrich content with AI-readable signals ([READ_MORE], [KEY_FACT], etc.)
+                # so the actor and observation phases know what to do next without
+                # having to infer next steps from raw content alone.
+                _raw_content = tool_result.content
+                try:
+                    _content_json = json.loads(_raw_content)
+                    _is_truncated = bool(_content_json.get("truncated"))
+                    _total_len = int(_content_json.get("total_length") or 0)
+                    _shown_len = len(str(_content_json.get("content") or ""))
+                    _truncated_chars = max(0, _total_len - _shown_len) if _is_truncated else 0
+                except Exception:
+                    _is_truncated = "[truncated" in _raw_content.lower()
+                    _truncated_chars = 0
+                _enriched_content = enrich_tool_result_content(
+                    tool_result.tool_name,
+                    _raw_content,
+                    arguments=dict(tool_call.arguments or {}),
+                    is_truncated=_is_truncated,
+                    truncated_chars=_truncated_chars,
+                ) if tool_result.success else _raw_content
+
                 result_payload = {
                     "tool_name": tool_result.tool_name,
                     "success": tool_result.success,
-                    "content": tool_result.content,
+                    "content": _enriched_content,
                     "arguments": dict(tool_call.arguments or {}),
                 }
                 tool_results.append(result_payload)
@@ -1146,7 +1246,12 @@ class RunEngine:
             )
 
             verification = {"supported": True, "issues": [], "confidence": 0.0}
-            if self.orchestrator is not None:
+            # Skip verification for runs that need no external grounding:
+            # direct-fact-memory-only answers come from deterministic facts,
+            # and no-tool runs have nothing to ground-check.
+            _plan_route = str(structured_plan.get("route_type", ""))
+            _skip_verify = direct_fact_memory_only or (not tool_results and _plan_route in {"trivial_chat", "memory_recall"})
+            if self.orchestrator is not None and not _skip_verify:
                 verification_packet = self._compile_phase_packet(
                     context_engine=active_context_engine,
                     run_id=run.run_id,
@@ -1173,6 +1278,7 @@ class RunEngine:
                     tool_results=tool_results,
                     model=request.planner_model or session_model,
                     compiled_context=verification_packet.content,
+                    route_type=_plan_route,
                 )
                 self._trace(
                     request=request,
@@ -1329,6 +1435,7 @@ class RunEngine:
         allowed_tools: list[str],
         tool_results: list[dict[str, Any]],
         context_block: str,
+        argument_clues: Optional[dict[str, str]] = None,
     ) -> Optional[ToolCall]:
         available_names = [name for name in allowed_tools if self.tool_registry.get(name) is not None]
         if not available_names:
@@ -1352,6 +1459,7 @@ class RunEngine:
                     allowed_tools=available_names,
                     tool_results=tool_results,
                     context_block=context_block,
+                    argument_clues=argument_clues,
                 ),
             },
         ]
@@ -1392,6 +1500,7 @@ class RunEngine:
         allowed_tools: list[str],
         tool_results: list[dict[str, Any]],
         context_block: str,
+        argument_clues: Optional[dict[str, str]] = None,
     ) -> str:
         return build_actor_request_content(
             user_message=request.user_message,
@@ -1401,6 +1510,7 @@ class RunEngine:
             tool_results=tool_results,
             context_block=context_block,
             clip_text=self._clip,
+            argument_clues=argument_clues,
         )
 
     @staticmethod
@@ -1742,6 +1852,8 @@ class RunEngine:
         execution_risk_tier: str = "",
         correction_turn: bool = False,
         direct_fact_memory_only: bool = False,
+        available_loci: Optional[list[dict[str, str]]] = None,
+        planned_locus_id: str = "",
     ) -> CompiledPassPacket:
         inferred_correction_turn = correction_turn or bool(
             re.search(r"\b(actually|instead|correction|updated|changed|not .* anymore|moved to|call me)\b", request.user_message or "", re.IGNORECASE)
@@ -1776,6 +1888,8 @@ class RunEngine:
                 execution_risk_tier=execution_risk_tier,
                 correction_turn=inferred_correction_turn,
                 direct_fact_memory_only=inferred_direct_fact_memory_only,
+                available_loci=available_loci,
+                planned_locus_id=planned_locus_id,
             ),
         )
         phase_trace = dict(packet.trace)

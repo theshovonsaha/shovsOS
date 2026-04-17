@@ -168,8 +168,6 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   setShowObserverActivity,
   embedModels,
 }) => {
-  const nextContextMode =
-    contextMode === 'v1' ? 'v2' : contextMode === 'v2' ? 'v3' : 'v1';
   const [memories, setMemories] = useState<Memory[]>([]);
   const [total, setTotal] = useState(0);
   const [searchQuery, setSearchQuery] = useState('');
@@ -744,31 +742,39 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 fontWeight: 600,
               }}
             >
-              Context Engine Mode
+              Context Engine
             </label>
-            <button
-              className='memory-refresh-btn'
-              style={{ width: '100%' }}
-              onClick={() => setSessionContextMode(nextContextMode)}
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '6px 10px',
+                background: 'var(--bg-input)',
+                borderRadius: '6px',
+                border: '1px solid var(--border-color)',
+                fontSize: '13px',
+                color: 'var(--text-primary)',
+              }}
             >
-              {contextMode === 'v1'
-                ? '📋 V1 Linear'
+              <span style={{ opacity: 0.6 }}>&#9679;</span>
+              {contextMode === 'v3'
+                ? 'V3 Hybrid — durable anchors + convergent goal ranking'
                 : contextMode === 'v2'
-                  ? '⚡ V2 Convergent'
-                  : '🧠 V3 Hybrid'}
-            </button>
+                  ? 'V2 Convergent — active-goal ranked modules'
+                  : 'V1 Linear — durable bullet compression'}
+            </div>
             <p
               className='settings-help'
               style={{
-                marginTop: '8px',
+                marginTop: '6px',
                 fontSize: '11px',
                 color: 'var(--text-dim)',
                 lineHeight: 1.4,
               }}
             >
-              Per-session toggle. V1 stores linear durable memory. V2 ranks
-              convergent modules by active goals. V3 combines both as an
-              experimental hybrid.
+              Managed by agent profile. V3 is the default and combines stable
+              fact memory with active-goal relevance ranking.
             </p>
           </div>
 

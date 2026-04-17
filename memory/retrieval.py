@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from time import perf_counter
 from typing import Optional
@@ -12,38 +13,175 @@ from engine.direct_fact_policy import direct_fact_predicates, normalize_memory_p
 
 
 _STOPWORDS = {
-    "the",
-    "a",
-    "an",
-    "is",
-    "it",
-    "in",
-    "on",
-    "at",
-    "to",
-    "for",
-    "of",
-    "and",
-    "or",
-    "but",
-    "not",
-    "with",
-    "by",
-    "from",
-    "as",
-    "this",
-    "that",
-    "what",
-    "which",
-    "who",
-    "my",
-    "your",
+    "the", "a", "an", "is", "it", "in", "on", "at", "to", "for",
+    "of", "and", "or", "but", "not", "with", "by", "from", "as",
+    "this", "that", "what", "which", "who", "my", "your",
 }
 
+# ── Query sanitizer (adapted from mempalace/query_sanitizer.py) ────────────
+# Problem: agents sometimes prepend system prompts (2000+ chars) to memory
+# queries, causing near-total retrieval failure because the embedding vector
+# is dominated by the system prompt rather than the actual question.
+# Recovery: extract the actual question from the tail of the contaminated query.
 
-def _tokenize(text: str) -> set[str]:
+_SAFE_QUERY_LENGTH = 200   # Below this: almost certainly clean
+_MAX_QUERY_LENGTH = 250    # Hard cap on extracted query length
+_MIN_QUERY_LENGTH = 10     # Extracted result shorter than this = failed
+_QUESTION_MARK_RE = re.compile(r"[?？]\s*[\"']?\s*$")
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?。！？\n]+")
+_QUOTE_CHARS = {"'", '"'}
+
+
+def _sanitize_query(raw_query: str) -> str:
+    """
+    Extract the actual search intent from a potentially prompt-contaminated query.
+    Uses tail-extraction: system prompts are prepended, so the real query is last.
+    """
+    if not raw_query or not raw_query.strip():
+        return raw_query or ""
+    raw_query = raw_query.strip()
+    if len(raw_query) <= _SAFE_QUERY_LENGTH:
+        return raw_query
+
+    def _strip_quotes(s: str) -> str:
+        s = s.strip()
+        while len(s) >= 2 and s[:1] in _QUOTE_CHARS and s[:1] == s[-1:]:
+            s = s[1:-1].strip()
+        return s
+
+    def _trim(candidate: str) -> str:
+        candidate = _strip_quotes(candidate)
+        if len(candidate) <= _MAX_QUERY_LENGTH:
+            return candidate
+        frags = [_strip_quotes(f) for f in _SENTENCE_SPLIT_RE.split(candidate) if f.strip()]
+        for frag in reversed(frags):
+            if _MIN_QUERY_LENGTH <= len(frag) <= _MAX_QUERY_LENGTH:
+                return frag
+        return candidate[-_MAX_QUERY_LENGTH:].strip()
+
+    segments = [s.strip() for s in raw_query.split("\n") if s.strip()]
+
+    # Step 1: look for a question-mark sentence (most reliable signal)
+    for seg in reversed(segments):
+        if _QUESTION_MARK_RE.search(seg) and len(seg) >= _MIN_QUERY_LENGTH:
+            candidate = _trim(seg)
+            if len(candidate) >= _MIN_QUERY_LENGTH:
+                log("memory", "retrieval", f"Query sanitized via question extraction: {len(raw_query)}→{len(candidate)} chars")
+                return candidate
+
+    # Step 2: last meaningful line (system prompts are prepended, query is last)
+    for seg in reversed(segments):
+        if len(seg) >= _MIN_QUERY_LENGTH:
+            candidate = _trim(seg)
+            if len(candidate) >= _MIN_QUERY_LENGTH:
+                log("memory", "retrieval", f"Query sanitized via tail extraction: {len(raw_query)}→{len(candidate)} chars")
+                return candidate
+
+    # Step 3: hard tail truncation
+    return raw_query[-_MAX_QUERY_LENGTH:].strip()
+
+
+# ── BM25 hybrid re-ranker (adapted from mempalace/searcher.py) ─────────────
+# After vector retrieval produces a candidate set, BM25 re-ranks it using
+# term-frequency overlap. This recovers exact-phrase queries that embeddings
+# can miss (e.g. "what did I say about Stripe" where "Stripe" is a keyword).
+
+def _tokenize(text: str) -> list[str]:
     cleaned = re.sub(r"[^\w\s]", " ", (text or "").lower())
-    return {token for token in cleaned.split() if len(token) > 2 and token not in _STOPWORDS}
+    return [token for token in cleaned.split() if len(token) > 2 and token not in _STOPWORDS]
+
+
+def _tokenize_set(text: str) -> set[str]:
+    return set(_tokenize(text))
+
+
+def _bm25_scores(query: str, documents: list[str], k1: float = 1.5, b: float = 0.75) -> list[float]:
+    """
+    Okapi-BM25 with Lucene-smoothed IDF. Safe for small candidate sets (re-ranking only).
+    IDF computed over the provided corpus so rare-in-candidates terms score higher.
+    """
+    n_docs = len(documents)
+    query_terms = set(_tokenize(query))
+    if not query_terms or n_docs == 0:
+        return [0.0] * n_docs
+
+    tokenized = [_tokenize(d) for d in documents]
+    doc_lens = [len(toks) for toks in tokenized]
+    avgdl = sum(doc_lens) / n_docs or 1.0
+
+    df: dict[str, int] = {term: 0 for term in query_terms}
+    for toks in tokenized:
+        seen = set(toks) & query_terms
+        for term in seen:
+            df[term] += 1
+
+    idf = {
+        term: math.log((n_docs - df[term] + 0.5) / (df[term] + 0.5) + 1)
+        for term in query_terms
+    }
+
+    scores: list[float] = []
+    for toks, dl in zip(tokenized, doc_lens):
+        if dl == 0:
+            scores.append(0.0)
+            continue
+        tf: dict[str, int] = {}
+        for t in toks:
+            if t in query_terms:
+                tf[t] = tf.get(t, 0) + 1
+        score = 0.0
+        for term, freq in tf.items():
+            num = freq * (k1 + 1)
+            den = freq + k1 * (1 - b + b * dl / avgdl)
+            score += idf[term] * num / den
+        scores.append(score)
+    return scores
+
+
+def _hybrid_rerank(
+    hits: list["_Hit"],
+    query: str,
+    *,
+    vector_weight: float = 0.6,
+    bm25_weight: float = 0.4,
+) -> list["_Hit"]:
+    """
+    Re-rank a vector-retrieved candidate set using BM25 as a secondary signal.
+    Convex combination: final_score = 0.6 * vector_sim + 0.4 * bm25_norm.
+    Deterministic-fact hits (score ≥ 0.97) are pinned at the top and bypass re-ranking.
+    """
+    if len(hits) < 2:
+        return hits
+
+    # Split: pinned (deterministic facts) stay at top; rest get re-ranked.
+    pinned = [h for h in hits if h.score >= 0.97]
+    candidates = [h for h in hits if h.score < 0.97]
+    if not candidates:
+        return hits
+
+    def _hit_text(h: "_Hit") -> str:
+        p = h.payload
+        parts = [
+            str(p.get("subject") or ""),
+            str(p.get("predicate") or ""),
+            str(p.get("object") or ""),
+            str(p.get("anchor") or ""),
+            str(p.get("content") or ""),
+        ]
+        return " ".join(filter(None, parts))
+
+    docs = [_hit_text(h) for h in candidates]
+    bm25_raw = _bm25_scores(query, docs)
+    max_bm25 = max(bm25_raw) if bm25_raw else 0.0
+    bm25_norm = [s / max_bm25 for s in bm25_raw] if max_bm25 > 0 else [0.0] * len(bm25_raw)
+
+    for hit, raw, norm in zip(candidates, bm25_raw, bm25_norm):
+        vec_sim = min(hit.score, 1.0)  # already normalised in [0,1]
+        hit.score = round(vector_weight * vec_sim + bm25_weight * norm, 4)
+        hit.payload["bm25_score"] = round(raw, 3)
+
+    reranked = sorted(candidates, key=lambda h: h.score, reverse=True)
+    return pinned + reranked
 
 
 def _detect_locus_from_query(query: str, graph: SemanticGraph, owner_id: Optional[str] = None) -> Optional[str]:
@@ -55,7 +193,7 @@ def _detect_locus_from_query(query: str, graph: SemanticGraph, owner_id: Optiona
     if not loci:
         return None
     
-    q_tokens = _tokenize(query)
+    q_tokens = _tokenize_set(query)
     for locus in loci:
         lid = str(locus.get("id", "")).lower()
         lname = str(locus.get("name", "")).lower()
@@ -72,10 +210,10 @@ def _detect_locus_from_query(query: str, graph: SemanticGraph, owner_id: Optiona
 
 
 def _lexical_overlap_score(query: str, text: str) -> float:
-    q_tokens = _tokenize(query)
+    q_tokens = _tokenize_set(query)
     if not q_tokens:
         return 0.0
-    t_tokens = _tokenize(text)
+    t_tokens = _tokenize_set(text)
     if not t_tokens:
         return 0.0
     overlap = len(q_tokens & t_tokens)
@@ -170,6 +308,10 @@ async def unified_memory_search(
     search_limit = max(safe_top_k * 3, 12)
     graph = graph or SemanticGraph()
     owner_scope = owner_id if owner_id is not None else None
+
+    # Guard: sanitize the query before embedding — prevents system-prompt
+    # contamination from silently destroying retrieval quality.
+    query = _sanitize_query(query)
 
     # Step 0: Spatial Scan (Auto-detect Locus if not explicitly provided)
     if not locus_id:
@@ -336,7 +478,13 @@ async def unified_memory_search(
             )
             source_counts["vector_engine"] += 1
 
-    ranked = sorted(merged.values(), key=lambda hit: hit.score, reverse=True)[:safe_top_k]
+    # BM25 hybrid re-rank: vector retrieval provides the candidate pool;
+    # BM25 corrects ordering for exact-phrase queries that embeddings can miss.
+    # Deterministic facts (score ≥ 0.97) are pinned at the top and bypass re-ranking.
+    all_candidates = sorted(merged.values(), key=lambda hit: hit.score, reverse=True)
+    reranked = _hybrid_rerank(all_candidates, query)
+    ranked = reranked[:safe_top_k]
+
     duration_ms = round((perf_counter() - started) * 1000.0, 2)
     results = []
     for hit in ranked:
@@ -355,5 +503,6 @@ async def unified_memory_search(
             "source_counts": source_counts,
             "suppressed_conflicts": suppressed_conflicts,
             "session_scoped": bool(session_id),
+            "bm25_applied": len(all_candidates) >= 2,
         },
     }

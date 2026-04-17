@@ -10,10 +10,13 @@ You are the [Shovs Orchestrator]. Choose the smallest reliable next-step plan fo
 Available Tools:
 {tools_docs}
 
-{skills_block}Session Signals:
+{skills_block}{loci_block}Session Signals:
 - session_has_history: {session_has_history}
 - current_fact_count: {current_fact_count}
 - recently_failed_tools: {failed_tools}
+- code_intent: {code_intent_note}
+- execution_risk_tier: {risk_tier}
+- conversation_tension: {tension_summary}
 
 Phase Context:
 {compiled_context}
@@ -22,19 +25,26 @@ Rules:
 - Preserve exact user entities, domains, URLs, file names, tickers, and keywords unless the context clearly justifies normalization.
 - Prefer the minimum tool set needed for the next useful step, not every possible step.
 - Do not broaden or weaken the user's query with filler like "related to", "about", or "similar to" unless that expansion is clearly necessary.
+- If execution_risk_tier is "high" or "critical", prefer clarification or a single safe probe over broad multi-step execution. Do not pile on artifact tools (file_create, bash) without evidence the task is scoped.
+- If conversation_tension is non-empty, the planner must explicitly reflect the tension in its strategy string and avoid tools that would write artifacts based on the contradicted state.
 - If the phase context shows contradiction or drift between the user's current turn and earlier user-stated facts, preserve that tension. Do not silently smooth it over.
 - If answering depends on a contradicted user fact, prefer a plan that helps clarify or verify the conflict instead of pretending the tension does not exist.
 - For exact-domain product or company research, prefer first-party evidence before third-party commentary.
 - If the user asks what a product costs or what plans exist, prefer fetching the exact pricing page before concluding.
 - If the user asks whether a product is good, trustworthy, or recommendable, gather first-party feature/pricing evidence before finalizing.
 - If the task clearly matches an Available Skill, include "skill": "skill_name" in your response so the runtime can load specialized instructions.
+- MEMORY-FIRST: For any recall, research, or "do you remember" query — check memory before web_search. If a named locus exists for the topic, use shovs_memory_query with that locus_id.
 - Conversational queries ("hi", "how are you", opinions) → return []
 - Factual/current data → ["web_search"]
 - URL reading → ["web_fetch"]
 - File creation/editing → ["file_create"] or ["file_str_replace"]
 - Image lookup → ["image_search"]
 - Weather → ["weather_fetch"]
-- Memory recall → ["query_memory"]
+- Memory recall (general) → ["query_memory"]
+- Memory recall (spatial/locus) → ["shovs_memory_query"] with locus_id when a matching locus exists
+- Create a named research area / locus → ["shovs_create_locus"]
+- List all loci / memory rooms → ["shovs_list_loci"]
+- Store fact to a specific locus → ["shovs_memory_store"]
 - Delegation → ["delegate_to_agent"]
 - Use `todo_write` only when multi-step task tracking will materially help several later steps. Do not use task tools as a substitute for substantive work.
 - For direct commands like "web search X" or "research X", prefer the substantive research tool first. Add task tools only when they clearly help the run stay organized.
@@ -49,6 +59,7 @@ Return ONLY JSON (no markdown). Preferred format:
   ],
   "force_memory": true/false,
   "memory_topic": "topic or empty",
+  "locus_id": "locus_id if spatial memory is targeted or empty",
   "confidence": 0.0-1.0
 }}
 
@@ -417,6 +428,10 @@ class AgenticOrchestrator:
         failed_tools: Optional[List[str]] = None,
         compiled_context: Optional[str] = None,
         skills_list: Optional[List[Dict[str, str]]] = None,
+        available_loci: Optional[List[Dict[str, str]]] = None,
+        code_intent_note: str = "none",
+        risk_tier: str = "standard",
+        tension_summary: str = "none",
     ) -> Dict[str, Any]:
         """Analyze query and return structured execution guidance."""
         tools_docs = "\n".join([f"- {t['name']}: {t['description']}" for t in tools_list])
@@ -429,11 +444,33 @@ class AgenticOrchestrator:
             if skill_lines:
                 skills_block = "Available Skills:\n" + "\n".join(skill_lines) + "\n\n"
 
+        loci_block = ""
+        if available_loci:
+            loci_lines = [
+                f"- {l.get('id', '')}: {l.get('name', '')} — {l.get('description', '') or 'no description'}"
+                for l in available_loci
+                if isinstance(l, dict) and l.get("id")
+            ]
+            if loci_lines:
+                loci_block = "Memory Palace Loci (named research rooms):\n" + "\n".join(loci_lines) + "\n\n"
+
         route_type = self.classify_route(
             query,
             session_has_history=session_has_history,
             current_fact_count=current_fact_count,
         )
+
+        # If a locus matches the query, prefer shovs_memory_query over flat query_memory
+        # for the memory_recall deterministic short-circuit path.
+        _spatial_locus_id = ""
+        if available_loci:
+            q_lower = query.lower()
+            for _locus in available_loci:
+                lid = str(_locus.get("id", "")).lower()
+                lname = str(_locus.get("name", "")).lower()
+                if lid and (lid in q_lower or lname in q_lower):
+                    _spatial_locus_id = str(_locus.get("id", ""))
+                    break
 
         deterministic_tools: list[dict[str, str]] = []
         if route_type == "trivial_chat":
@@ -441,6 +478,7 @@ class AgenticOrchestrator:
                 "strategy": "No tools needed for a trivial conversational turn.",
                 "tools": [],
                 "skill": "",
+                "locus_id": "",
                 "force_memory": False,
                 "memory_topic": "",
                 "confidence": 0.98,
@@ -452,10 +490,11 @@ class AgenticOrchestrator:
         elif (
             route_type == "memory_recall"
             and _memory_recall_can_short_circuit(query)
-            and "query_memory" in known_tools
-            and "query_memory" not in failed_set
         ):
-            deterministic_tools.append({"name": "query_memory", "priority": "high", "reason": "Memory recall intent detected."})
+            if _spatial_locus_id and "shovs_memory_query" in known_tools and "shovs_memory_query" not in failed_set:
+                deterministic_tools.append({"name": "shovs_memory_query", "priority": "high", "reason": f"Spatial memory recall — locus '{_spatial_locus_id}' matches query."})
+            elif "query_memory" in known_tools and "query_memory" not in failed_set:
+                deterministic_tools.append({"name": "query_memory", "priority": "high", "reason": "Memory recall intent detected."})
         elif route_type == "direct_fact" and "web_search" in known_tools and "web_search" not in failed_set:
             deterministic_tools.append({"name": "web_search", "priority": "high", "reason": "Deterministic factual/current query route."})
 
@@ -464,6 +503,7 @@ class AgenticOrchestrator:
                 "strategy": "Use deterministic route-selected tools before final answer.",
                 "tools": deterministic_tools,
                 "skill": "",
+                "locus_id": _spatial_locus_id,
                 "force_memory": route_type == "memory_recall",
                 "memory_topic": query[:80],
                 "confidence": 0.9,
@@ -474,10 +514,14 @@ class AgenticOrchestrator:
         prompt = PLANNING_PROMPT.format(
             tools_docs=tools_docs,
             skills_block=skills_block,
+            loci_block=loci_block,
             query=query,
             session_has_history=str(bool(session_has_history)).lower(),
             current_fact_count=current_fact_count,
             failed_tools=", ".join(sorted(failed_set)) if failed_set else "none",
+            code_intent_note=str(code_intent_note or "none").strip() or "none",
+            risk_tier=str(risk_tier or "standard").strip() or "standard",
+            tension_summary=str(tension_summary or "none").strip() or "none",
             compiled_context=(compiled_context.strip() if compiled_context else "none"),
         )
         
@@ -583,10 +627,14 @@ class AgenticOrchestrator:
                 failed_tools=failed_set,
             )
 
+            # If planner targeted a locus, use it; otherwise fall back to spatial scan result.
+            planned_locus_id = str(payload.get("locus_id", "")).strip() or _spatial_locus_id
+
             structured = {
                 "strategy": str(payload.get("strategy", "Use selected tools to gather evidence before final answer.")),
                 "tools": tools,
                 "skill": str(payload.get("skill", "")).strip(),
+                "locus_id": planned_locus_id,
                 "force_memory": bool(payload.get("force_memory", session_has_history or current_fact_count > 0)),
                 "memory_topic": str(payload.get("memory_topic", query[:80])).strip(),
                 "confidence": float(payload.get("confidence", 0.5)),
@@ -601,6 +649,7 @@ class AgenticOrchestrator:
                 "strategy": "Planner failed; continue with direct reasoning.",
                 "tools": [],
                 "skill": "",
+                "locus_id": "",
                 "force_memory": False,
                 "memory_topic": "",
                 "confidence": 0.0,
@@ -651,6 +700,47 @@ class AgenticOrchestrator:
                 "notes": "",
                 "confidence": 0.2,
             }
+
+        # ── Pre-LLM deterministic short-circuits ─────────────────────────────
+        # These avoid a full LLM observation call when the outcome is obvious.
+        _all_failed = len(failed_tools) == len(tool_results)
+        _all_succeeded = successful_count == len(tool_results)
+        _rich_single = (
+            len(tool_results) == 1
+            and successful_count == 1
+            and len(str(tool_results[0].get("content") or "")) > 150
+        )
+
+        # If every tool failed, nothing to continue with — finalize immediately.
+        if _all_failed:
+            return {
+                "status": "finalize",
+                "strategy": "All tools failed; actor will explain what is missing.",
+                "tools": [],
+                "notes": "All attempted tools failed. Do not retry; answer from available context.",
+                "confidence": 0.85,
+            }
+
+        # Single successful tool with substantial content → check gap actions
+        # heuristically first; skip LLM if no gap is detected.
+        if _rich_single:
+            heuristic_early = _infer_observation_gap_actions(
+                query=query,
+                tool_results=tool_results,
+                known_tools=known_tools,
+                failed_tools=failed_tools,
+            )
+            if heuristic_early:
+                return heuristic_early
+            # No gap detected — finalize without LLM call.
+            return {
+                "status": "finalize",
+                "strategy": "Single tool returned sufficient evidence.",
+                "tools": [],
+                "notes": "",
+                "confidence": 0.88,
+            }
+        # ── End pre-LLM short-circuits ────────────────────────────────────────
 
         prompt = OBSERVATION_PROMPT.format(
             query=query,
@@ -729,7 +819,17 @@ class AgenticOrchestrator:
         tool_results: List[Dict[str, Any]],
         model: str = "llama3.1:8b",
         compiled_context: Optional[str] = None,
+        route_type: str = "",
     ) -> Dict[str, Any]:
+        # Skip verification for routes where there is nothing to ground-check.
+        # trivial_chat: no factual claims made.
+        # memory_recall: actor is synthesizing from deterministic facts, not
+        #   inventing external claims — verification would be noise.
+        # url_fetch with no tool results: nothing was fetched.
+        _skip_routes = {"trivial_chat", "memory_recall"}
+        if route_type in _skip_routes:
+            return {"supported": True, "issues": [], "confidence": 1.0, "skipped": True}
+
         formatted_results = []
         for item in tool_results or []:
             name = str(item.get("tool_name") or item.get("tool") or "unknown")

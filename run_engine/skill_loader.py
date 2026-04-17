@@ -4,12 +4,22 @@ Skill Loader
 Reads SKILL.md files from the workspace skill directory.
 Strips YAML frontmatter and returns the instruction body.
 Returns empty string gracefully if skill is not found.
+
+Frontmatter fields supported:
+  name        — display name (defaults to dir name)
+  description — one-line summary used by the planner
+  triggers    — comma-separated keywords that activate the skill automatically
+  requirements — comma-separated tool/capability names this skill needs
+  eligibility — "always" | "explicit_only" | "auto" (default: "auto")
+                always      → always inject into context
+                explicit_only → only when user or planner explicitly names it
+                auto        → activated by trigger match (default)
 """
 
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +38,28 @@ class SkillManifest:
     name: str
     description: str
     body: str
+    triggers: list[str] = field(default_factory=list)
+    requirements: list[str] = field(default_factory=list)
+    eligibility: str = "auto"  # "always" | "explicit_only" | "auto"
+
+    def matches_message(self, message: str) -> bool:
+        """Return True if any trigger keyword appears in the message (case-insensitive)."""
+        if not self.triggers:
+            return False
+        lower = message.lower()
+        return any(t.lower() in lower for t in self.triggers)
+
+    def is_eligible_for_auto(self, message: str, available_tools: list[str]) -> bool:
+        """Return True if this skill should be auto-activated for the given message/tools."""
+        if self.eligibility == "always":
+            return True
+        if self.eligibility == "explicit_only":
+            return False
+        # "auto" — activate if triggers match and required tools are present
+        if self.requirements and available_tools:
+            if not all(r in available_tools for r in self.requirements):
+                return False
+        return self.matches_message(message)
 
 
 def _strip_yaml_frontmatter(content: str) -> tuple[dict[str, str], str]:

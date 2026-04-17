@@ -59,6 +59,8 @@ class PacketBuildInputs:
     execution_risk_tier: str = ""
     correction_turn: bool = False
     direct_fact_memory_only: bool = False
+    available_loci: Optional[list[dict[str, str]]] = None
+    planned_locus_id: str = ""
 
 
 def build_phase_packet(
@@ -371,6 +373,46 @@ def build_phase_packet(
                     priority=40,
                     max_chars=500,
                     trace_id="run_engine:phase_guidance",
+                    phase_visibility=frozenset({
+                        ContextPhase.PLANNING,
+                        ContextPhase.ACTING,
+                    }),
+                )
+            )
+
+    # ── Memory Palace loci context (PLANNING + ACTING only) ──────────────────
+    if inputs.available_loci:
+        loci_lines = []
+        for locus in inputs.available_loci:
+            lid = str(locus.get("id", "")).strip()
+            lname = str(locus.get("name", "")).strip()
+            ldesc = str(locus.get("description", "")).strip()
+            if not lid:
+                continue
+            line = f"- {lid}: {lname}"
+            if ldesc:
+                line += f" — {ldesc}"
+            if inputs.planned_locus_id and lid == inputs.planned_locus_id:
+                line += " [TARGETED]"
+            loci_lines.append(line)
+        if loci_lines:
+            loci_content = "Named loci in Memory Palace:\n" + "\n".join(loci_lines)
+            if inputs.planned_locus_id:
+                loci_content += f"\n\nActive locus: {inputs.planned_locus_id} — use shovs_memory_query with locus_id=\"{inputs.planned_locus_id}\" to query it."
+            items.append(
+                ContextItem(
+                    item_id="memory_palace_loci",
+                    kind=ContextKind.MEMORY,
+                    title="Memory Palace",
+                    content=loci_content,
+                    source="semantic_graph",
+                    priority=38,
+                    max_chars=600,
+                    trace_id="run_engine:memory_palace_loci",
+                    provenance={
+                        "loci_count": len(loci_lines),
+                        "planned_locus_id": inputs.planned_locus_id or "",
+                    },
                     phase_visibility=frozenset({
                         ContextPhase.PLANNING,
                         ContextPhase.ACTING,

@@ -40,13 +40,18 @@ async def _get_platform_manifest() -> str:
     }
     return json.dumps(manifest, indent=2)
 
-async def _spatial_query(query: str, locus_id: Optional[str] = None, _owner_id: Optional[str] = None) -> str:
-    """Query the Shovs memory system (Relational + Spatial)."""
+async def _spatial_query(query: Optional[str] = None, topic: Optional[str] = None, locus_id: Optional[str] = None, _owner_id: Optional[str] = None) -> str:
+    """Query the Shovs memory system (Relational + Spatial). Accepts 'query' or 'topic' interchangeably."""
     if not _graph:
         return "Memory graph not available."
-    
+
+    # Accept either 'query' or 'topic' — LLMs sometimes use the wrong alias.
+    search_term = (query or topic or "").strip()
+    if not search_term:
+        return "shovs_memory_query requires a 'query' (or 'topic') argument."
+
     results = await unified_memory_search(
-        query=query,
+        query=search_term,
         owner_id=_owner_id,
         locus_id=locus_id,
         graph=_graph
@@ -115,14 +120,15 @@ GET_MANIFEST_TOOL = Tool(
 
 SPATIAL_QUERY_TOOL = Tool(
     name="shovs_memory_query",
-    description="Perform a unified semantic and spatial search across Shovs OS memory.",
+    description="Perform a unified semantic and spatial search across Shovs OS memory. Use 'query' (or alias 'topic') for the search term.",
     parameters={
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "The search query"},
+            "query": {"type": "string", "description": "The search query (also accepted as 'topic')"},
+            "topic": {"type": "string", "description": "Alias for 'query' — use either one"},
             "locus_id": {"type": "string", "description": "Optional: Focus search within a specific spatial room ID"}
         },
-        "required": ["query"]
+        "required": []
     },
     handler=_spatial_query,
     tags=["meta", "memory"]
@@ -153,8 +159,29 @@ LIST_LOCI_TOOL = Tool(
     tags=["meta", "memory", "spatial"]
 )
 
+CREATE_LOCUS_TOOL = Tool(
+    name="shovs_create_locus",
+    description=(
+        "Explicitly create a named spatial room (Locus) in the Memory Palace. "
+        "Use this when the user requests a dedicated locus for a topic, project, or research area. "
+        "After creation, anchor future facts to this locus via shovs_memory_store."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "locus_id": {"type": "string", "description": "Unique identifier for this locus (e.g. 'MUMBAI_RESEARCH_2026')"},
+            "name": {"type": "string", "description": "Human-readable name (defaults to locus_id)"},
+            "description": {"type": "string", "description": "What this locus stores / its purpose"},
+        },
+        "required": ["locus_id"]
+    },
+    handler=_create_locus,
+    tags=["meta", "memory", "spatial"]
+)
+
 def register_gateway_tools(registry: ToolRegistry):
     registry.register(GET_MANIFEST_TOOL)
     registry.register(SPATIAL_QUERY_TOOL)
     registry.register(SPATIAL_STORE_TOOL)
     registry.register(LIST_LOCI_TOOL)
+    registry.register(CREATE_LOCUS_TOOL)

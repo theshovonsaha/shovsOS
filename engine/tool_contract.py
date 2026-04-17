@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 
@@ -97,6 +98,132 @@ def tool_call_signature(tool_name: str, arguments: dict[str, Any] | None = None)
 
 def is_retry_sensitive_tool(tool_name: str) -> bool:
     return str(tool_name or "").lower() in {"web_search", "web_fetch"}
+
+
+# ── AI-readable tool result signals ─────────────────────────────────────────
+#
+# These signals are appended to tool result content so the actor LLM knows
+# what to do next without having to infer it from raw content alone.
+#
+# Signal format (always at end of content, one per line):
+#   [READ_MORE: <url>]       — fetch this URL next to get more detail
+#   [KEY_FACT: <text>]       — a fact worth hardening to memory
+#   [NEXT_PROBE: <query>]    — a better follow-up search query
+#   [TRUNCATED: <n> chars]   — content was cut; fetch URL for full version
+#   [NO_RESULTS]             — search returned nothing useful
+#   [AUTH_REQUIRED]          — page requires login; try a different source
+#
+# The actor prompt instructs the LLM to read these signals.
+
+
+_URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+_PRICING_RE = re.compile(r"\b(pricing|plans?|cost|tiers?|subscribe)\b", re.IGNORECASE)
+_LOGIN_RE = re.compile(r"\b(sign in|log in|login|register|subscribe to read|paywall|members only)\b", re.IGNORECASE)
+
+
+def generate_tool_signals(
+    tool_name: str,
+    content: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    is_truncated: bool = False,
+    truncated_chars: int = 0,
+) -> list[str]:
+    """
+    Inspect a tool result and emit AI-readable signals.
+    Returns a list of signal strings to append to the content.
+    """
+    signals: list[str] = []
+    tool = str(tool_name or "").lower()
+    text = str(content or "")
+
+    if tool == "web_search":
+        # Parse JSON search results to extract best candidate URL for follow-up fetch.
+        try:
+            payload = json.loads(text)
+            results = payload.get("results") or payload.get("organic_results") or []
+            if isinstance(results, list) and results:
+                # Best URL = first result that has a snippet
+                best_url = ""
+                for r in results[:5]:
+                    u = str(r.get("url") or r.get("link") or "").strip()
+                    snippet = str(r.get("snippet") or r.get("description") or "").strip()
+                    if u.startswith("http") and snippet:
+                        best_url = u
+                        break
+                if not best_url and results:
+                    candidate = str(results[0].get("url") or results[0].get("link") or "").strip()
+                    if candidate.startswith("http"):
+                        best_url = candidate
+                if best_url:
+                    signals.append(f"[READ_MORE: {best_url}]")
+
+                # Suggest a pricing-focused follow-up if the query looks commercial
+                query = str((arguments or {}).get("query", "")).lower()
+                if _PRICING_RE.search(query) and best_url:
+                    host = re.match(r"https?://[^/]+", best_url)
+                    if host:
+                        signals.append(f"[NEXT_PROBE: {host.group(0)}/pricing]")
+
+                if not results:
+                    signals.append("[NO_RESULTS]")
+        except (json.JSONDecodeError, AttributeError):
+            # Plain-text search result — extract first URL found
+            urls = _URL_RE.findall(text)
+            if urls:
+                signals.append(f"[READ_MORE: {urls[0]}]")
+            else:
+                signals.append("[NO_RESULTS]")
+
+    elif tool == "web_fetch":
+        if _LOGIN_RE.search(text[:500]):
+            signals.append("[AUTH_REQUIRED]")
+            fetched_url = str((arguments or {}).get("url", ""))
+            if fetched_url:
+                signals.append(f"[NEXT_PROBE: site:{fetched_url.split('/')[2]} pricing OR plans]")
+        if is_truncated and truncated_chars > 0:
+            fetched_url = str((arguments or {}).get("url", ""))
+            signals.append(f"[TRUNCATED: {truncated_chars} chars remaining]")
+            if fetched_url:
+                signals.append(f"[READ_MORE: {fetched_url}]")
+
+    elif tool == "query_memory":
+        if not text.strip() or text.strip() in {"[]", "{}", "No results", "none"}:
+            signals.append("[NO_RESULTS]")
+        else:
+            # Try to extract a key fact
+            lines = [l.strip() for l in text.splitlines() if l.strip()]
+            if lines:
+                signals.append(f"[KEY_FACT: {lines[0][:120]}]")
+
+    return signals
+
+
+def enrich_tool_result_content(
+    tool_name: str,
+    content: str,
+    *,
+    arguments: dict[str, Any] | None = None,
+    is_truncated: bool = False,
+    truncated_chars: int = 0,
+) -> str:
+    """
+    Append AI-readable signals to a tool result's content string.
+    Safe — returns original content if signal generation fails.
+    """
+    try:
+        signals = generate_tool_signals(
+            tool_name,
+            content,
+            arguments=arguments,
+            is_truncated=is_truncated,
+            truncated_chars=truncated_chars,
+        )
+        if signals:
+            return content.rstrip() + "\n\n" + "\n".join(signals)
+    except Exception:
+        pass
+    return content
 
 
 def canonical_tool_result(

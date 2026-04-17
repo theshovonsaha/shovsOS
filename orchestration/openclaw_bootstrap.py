@@ -24,7 +24,8 @@ from plugins.shovs_meta_gateway import (
     GET_MANIFEST_TOOL,
     SPATIAL_QUERY_TOOL,
     SPATIAL_STORE_TOOL,
-    LIST_LOCI_TOOL
+    LIST_LOCI_TOOL,
+    CREATE_LOCUS_TOOL,
 )
 
 def get_openclaw_skill_manifest():
@@ -52,14 +53,24 @@ def get_openclaw_skill_manifest():
                 "name": LIST_LOCI_TOOL.name,
                 "description": LIST_LOCI_TOOL.description,
                 "parameters": LIST_LOCI_TOOL.parameters
+            },
+            {
+                "name": CREATE_LOCUS_TOOL.name,
+                "description": CREATE_LOCUS_TOOL.description,
+                "parameters": CREATE_LOCUS_TOOL.parameters
             }
         ],
         "system_guidance": (
             "You are operating as a bridged-in agent within Shovs OS. "
-            "Use the 'shovs_' prefixed tools to interact with the host platform's "
-            "spatial memory and tool registry. "
+            "MEMORY-FIRST POLICY: ALWAYS call 'shovs_memory_query' before performing any web_search "
+            "or web_fetch. If the user asks about a known topic or prior research, query memory first. "
+            "Only fall back to web search when memory returns no relevant results. "
+            "Use 'shovs_create_locus' to create a named locus before anchoring facts to it. "
+            "Use 'shovs_list_loci' to enumerate existing rooms in the Memory Palace. "
             "Prioritize 'Compiled Drawers' returned by memory queries as they represent "
-            "high-density synthesized context from the Shovs compiler."
+            "high-density synthesized context from the Shovs compiler. "
+            "Use the 'shovs_' prefixed tools to interact with the host platform's "
+            "spatial memory and tool registry."
         )
     }
 

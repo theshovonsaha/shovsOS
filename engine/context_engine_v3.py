@@ -49,17 +49,30 @@ class ContextEngineV3:
         return self.compression_model
 
     def _split_context(self, current_context: str) -> tuple[str, str]:
-        if not current_context:
+        """
+        Returns (durable_context, convergent_context).
+
+        Migration rules:
+          - Native v3 JSON  → unpack both streams directly.
+          - v2 JSON (__v2__) → treat entire blob as convergent; durable starts empty.
+          - Plain text (v1 bullets) → treat as durable; convergent starts empty.
+          - Empty / unparseable → both empty (fresh session).
+        """
+        if not current_context or not current_context.strip():
             return "", ""
         try:
             payload = json.loads(current_context)
             if payload.get("__v3__"):
                 return payload.get("durable_context", ""), payload.get("convergent_context", "")
             if payload.get("__v2__"):
+                # Migrate v2: the entire JSON blob becomes the convergent stream.
+                # Durable stream starts fresh — v1 will accumulate from next exchange.
                 return "", current_context
-        except Exception:
-            pass
-        return current_context, ""
+            # Unknown JSON shape — treat as durable plain-text fallback.
+            return current_context, ""
+        except (json.JSONDecodeError, ValueError):
+            # Plain-text v1 bullets — migrate to durable stream.
+            return current_context, ""
 
     def _serialize_context(self, durable_context: str, convergent_context: str) -> str:
         payload = {

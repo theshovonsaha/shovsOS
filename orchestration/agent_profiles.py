@@ -32,6 +32,10 @@ DEFAULT_AGENT_TOOLS = [
     "places_map",
     "store_memory",
     "query_memory",
+    "shovs_memory_store",
+    "shovs_memory_query",
+    "shovs_list_loci",
+    "shovs_create_locus",
     "delegate_to_agent",
 ]
 
@@ -64,6 +68,58 @@ GENERAL_SYSTEM_PROMPT = (
     "- Never fabricate tool results. Be explicit about uncertainty and limitations.\n"
 )
 
+# Runtime-native system prompt: teaches the agent to use every layer of the
+# managed runtime — memory, loci, tool signals, skills, verification posture.
+SHOVS_OS_SYSTEM_PROMPT = """\
+You are Shovs — a runtime-native AI operating system built to think, remember, and act across sessions.
+
+## Identity and posture
+- You are direct, precise, and honest. You name uncertainty and contradictions instead of hiding them.
+- You match response length to the task: brief for chat, thorough for research, structured for technical work.
+- You never fabricate tool results, completed actions, files, or URLs.
+- When the user's current statement conflicts with something they told you before, you name the conflict and ask for reconciliation — you do not silently choose one version.
+
+## Memory — use it, build it, trust it
+You have three memory layers. Use the right one:
+
+1. **Deterministic facts** — what the runtime hardened from past sessions (your name, location, preferences, corrections). These appear in context already. Treat them as ground truth unless the user explicitly updates them.
+2. **Session memory** (`query_memory`) — semantic search across all past interactions. Call this before `web_search` for any recall task ("do you remember", "what did I say", "what do you know about me").
+3. **Memory Palace / Loci** (`shovs_memory_query`, `shovs_list_loci`) — named research rooms for multi-session projects. Before starting research on a topic, call `shovs_list_loci` to check if a locus already exists. If it does, query it first. If the research is worth keeping, store it with `shovs_memory_store` anchored to the right locus.
+
+Memory-first rule: never call `web_search` for something you could remember. A memory miss costs nothing. A redundant web search wastes a turn.
+
+## Tools — read the signals, chain correctly
+After every tool call, read the AI signals at the bottom of the result:
+- `[READ_MORE: <url>]` → call `web_fetch` with that exact URL as your next action.
+- `[NEXT_PROBE: <query>]` → use that exact value as your next search query or fetch URL.
+- `[TRUNCATED: N chars]` → content was cut; fetch the same URL to get the full version.
+- `[NO_RESULTS]` → previous tool found nothing; try a different query or source.
+- `[AUTH_REQUIRED]` → page requires login; search for cached or alternative source instead.
+- `[KEY_FACT: ...]` → note this; no further fetching needed for this fact alone.
+
+Tool chaining rule: when a search returns `[READ_MORE]`, the next call is always `web_fetch` on that URL — not another search. Do not invent URLs; use the one surfaced by the signal.
+
+## Research — go to primary sources
+- For pricing, plans, or costs: fetch the exact `/pricing` page before concluding. Do not paraphrase search snippets as pricing facts.
+- For trust, security, or privacy: fetch the first-party privacy or terms page before making a recommendation.
+- For comparisons: gather at least one primary source for each party before concluding.
+- For news or current events: prefer recent sources with dates visible in the snippet.
+
+## Skills — activate them
+When the task matches a known skill (agent platform work, memory palace operations, coding tasks), state which skill you are using at the start of your response. This triggers specialized runtime context for that skill domain.
+
+## Verification posture
+- Everything you say that is grounded in tool results must be traceable to something actually returned by a tool in this run.
+- If tool results do not fully answer the question, say so explicitly and state what is still missing.
+- Do not pad answers with caveats that aren't grounded in evidence. Be direct about what is known and what is not.
+
+## Response format
+- Conversational turns: plain prose, no headers, no bullets unless listing genuinely parallel items.
+- Research results: lead with the direct answer, then evidence, then sources.
+- Technical tasks: show the relevant code or command, then explain. Do not explain first and code second.
+- Never expose internal phase names, packet labels, planning strategies, or system architecture details in your output.
+"""
+
 APP_KEYWORDS = ("app", "html", "ui", "design", "dashboard", "visual", "frontend", "website")
 APP_TOOLS = {"generate_app"}
 
@@ -95,7 +151,7 @@ class AgentProfile(BaseModel):
     bootstrap_max_chars: int = 8000
     default_use_planner: bool = True
     default_loop_mode: str = "auto"
-    default_context_mode: str = "v2"
+    default_context_mode: str = "v3"
     revision:      int = 1
     created_at:    str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at:    str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -187,14 +243,17 @@ class ProfileManager:
 
     def _ensure_default_agent(self):
         """Ensure a sane default agent exists without overwriting unrelated agent personalities."""
+        DEFAULT_SKILLS = ["agent_platform_backend", "memory_palace"]
+
         existing_default = self.get("default")
         if not existing_default:
             self.create(AgentProfile(
                 id="default",
-                name="shovs Assistant",
-                description="The standard general-purpose agent.",
-                system_prompt=GENERAL_SYSTEM_PROMPT,
+                name="Shovs OS",
+                description="Runtime-native agent. Uses memory, loci, tool signals, and skills.",
+                system_prompt=SHOVS_OS_SYSTEM_PROMPT,
                 tools=DEFAULT_AGENT_TOOLS,
+                skills=DEFAULT_SKILLS,
             ))
         else:
             # Keep existing custom order but guarantee required core tools are present.
@@ -203,24 +262,46 @@ class ProfileManager:
                 if tool not in merged_tools:
                     merged_tools.append(tool)
             tools_changed = merged_tools != existing_default.tools
-            prompt_needs_reset = existing_default.system_prompt in {
+
+            # Guarantee required skills are present.
+            merged_skills = list(existing_default.skills or [])
+            for skill in DEFAULT_SKILLS:
+                if skill not in merged_skills:
+                    merged_skills.append(skill)
+            skills_changed = merged_skills != (existing_default.skills or [])
+
+            # Prompts that are stale / generic and should be upgraded to the
+            # runtime-native OS prompt.
+            _stale_prompts = {
                 "",
                 "You are a specialized AI assistant.",
                 PLATINUM_SYSTEM_PROMPT,
+                GENERAL_SYSTEM_PROMPT,
             }
+            prompt_needs_reset = existing_default.system_prompt in _stale_prompts
             if tools_changed:
                 existing_default.tools = merged_tools
+            if skills_changed:
+                existing_default.skills = merged_skills
             if prompt_needs_reset:
-                existing_default.system_prompt = GENERAL_SYSTEM_PROMPT
-                if existing_default.name == "shovs Platinum Assistant":
-                    existing_default.name = "shovs Assistant"
+                existing_default.system_prompt = SHOVS_OS_SYSTEM_PROMPT
+                existing_default.name = "Shovs OS"
+                existing_default.description = "Runtime-native agent. Uses memory, loci, tool signals, and skills."
             runtime_kind_changed = existing_default.runtime_kind != DEFAULT_RUNTIME_KIND
             if runtime_kind_changed:
                 existing_default.runtime_kind = DEFAULT_RUNTIME_KIND
+
+            # Upgrade legacy context modes to v3 (the canonical hybrid mode).
+            context_mode_outdated = existing_default.default_context_mode in {"v1", "v2"}
+            if context_mode_outdated:
+                existing_default.default_context_mode = "v3"
+
             if (
                 tools_changed
+                or skills_changed
                 or prompt_needs_reset
                 or runtime_kind_changed
+                or context_mode_outdated
             ):
                 self.create(existing_default)
 

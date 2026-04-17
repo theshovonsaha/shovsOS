@@ -315,6 +315,10 @@ class ContextGovernor:
         trace_prefix: str = "ctx",
         correction_turn: bool = False,
         direct_fact_memory_only: bool = False,
+        # When True, suppress _build_historical_context so the v3 governor
+        # items (active memory + durable anchors) are the sole older-history
+        # lane and there is no duplication.
+        suppress_historical_for_managed_engine: bool = False,
     ) -> GovernedMemorySurface:
         candidate_signals = list(getattr(session, "candidate_signals", []) or []) if session is not None else []
         legacy_candidate_context = str(getattr(session, "candidate_context", "") or "").strip() if session is not None else ""
@@ -327,10 +331,19 @@ class ContextGovernor:
             if not candidate_context and legacy_candidate_context:
                 candidate_signals = parse_candidate_context(legacy_candidate_context)
 
-        historical_context = self._build_historical_context(
-            session=session,
-            correction_turn=correction_turn,
-            direct_fact_memory_only=direct_fact_memory_only,
+        # v3 governor emits its own active-memory + durable-anchor items which
+        # fully cover older-session context.  Suppress the raw historical lane
+        # to avoid injecting the same turns twice at different priorities.
+        mode = self.mode_for_engine(engine)
+        skip_historical = suppress_historical_for_managed_engine or mode == "v3"
+        historical_context = (
+            ""
+            if skip_historical
+            else self._build_historical_context(
+                session=session,
+                correction_turn=correction_turn,
+                direct_fact_memory_only=direct_fact_memory_only,
+            )
         )
         memory_items = self.build_memory_items(
             engine=engine,
@@ -343,13 +356,14 @@ class ContextGovernor:
             historical_context=historical_context,
             memory_items=memory_items,
             provenance={
-                "mode": self.mode_for_engine(engine),
+                "mode": mode,
                 "candidate_source": candidate_source,
                 "candidate_count": len(candidate_signals),
                 "historical_segments": len([seg for seg in historical_context.split("\n\n---\n") if seg.strip()]),
                 "memory_item_count": len(memory_items),
                 "direct_fact_memory_only": bool(direct_fact_memory_only),
                 "correction_turn": bool(correction_turn),
+                "historical_suppressed": bool(skip_historical),
             },
         )
 

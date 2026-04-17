@@ -64,6 +64,63 @@ FILE_TYPE_SIGNAL = re.compile(
     re.IGNORECASE,
 )
 
+# ── Research / multi-step ambiguity signals ──────────────────────────────────
+
+# "Research X" — vague enough to need scoping if X is a bare noun with no context
+VAGUE_RESEARCH_SIGNAL = re.compile(
+    r"^(?:research|investigate|analyze|evaluate|assess|look into|find out about|tell me about)\s+(?:a|an|the|some)?\s*\w[\w\s]{0,30}[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+# Comparison with no named second party — "compare X" with nothing to compare to
+VAGUE_COMPARE_SIGNAL = re.compile(
+    r"^(?:compare|contrast)\s+(?:a|an|the|some)?\s*\w[\w\s]{0,30}[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+# "Find the best X" — needs to know the evaluation criteria
+BEST_OF_SIGNAL = re.compile(
+    r"^(?:find|get|show|list|recommend)\s+(?:me\s+)?(?:the\s+)?best\s+\w[\w\s]{0,40}[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+# Signals that the message already has enough scope to proceed
+SCOPED_ENOUGH_SIGNAL = re.compile(
+    r"\b(for\s+my|for\s+our|for\s+the|in\s+\w+|using\s+\w+|vs\.?\s+\w+|compared\s+to|between\s+\w+\s+and|criteria|requirements?|goal|budget|timeline)\b",
+    re.IGNORECASE,
+)
+
+
+def check_research_ambiguity(message: str) -> Optional[str]:
+    """
+    Return a clarification question if the message is a vague research/comparison
+    request that needs scoping before we waste tool calls on wrong targets.
+    Returns None if message is specific enough to act on.
+    """
+    msg = (message or "").strip()
+    if not msg or len(msg) > 280:
+        # Long messages are usually specific enough
+        return None
+    if SCOPED_ENOUGH_SIGNAL.search(msg):
+        return None
+
+    if VAGUE_COMPARE_SIGNAL.match(msg):
+        return (
+            "What should I compare it against? "
+            "A second product, approach, or set of criteria would help me give you a useful comparison."
+        )
+    if BEST_OF_SIGNAL.match(msg):
+        return (
+            "What are the most important criteria for 'best' here — "
+            "price, features, ease of use, performance, or something else?"
+        )
+    if VAGUE_RESEARCH_SIGNAL.match(msg):
+        return (
+            "What specific aspect do you want to focus on? "
+            "For example: pricing, technical details, reviews, competitors, or recent news."
+        )
+    return None
+
 
 # ── Classifier ───────────────────────────────────────────────────────
 
