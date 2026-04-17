@@ -101,6 +101,19 @@ def _build_direct_fact_index(
     return indexed
 
 
+def _build_current_fact_index(
+    current_facts: list[tuple[str, str, str]],
+) -> dict[tuple[str, str], tuple[str, str, str]]:
+    indexed: dict[tuple[str, str], tuple[str, str, str]] = {}
+    for subject, predicate, object_ in current_facts or []:
+        normalized_subject = _normalize_subject(subject)
+        canonical = normalize_memory_predicate(predicate)
+        if not normalized_subject or not canonical:
+            continue
+        indexed[(normalized_subject, canonical)] = (subject, canonical, object_)
+    return indexed
+
+
 @dataclass
 class _Hit:
     dedupe_key: str
@@ -170,10 +183,12 @@ async def unified_memory_search(
     target_predicates = direct_fact_predicates(query)
     current_facts: list[tuple[str, str, str]] = []
     direct_fact_index: dict[str, tuple[str, str, str]] = {}
+    current_fact_index: dict[tuple[str, str], tuple[str, str, str]] = {}
 
     if session_id:
         current_facts = list(graph.get_current_facts(session_id, owner_id=owner_scope) or [])
         direct_fact_index = _build_direct_fact_index(current_facts)
+        current_fact_index = _build_current_fact_index(current_facts)
 
     # Step 1: Karpathy Pattern - Prioritize Compiled Drawers (High-Density Context)
     if locus_id:
@@ -204,6 +219,15 @@ async def unified_memory_search(
         predicate = str(item.get("predicate") or "").strip()
         object_ = str(item.get("object") or "").strip()
         canonical_predicate = normalize_memory_predicate(predicate)
+        active_fact_for_key = current_fact_index.get((_normalize_subject(subject), canonical_predicate))
+        if active_fact_for_key is not None:
+            active_subject, _, active_object = active_fact_for_key
+            if (
+                _normalize_subject(active_subject) == _normalize_subject(subject)
+                and _normalize_object(active_object) != _normalize_object(object_)
+            ):
+                suppressed_conflicts += 1
+                continue
         if target_predicates and canonical_predicate in target_predicates:
             active_fact = direct_fact_index.get(canonical_predicate)
             if active_fact is not None:
@@ -272,8 +296,21 @@ async def unified_memory_search(
         for index, item in enumerate(vector_hits):
             key = str(item.get("key") or "").strip()
             anchor = str(item.get("anchor") or "").strip()
+            metadata_fact = str((item.get("metadata") or {}).get("fact") or "").strip()
             if not key and not anchor:
                 continue
+            if metadata_fact:
+                lowered_parts = metadata_fact.split()
+                if len(lowered_parts) >= 3:
+                    subject = lowered_parts[0]
+                    predicate = normalize_memory_predicate(lowered_parts[1])
+                    object_ = " ".join(lowered_parts[2:])
+                    active_fact_for_key = current_fact_index.get((_normalize_subject(subject), predicate))
+                    if active_fact_for_key is not None:
+                        _, _, active_object = active_fact_for_key
+                        if _normalize_object(active_object) != _normalize_object(object_):
+                            suppressed_conflicts += 1
+                            continue
             vector_predicates = direct_fact_predicates(f"{key} {anchor}")
             if target_predicates:
                 overlapping = vector_predicates & target_predicates

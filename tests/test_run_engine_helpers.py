@@ -340,17 +340,22 @@ def test_build_phase_packet_can_include_shared_session_and_memory_lanes():
     assert "Session Anchor" in packet.content
     assert "Meta Context" in packet.content
     assert "Epistemic Posture:" in packet.content
+    assert "Memory Authority" in packet.content
     assert "Deterministic Facts" in packet.content
-    assert "Candidate Signals" in packet.content
+    assert "Candidate Signals" not in packet.content
     assert "Working Evidence" in packet.content
     assert "Curated evidence most relevant to the current objective." in packet.content
     meta_item = next(item for item in packet.trace["included"] if item["item_id"] == "meta_context")
     assert meta_item["kind"] == "meta"
     assert meta_item["provenance"]["known_fact_count"] == 1
     assert meta_item["provenance"]["candidate_count"] == 1
+    assert meta_item["provenance"]["memory_mode"] == "deterministic_plus_evidence"
+    assert "tool_economy" in meta_item["provenance"]
+    assert "contradiction_policy" in meta_item["provenance"]
     evidence_item = next(item for item in packet.trace["included"] if item["item_id"] == "working_evidence")
     assert evidence_item["kind"] == "evidence"
     assert evidence_item["provenance"]["selected_count"] == 1
+    assert packet.trace["governed_memory"]["candidate_source"] == "legacy_candidate_context"
 
 
 def test_build_phase_packet_meta_context_can_define_minimum_probe():
@@ -386,6 +391,91 @@ def test_build_phase_packet_meta_context_can_define_minimum_probe():
     meta_item = next(item for item in packet.trace["included"] if item["item_id"] == "meta_context")
     assert meta_item["kind"] == "meta"
     assert meta_item["provenance"]["evidence_count"] == 0
+
+
+def test_build_phase_packet_direct_fact_turn_prefers_deterministic_only_mode():
+    from types import SimpleNamespace
+
+    from engine.context_schema import ContextPhase
+    from run_engine.context_packets import PacketBuildInputs, build_phase_packet
+    from run_engine.types import RunEngineRequest
+
+    packet = build_phase_packet(
+        context_engine=None,
+        inputs=PacketBuildInputs(
+            request=RunEngineRequest(
+                session_id="packet-direct-fact",
+                owner_id="owner-1",
+                agent_id="default",
+                user_message="What editor do I use now?",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+            ),
+            session=SimpleNamespace(
+                first_message="I use VS Code.",
+                candidate_context="- Candidate: User editor Cursor (reason=stale)",
+                sliding_window=[],
+                full_history=[{"role": "user", "content": "I used Cursor before."}],
+            ),
+            phase=ContextPhase.RESPONSE,
+            system_prompt="You are Shovs.",
+            effective_objective="What editor do I use now?",
+            current_context="",
+            allowed_tools=[{"name": "query_memory", "description": "Recall memory"}],
+            tool_results=[],
+            current_facts=[("User", "preferred_editor", "VS Code")],
+            direct_fact_memory_only=True,
+        ),
+    )
+
+    assert "Memory Mode:" in packet.content
+    assert "- deterministic_only" in packet.content
+    assert "Historical Context" not in packet.content
+    assert "Candidate Signals" not in packet.content
+
+
+def test_build_phase_packet_prefers_structured_candidate_signals_over_stale_candidate_text():
+    from types import SimpleNamespace
+
+    from engine.context_schema import ContextPhase
+    from run_engine.context_packets import PacketBuildInputs, build_phase_packet
+    from run_engine.types import RunEngineRequest
+
+    packet = build_phase_packet(
+        context_engine=None,
+        inputs=PacketBuildInputs(
+            request=RunEngineRequest(
+                session_id="packet-structured-candidates",
+                owner_id="owner-1",
+                agent_id="default",
+                user_message="What candidate signals are active?",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+            ),
+            session=SimpleNamespace(
+                first_message="Track my constraints.",
+                candidate_context="- Candidate: stale legacy text (reason=old)",
+                candidate_signals=[
+                    {
+                        "text": "User may increase budget to $4k next month",
+                        "reason": "candidate_budget_change",
+                    }
+                ],
+                sliding_window=[],
+                full_history=[],
+            ),
+            phase=ContextPhase.PLANNING,
+            system_prompt="You are Shovs.",
+            effective_objective="What candidate signals are active?",
+            current_context="",
+            allowed_tools=[],
+            tool_results=[],
+        ),
+    )
+
+    assert "User may increase budget to $4k next month" in packet.content
+    assert "stale legacy text" not in packet.content
+    assert packet.trace["governed_memory"]["candidate_source"] == "structured_candidate_signals"
 
 
 def test_build_phase_packet_prefers_resolved_working_objective_when_present():

@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Optional
 
 import httpx
 
+from engine.direct_fact_policy import normalize_memory_predicate
 from plugins.tool_registry import Tool, ToolRegistry
 from plugins.tools_web import (
     WEB_FETCH_TOOL as CANONICAL_WEB_FETCH_TOOL,
@@ -47,6 +48,7 @@ from plugins.tools_web import (
 )
 from config.logger import log
 from memory.task_tracker import get_session_task_tracker
+from orchestration.session_manager import SessionManager
 
 if TYPE_CHECKING:
     from orchestration.agent_manager import AgentManager
@@ -1085,43 +1087,152 @@ def _build_runtime_graph(kwargs):
         return SemanticGraph()
 
 
-async def _store_memory(subject: str, predicate: str, object_: str, locus_id: Optional[str] = None, **kwargs) -> str:
+def _normalize_memory_subject(subject: Optional[str]) -> str:
+    value = str(subject or "").strip()
+    return value or "User"
+
+
+def _resolve_runtime_turn(session_id: Optional[str], owner_id: Optional[str]) -> int:
+    if not session_id:
+        return 1
+    try:
+        session = SessionManager().get(session_id, owner_id=owner_id)
+    except Exception:
+        session = None
+    return max(1, int(getattr(session, "message_count", 0) or 0))
+
+
+async def _store_memory(
+    subject: Optional[str] = None,
+    predicate: str = "",
+    object_: str = "",
+    locus_id: Optional[str] = None,
+    **kwargs,
+) -> str:
     """Explicitly store a factual triplet into the semantic graph memory."""
     try:
         graph = _build_runtime_graph(kwargs)
         owner_id = kwargs.get("_owner_id")
         run_id = kwargs.get("_run_id")
+        normalized_subject = _normalize_memory_subject(subject)
+        normalized_predicate = normalize_memory_predicate(predicate)
+        normalized_object = str(object_ or "").strip()
         await graph.add_triplet(
-            subject,
-            predicate,
-            object_,
+            normalized_subject,
+            normalized_predicate,
+            normalized_object,
             owner_id=owner_id,
             run_id=run_id,
             locus_id=locus_id
         )
         locus_note = f" (Locus: {locus_id})" if locus_id else ""
-        return f"Successfully stored memory: [{subject}] --[{predicate}]--> [{object_}]{locus_note}"
+        return (
+            "Successfully stored memory: "
+            f"[{normalized_subject}] --[{normalized_predicate}]--> [{normalized_object}]{locus_note}"
+        )
     except Exception as e:
         return f"Failed to store memory: {e}"
+
+
+async def _update_memory(
+    subject: Optional[str] = None,
+    predicate: str = "",
+    object_: str = "",
+    locus_id: Optional[str] = None,
+    supersede_existing: bool = True,
+    **kwargs,
+) -> str:
+    """Store a correction-aware memory update for the current session and semantic graph."""
+    try:
+        graph = _build_runtime_graph(kwargs)
+        owner_id = kwargs.get("_owner_id")
+        run_id = kwargs.get("_run_id")
+        session_id = kwargs.get("_session_id") or kwargs.get("session_id")
+        normalized_subject = _normalize_memory_subject(subject)
+        normalized_predicate = normalize_memory_predicate(predicate)
+        normalized_object = str(object_ or "").strip()
+
+        if session_id:
+            turn = _resolve_runtime_turn(session_id, owner_id)
+            if supersede_existing:
+                graph.void_temporal_fact(
+                    session_id,
+                    normalized_subject,
+                    normalized_predicate,
+                    turn,
+                    owner_id=owner_id,
+                )
+            graph.add_temporal_fact(
+                session_id,
+                normalized_subject,
+                normalized_predicate,
+                normalized_object,
+                turn,
+                owner_id=owner_id,
+                run_id=run_id,
+                locus_id=locus_id,
+            )
+
+        await graph.add_triplet(
+            normalized_subject,
+            normalized_predicate,
+            normalized_object,
+            owner_id=owner_id,
+            run_id=run_id,
+            locus_id=locus_id,
+        )
+        locus_note = f" (Locus: {locus_id})" if locus_id else ""
+        lane_note = "session + semantic memory" if session_id else "semantic memory only"
+        return (
+            "Successfully updated memory in "
+            f"{lane_note}: [{normalized_subject}] --[{normalized_predicate}]--> "
+            f"[{normalized_object}]{locus_note}"
+        )
+    except Exception as e:
+        return f"Failed to update memory: {e}"
 
 STORE_MEMORY_TOOL = Tool(
     name="store_memory",
     description=(
         "Store a single declarative fact or preference about the user or the world into long-term semantic memory. "
         "Use this PROACTIVELY when the user tells you something important to remember for future conversations. "
-        "Break the fact into a subject, a predicate (the verb/relationship), and an object."
+        "Break the fact into a subject, a predicate (the verb/relationship), and an object. "
+        "If the fact is about the user and subject is omitted, default to 'User'. "
+        "Use update_memory instead when the new fact corrects or replaces an older one."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "subject": {"type": "string", "description": "The entity the fact is about (e.g., 'User', 'System', 'John')"},
+            "subject": {"type": "string", "description": "The entity the fact is about (e.g., 'User', 'System', 'John'). Defaults to 'User' when omitted."},
             "predicate": {"type": "string", "description": "The relationship (e.g., 'likes', 'is allergic to', 'works at')"},
             "object_": {"type": "string", "description": "The target of the relationship (e.g., 'spicy food', 'peanuts', 'Google')"},
             "locus_id": {"type": "string", "description": "Optional: Anchor this memory to a specific spatial room (Locus ID)."}
         },
-        "required": ["subject", "predicate", "object_"]
+        "required": ["predicate", "object_"]
     },
     handler=_store_memory,
+    tags=["memory", "core"]
+)
+
+UPDATE_MEMORY_TOOL = Tool(
+    name="update_memory",
+    description=(
+        "Update a remembered fact or preference, especially when the user is correcting earlier context. "
+        "This writes to session-scoped deterministic memory and semantic memory so future retrieval prefers the new value. "
+        "If the fact is about the user and subject is omitted, default to 'User'."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string", "description": "The entity the fact is about. Defaults to 'User' when omitted."},
+            "predicate": {"type": "string", "description": "The relationship being updated (for example 'location' or 'preferred_editor')."},
+            "object_": {"type": "string", "description": "The new value that should now be treated as current."},
+            "locus_id": {"type": "string", "description": "Optional: Anchor this memory to a specific spatial room (Locus ID)."},
+            "supersede_existing": {"type": "boolean", "description": "When true, retire any active fact with the same subject and predicate first. Defaults to true."},
+        },
+        "required": ["predicate", "object_"]
+    },
+    handler=_update_memory,
     tags=["memory", "core"]
 )
 
@@ -1687,6 +1798,7 @@ ALL_TOOLS = [
     PLACES_SEARCH_TOOL,   # BUG FIX: was missing from ALL_TOOLS — caused 'not found in global registry' warning
     PLACES_MAP_TOOL,
     STORE_MEMORY_TOOL,
+    UPDATE_MEMORY_TOOL,
     QUERY_MEMORY_TOOL,
     TODO_WRITE_TOOL,
     TODO_UPDATE_TOOL,

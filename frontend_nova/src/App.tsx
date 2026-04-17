@@ -225,6 +225,9 @@ function App() {
   const [sidebarTab, setSidebarTab] = useState<'sessions' | 'options'>(
     'sessions',
   );
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingMessageText, setEditingMessageText] = useState('');
+  const [editingBusy, setEditingBusy] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toolMenuRef = useRef<HTMLDivElement>(null);
@@ -277,6 +280,29 @@ function App() {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  const startEditingMessage = (messageId: string, content: string) => {
+    setEditingMessageId(messageId);
+    setEditingMessageText(content);
+  };
+
+  const cancelEditingMessage = () => {
+    setEditingMessageId(null);
+    setEditingMessageText('');
+  };
+
+  const saveEditedMessage = async (historyIndex?: number) => {
+    if (historyIndex == null) return;
+    setEditingBusy(true);
+    try {
+      await agent.editSessionMessage(historyIndex, editingMessageText);
+      cancelEditingMessage();
+    } catch (error) {
+      console.error('Failed to edit message', error);
+    } finally {
+      setEditingBusy(false);
     }
   };
 
@@ -378,8 +404,6 @@ function App() {
       models={agent.models}
       usePlanner={agent.usePlanner}
       setUsePlanner={agent.setUsePlanner}
-      loopMode={agent.loopMode}
-      setLoopMode={agent.setLoopMode}
       maxToolCalls={agent.maxToolCalls}
       setMaxToolCalls={agent.setMaxToolCalls}
       maxTurns={agent.maxTurns}
@@ -627,9 +651,51 @@ function App() {
                       className={`nova-message ${message.role}`}
                     >
                       <div className='nova-message-role'>
-                        {message.role === 'user' ? 'You' : 'Agent'}
+                        <span>{message.role === 'user' ? 'You' : 'Agent'}</span>
+                        {message.edited ? <span className='nova-inline-badge subtle'>edited</span> : null}
+                        {message.role === 'user' &&
+                        typeof message.historyIndex === 'number' &&
+                        !agent.isStreaming ? (
+                          <button
+                            className='nova-inline-action'
+                            onClick={() => startEditingMessage(message.id, message.content)}
+                          >
+                            Edit
+                          </button>
+                        ) : null}
                       </div>
                       <div className='nova-message-body'>
+                        {editingMessageId === message.id ? (
+                          <div className='nova-message-edit'>
+                            <textarea
+                              value={editingMessageText}
+                              onChange={(e) => setEditingMessageText(e.target.value)}
+                              rows={4}
+                            />
+                            <div className='nova-message-edit-actions'>
+                              <button
+                                className='nova-ghost-btn'
+                                onClick={cancelEditingMessage}
+                                disabled={editingBusy}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                className='nova-send-btn'
+                                onClick={() => saveEditedMessage(message.historyIndex)}
+                                disabled={editingBusy || !editingMessageText.trim()}
+                              >
+                                {editingBusy ? 'Saving...' : 'Save'}
+                              </button>
+                            </div>
+                            <div className='nova-inline-badge subtle'>
+                              Editing resets derived context and memory for this session so the next turn rebuilds from the corrected transcript.
+                            </div>
+                          </div>
+                        ) : null}
+
+                        {editingMessageId === message.id ? null : (
+                          <>
                         {message.files?.filter((f) => f.dataURL).length ? (
                           <div className='nova-image-row'>
                             {message
@@ -747,6 +813,8 @@ function App() {
                         idx === agent.messages.length - 1 ? (
                           <span className='nova-cursor' />
                         ) : null}
+                          </>
+                        )}
                       </div>
                     </article>
                   ))

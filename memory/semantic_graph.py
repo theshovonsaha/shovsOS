@@ -416,6 +416,18 @@ class SemanticGraph:
                 )
             conn.commit()
 
+    def clear_session_facts(self, session_id: str, owner_id: Optional[str] = None):
+        """Delete deterministic fact history for one session without touching global memory."""
+        with sqlite3.connect(self.db_path) as conn:
+            if owner_id is None:
+                conn.execute("DELETE FROM facts WHERE session_id = ?", (session_id,))
+            else:
+                conn.execute(
+                    "DELETE FROM facts WHERE session_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')",
+                    (session_id, owner_id),
+                )
+            conn.commit()
+
     # ── Temporal Fact Logic (Deterministic Memory) ─────────────────────────
     def add_temporal_fact(
         self,

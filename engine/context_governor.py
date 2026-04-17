@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Optional
 
 from llm.base_adapter import BaseLLMAdapter
+from engine.candidate_signals import parse_candidate_context, render_candidate_signals
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
+from run_engine.memory_pipeline import (
+    MemoryCommitOutcome,
+    MemoryCommitPlan,
+    apply_memory_commit as apply_governed_memory_commit,
+    build_deterministic_memory_commit as build_governed_deterministic_commit,
+    plan_memory_commit as plan_governed_memory_commit,
+)
 
 
 _MEMORY_PHASE_VISIBILITY = frozenset({
@@ -12,6 +21,14 @@ _MEMORY_PHASE_VISIBILITY = frozenset({
     ContextPhase.RESPONSE,
     ContextPhase.VERIFICATION,
 })
+
+
+@dataclass(frozen=True)
+class GovernedMemorySurface:
+    candidate_context: str
+    historical_context: str
+    memory_items: list[ContextItem]
+    provenance: dict[str, Any]
 
 
 class ContextGovernor:
@@ -285,5 +302,179 @@ class ContextGovernor:
                     trace_id=f"{trace_prefix}:governor:patterns",
                     provenance={"engine": mode},
                 )
-            )
+        )
         return items
+
+    def build_memory_surface(
+        self,
+        *,
+        engine: Optional[object],
+        session: Optional[object],
+        context: str,
+        current_facts: Optional[list[tuple[str, str, str]]] = None,
+        trace_prefix: str = "ctx",
+        correction_turn: bool = False,
+        direct_fact_memory_only: bool = False,
+    ) -> GovernedMemorySurface:
+        candidate_signals = list(getattr(session, "candidate_signals", []) or []) if session is not None else []
+        legacy_candidate_context = str(getattr(session, "candidate_context", "") or "").strip() if session is not None else ""
+        if candidate_signals:
+            candidate_context = render_candidate_signals(candidate_signals)
+            candidate_source = "structured_candidate_signals"
+        else:
+            candidate_context = legacy_candidate_context
+            candidate_source = "legacy_candidate_context" if candidate_context else "none"
+            if not candidate_context and legacy_candidate_context:
+                candidate_signals = parse_candidate_context(legacy_candidate_context)
+
+        historical_context = self._build_historical_context(
+            session=session,
+            correction_turn=correction_turn,
+            direct_fact_memory_only=direct_fact_memory_only,
+        )
+        memory_items = self.build_memory_items(
+            engine=engine,
+            context=context,
+            current_facts=current_facts,
+            trace_prefix=trace_prefix,
+        )
+        return GovernedMemorySurface(
+            candidate_context=candidate_context,
+            historical_context=historical_context,
+            memory_items=memory_items,
+            provenance={
+                "mode": self.mode_for_engine(engine),
+                "candidate_source": candidate_source,
+                "candidate_count": len(candidate_signals),
+                "historical_segments": len([seg for seg in historical_context.split("\n\n---\n") if seg.strip()]),
+                "memory_item_count": len(memory_items),
+                "direct_fact_memory_only": bool(direct_fact_memory_only),
+                "correction_turn": bool(correction_turn),
+            },
+        )
+
+    def get_current_facts(
+        self,
+        session_id: str,
+        *,
+        owner_id: Optional[str] = None,
+    ) -> list[tuple[str, str, str]]:
+        if self.graph is None:
+            return []
+        try:
+            return list(self.graph.get_current_facts(session_id, owner_id=owner_id) or [])
+        except Exception:
+            return []
+
+    async def search_memory(
+        self,
+        query: str,
+        *,
+        owner_id: Optional[str],
+        session_id: Optional[str] = None,
+        locus_id: Optional[str] = None,
+        top_k: int = 5,
+        threshold: float = 0.5,
+    ) -> dict[str, Any]:
+        from memory.retrieval import unified_memory_search
+
+        return await unified_memory_search(
+            query,
+            owner_id=owner_id,
+            session_id=session_id,
+            locus_id=locus_id,
+            top_k=top_k,
+            threshold=threshold,
+            graph=self.graph,
+        )
+
+    def build_memory_commit_plan(
+        self,
+        *,
+        context_result: Optional[tuple[Any, ...]] = None,
+        user_message: str,
+        tool_results: list[dict[str, Any]],
+        deterministic_keyed_facts: list[dict[str, Any]],
+        deterministic_voids: list[dict[str, Any]],
+        current_facts: Optional[list[tuple[str, str, str]]],
+        existing_candidate_signals: Optional[list[dict[str, str]]],
+        existing_candidate_context: str,
+        new_candidate_signals: Optional[list[dict[str, Any]]] = None,
+        current_turn: Optional[int] = None,
+    ) -> MemoryCommitPlan:
+        if context_result is None:
+            return build_governed_deterministic_commit(
+                deterministic_keyed_facts=deterministic_keyed_facts,
+                deterministic_voids=deterministic_voids,
+                existing_candidate_signals=existing_candidate_signals,
+                existing_candidate_context=existing_candidate_context,
+                user_message=user_message,
+                new_candidate_signals=new_candidate_signals,
+                current_turn=current_turn,
+            )
+        return plan_governed_memory_commit(
+            context_result=context_result,
+            user_message=user_message,
+            tool_results=tool_results,
+            deterministic_keyed_facts=deterministic_keyed_facts,
+            deterministic_voids=deterministic_voids,
+            current_facts=current_facts,
+            existing_candidate_signals=existing_candidate_signals,
+            existing_candidate_context=existing_candidate_context,
+            new_candidate_signals=new_candidate_signals,
+            current_turn=current_turn,
+        )
+
+    async def apply_memory_commit(
+        self,
+        *,
+        sessions,
+        session_id: str,
+        owner_id: Optional[str],
+        agent_id: str,
+        turn: int,
+        run_id: str,
+        user_message: str,
+        assistant_response: str,
+        plan: MemoryCommitPlan,
+        current_context: str,
+    ) -> MemoryCommitOutcome:
+        return await apply_governed_memory_commit(
+            sessions=sessions,
+            session_id=session_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            turn=turn,
+            run_id=run_id,
+            user_message=user_message,
+            assistant_response=assistant_response,
+            graph=self.graph,
+            plan=plan,
+            current_context=current_context,
+        )
+
+    def _build_historical_context(
+        self,
+        *,
+        session: Optional[object],
+        correction_turn: bool,
+        direct_fact_memory_only: bool,
+    ) -> str:
+        if direct_fact_memory_only or session is None:
+            return ""
+
+        history = list(getattr(session, "full_history", []) or [])
+        recent = list(getattr(session, "sliding_window", []) or [])
+        if len(history) <= len(recent):
+            return ""
+
+        older_history = history[:-len(recent)] if recent else history[:-4]
+        max_segments = 2 if correction_turn else 4
+        segments: list[str] = []
+        for entry in older_history[-max_segments:]:
+            role = str(entry.get("role") or "")
+            content = str(entry.get("content") or "").strip()
+            if role in {"user", "assistant"} and content:
+                clipped = content if len(content) <= 260 else content[:257].rstrip() + "..."
+                segments.append(f"{role.upper()}: {clipped}")
+        return "\n\n---\n".join(segments)

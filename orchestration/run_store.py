@@ -89,6 +89,11 @@ class RunPassRecord:
     tool_results: list[dict[str, Any]] | None = None
     compiled_context: dict[str, Any] | None = None
     response_preview: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    estimated_cost_usd: float = 0.0
+    cumulative_cost_usd: float = 0.0
     created_at: str = ""
 
 
@@ -190,10 +195,26 @@ class RunStore:
                     tool_results_json TEXT,
                     compiled_context_json TEXT,
                     response_preview TEXT,
+                    input_tokens INTEGER DEFAULT 0,
+                    output_tokens INTEGER DEFAULT 0,
+                    total_tokens INTEGER DEFAULT 0,
+                    estimated_cost_usd REAL DEFAULT 0,
+                    cumulative_cost_usd REAL DEFAULT 0,
                     created_at TEXT NOT NULL
                 )
                 """
             )
+            for statement in (
+                "ALTER TABLE run_passes ADD COLUMN input_tokens INTEGER DEFAULT 0",
+                "ALTER TABLE run_passes ADD COLUMN output_tokens INTEGER DEFAULT 0",
+                "ALTER TABLE run_passes ADD COLUMN total_tokens INTEGER DEFAULT 0",
+                "ALTER TABLE run_passes ADD COLUMN estimated_cost_usd REAL DEFAULT 0",
+                "ALTER TABLE run_passes ADD COLUMN cumulative_cost_usd REAL DEFAULT 0",
+            ):
+                try:
+                    conn.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_session_id ON runs(session_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_parent_run_id ON runs(parent_run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_owner_id ON runs(owner_id)")
@@ -366,14 +387,30 @@ class RunStore:
         tool_results: Optional[list[dict[str, Any]]] = None,
         compiled_context: Optional[dict[str, Any]] = None,
         response_preview: str = "",
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: Optional[int] = None,
+        estimated_cost_usd: float = 0.0,
     ) -> RunPassRecord:
         created_at = datetime.now(timezone.utc).isoformat()
+        safe_input_tokens = max(0, int(input_tokens or 0))
+        safe_output_tokens = max(0, int(output_tokens or 0))
+        safe_total_tokens = max(
+            0,
+            int(total_tokens if total_tokens is not None else safe_input_tokens + safe_output_tokens),
+        )
+        safe_cost = round(max(0.0, float(estimated_cost_usd or 0.0)), 8)
         with self._connect() as conn:
+            cumulative_row = conn.execute(
+                "SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM run_passes WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            cumulative_cost_usd = round(float(cumulative_row[0] or 0.0) + safe_cost, 8)
             cursor = conn.execute(
                 """
                 INSERT INTO run_passes
-                (run_id, phase, tool_turn, status, objective, strategy, notes, selected_tools_json, tool_results_json, compiled_context_json, response_preview, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (run_id, phase, tool_turn, status, objective, strategy, notes, selected_tools_json, tool_results_json, compiled_context_json, response_preview, input_tokens, output_tokens, total_tokens, estimated_cost_usd, cumulative_cost_usd, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -387,6 +424,11 @@ class RunStore:
                     json.dumps(tool_results or []),
                     json.dumps(compiled_context or {}),
                     response_preview,
+                    safe_input_tokens,
+                    safe_output_tokens,
+                    safe_total_tokens,
+                    safe_cost,
+                    cumulative_cost_usd,
                     created_at,
                 ),
             )
@@ -405,6 +447,11 @@ class RunStore:
             tool_results=list(tool_results or []),
             compiled_context=dict(compiled_context or {}),
             response_preview=response_preview,
+            input_tokens=safe_input_tokens,
+            output_tokens=safe_output_tokens,
+            total_tokens=safe_total_tokens,
+            estimated_cost_usd=safe_cost,
+            cumulative_cost_usd=cumulative_cost_usd,
             created_at=created_at,
         )
 
@@ -419,6 +466,27 @@ class RunStore:
                 (run_id,),
             ).fetchall()
             return [self._row_to_pass(row) for row in rows]
+
+    def summarize_usage(self, run_id: str) -> dict[str, float | int]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                    COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd
+                FROM run_passes
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        return {
+            "input_tokens": int(row["input_tokens"] or 0),
+            "output_tokens": int(row["output_tokens"] or 0),
+            "total_tokens": int(row["total_tokens"] or 0),
+            "estimated_cost_usd": round(float(row["estimated_cost_usd"] or 0.0), 8),
+        }
 
     def save_artifact(
         self,
@@ -618,6 +686,11 @@ class RunStore:
             tool_results=json.loads(row["tool_results_json"] or "[]"),
             compiled_context=json.loads(row["compiled_context_json"] or "{}"),
             response_preview=row["response_preview"] or "",
+            input_tokens=int(row["input_tokens"] or 0),
+            output_tokens=int(row["output_tokens"] or 0),
+            total_tokens=int(row["total_tokens"] or 0),
+            estimated_cost_usd=float(row["estimated_cost_usd"] or 0.0),
+            cumulative_cost_usd=float(row["cumulative_cost_usd"] or 0.0),
             created_at=row["created_at"] or "",
         )
 

@@ -35,7 +35,6 @@ DETERMINISTIC_FACT_PHASES = frozenset({
 CANDIDATE_CONTEXT_PHASES = frozenset({
     ContextPhase.PLANNING,
     ContextPhase.ACTING,
-    ContextPhase.RESPONSE,
     ContextPhase.VERIFICATION,
 })
 
@@ -57,6 +56,14 @@ HISTORICAL_CONTEXT_PHASES = frozenset({
     ContextPhase.PLANNING,
     ContextPhase.ACTING,
     ContextPhase.RESPONSE,
+    ContextPhase.VERIFICATION,
+})
+
+MEMORY_AUTHORITY_PHASES = frozenset({
+    ContextPhase.PLANNING,
+    ContextPhase.ACTING,
+    ContextPhase.RESPONSE,
+    ContextPhase.MEMORY_COMMIT,
     ContextPhase.VERIFICATION,
 })
 
@@ -207,6 +214,42 @@ def build_deterministic_facts_item(
         phase_visibility=DETERMINISTIC_FACT_PHASES,
         trace_id=trace_id,
         provenance={"fact_count": len(fact_lines)},
+    )
+
+
+def build_memory_authority_item(
+    *,
+    correction_turn: bool,
+    direct_fact_memory_only: bool,
+    source: str,
+    trace_id: str,
+    priority: int = 21,
+    max_chars: int = 900,
+    provenance: Optional[dict[str, Any]] = None,
+) -> ContextItem:
+    lines = [
+        "Memory authority order:",
+        "1. Current-turn explicit user corrections and deterministic facts.",
+        "2. Verified working evidence from this run.",
+        "3. Historical retrieved memory that does not conflict with current facts.",
+        "4. Candidate signals are planning hints only, not response truth.",
+        "When a current deterministic fact exists for the same subject and predicate, do not use conflicting older memory.",
+    ]
+    if correction_turn:
+        lines.append("This is a correction turn: treat the latest user-provided revision as authoritative.")
+    if direct_fact_memory_only:
+        lines.append("This turn is answerable from deterministic facts alone: ignore historical memory and tools.")
+    return ContextItem(
+        item_id="memory_authority",
+        kind=ContextKind.OBJECTIVE,
+        title="Memory Authority",
+        content="\n".join(lines),
+        source=source,
+        priority=priority,
+        max_chars=max_chars,
+        phase_visibility=MEMORY_AUTHORITY_PHASES,
+        trace_id=trace_id,
+        provenance=dict(provenance or {}),
     )
 
 

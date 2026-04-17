@@ -37,6 +37,7 @@ interface SessionMemoryState {
     stance_signal_count: number;
     context_line_count: number;
     memory_signal_count: number;
+    candidate_signal_source?: string;
   };
   deterministic_facts: MemoryStateFact[];
   superseded_facts: MemoryStateFact[];
@@ -56,6 +57,7 @@ interface SessionMemoryState {
     confidence?: string;
     superseded?: boolean;
   }>;
+  candidate_context_preview?: string;
   context_preview: string[];
   recent_memory_signals: MemorySignal[];
   explanation: string[];
@@ -92,8 +94,6 @@ interface OptionsPanelProps {
   models: Record<string, string[]>;
   usePlanner: boolean;
   setUsePlanner: (val: boolean) => void;
-  loopMode: 'auto' | 'single' | 'managed';
-  setLoopMode: (val: 'auto' | 'single' | 'managed') => void;
   maxToolCalls: string;
   setMaxToolCalls: (val: string) => void;
   maxTurns: string;
@@ -147,8 +147,6 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   models,
   usePlanner,
   setUsePlanner,
-  loopMode,
-  setLoopMode,
   maxToolCalls,
   setMaxToolCalls,
   maxTurns,
@@ -170,23 +168,6 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   setShowObserverActivity,
   embedModels,
 }) => {
-  const loopModes: Array<{
-    value: 'auto' | 'single' | 'managed';
-    label: string;
-  }> = [
-    { value: 'auto', label: 'Auto' },
-    { value: 'single', label: 'Single' },
-    { value: 'managed', label: 'Managed' },
-  ];
-  const effectiveLoopHint =
-    loopMode === 'managed'
-      ? 'Current selection: Managed.'
-      : loopMode === 'single'
-        ? 'Current selection: Single.'
-        : usePlanner
-          ? 'Auto prefers managed for non-trivial turns, but local runtimes may downgrade to single.'
-          : 'Auto resolves to single unless you re-enable Manager Agent.';
-
   const nextContextMode =
     contextMode === 'v1' ? 'v2' : contextMode === 'v2' ? 'v3' : 'v1';
   const [memories, setMemories] = useState<Memory[]>([]);
@@ -650,77 +631,6 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 />
               </div>
             )}
-
-            <div style={{ marginTop: '12px' }}>
-              <label
-                className='settings-label'
-                style={{
-                  display: 'block',
-                  marginBottom: '6px',
-                  fontSize: '12px',
-                }}
-              >
-                Execution Loop
-              </label>
-              <div
-                style={{
-                  display: 'grid',
-                  gridTemplateColumns: 'repeat(3, minmax(0, 1fr))',
-                  gap: '8px',
-                }}
-              >
-                {loopModes.map((mode) => {
-                  const active = loopMode === mode.value;
-                  return (
-                    <button
-                      key={mode.value}
-                      type='button'
-                      onClick={() => setLoopMode(mode.value)}
-                      style={{
-                        minHeight: '42px',
-                        borderRadius: '12px',
-                        border: active
-                          ? '1px solid var(--accent)'
-                          : '1px solid var(--border)',
-                        background: active
-                          ? 'rgba(111, 210, 255, 0.12)'
-                          : 'var(--bg)',
-                        color: active ? 'var(--accent)' : 'var(--text-dim)',
-                        fontSize: '12px',
-                        fontWeight: 600,
-                        cursor: 'pointer',
-                      }}
-                    >
-                      {mode.label}
-                    </button>
-                  );
-                })}
-              </div>
-              <p
-                className='settings-help'
-                style={{
-                  marginTop: '8px',
-                  fontSize: '11px',
-                  color: 'var(--text-dim)',
-                  lineHeight: 1.4,
-                }}
-              >
-                Auto uses the managed controller when planning is enabled.
-                Single runs the actor loop directly. Managed forces plan → act →
-                observe → verify → commit inside one run.
-              </p>
-              <p
-                className='settings-help'
-                style={{
-                  marginTop: '6px',
-                  fontSize: '11px',
-                  color: 'var(--accent)',
-                  lineHeight: 1.4,
-                }}
-              >
-                {effectiveLoopHint}
-              </p>
-            </div>
 
             <div
               style={{

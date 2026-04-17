@@ -240,6 +240,23 @@ def test_deterministic_fact_extractor_supports_more_user_preferences():
     assert ("pronouns", "he/him") in pairs
 
 
+def test_deterministic_fact_extractor_captures_profile_anchors_for_converged_memory():
+    facts, voids = extract_user_stated_fact_updates(
+        "Hi, I'm Shovon. I work as a System Development Specialist at City of Toronto. "
+        "I'm building an open source project called shovsOS. "
+        "I have 5 years experience at IBM and City of Toronto. "
+        "My role is now focused on AI integration, not just enterprise apps."
+    )
+
+    assert voids == []
+    pairs = {(item["predicate"], item["object"]) for item in facts}
+    assert ("professional_role", "System Development Specialist") in pairs
+    assert ("current_employer", "City of Toronto") in pairs
+    assert ("current_project", "shovsOS") in pairs
+    assert ("years_experience", "5 years experience at IBM") in pairs
+    assert ("professional_focus", "AI integration") in pairs
+
+
 def test_deterministic_fact_extractor_captures_task_state_and_constraints():
     facts, voids = extract_user_stated_fact_updates(
         "Use staging environment mode. Keep scope to engine/ and tests/. "
@@ -309,6 +326,31 @@ def test_direct_fact_memory_guard_supports_task_state_queries():
     assert should_answer_direct_fact_from_memory("What budget did I set?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What constraints did I set?", current_facts) is True
     assert should_answer_direct_fact_from_memory("What follow up directive did I set?", current_facts) is True
+
+
+def test_direct_fact_memory_guard_supports_profile_anchor_queries():
+    current_facts = [
+        ("User", "current_employer", "City of Toronto"),
+        ("User", "current_project", "shovsOS"),
+        ("User", "professional_role", "System Development Specialist"),
+        ("User", "professional_focus", "AI integration"),
+        ("User", "years_experience", "5 years experience at IBM"),
+    ]
+
+    assert should_answer_direct_fact_from_memory("Do you remember my employer?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What project am I building?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What is my role?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("What is my current focus?", current_facts) is True
+    assert should_answer_direct_fact_from_memory("How much experience do I have?", current_facts) is True
+
+
+def test_direct_fact_memory_guard_does_not_short_circuit_mixed_instruction_turns():
+    current_facts = [("User", "preferred_name", "Shovon")]
+
+    assert should_answer_direct_fact_from_memory(
+        "Call me Alex. Research run engine and summarize it.",
+        current_facts,
+    ) is False
 
 
 def test_finalize_compression_fact_records_blocks_alias_noise_after_grounding():

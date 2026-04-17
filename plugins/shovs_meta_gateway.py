@@ -57,8 +57,15 @@ async def _spatial_store(subject: str, predicate: str, object: str, locus_id: Op
     """Store a fact into the Shovs semantic graph with optional spatial anchoring."""
     if not _graph:
         return "Memory graph not available."
-    
+
     try:
+        # Auto-register the locus if a locus_id is given but doesn't exist yet.
+        if locus_id:
+            existing = _graph.get_locus(locus_id, owner_id=_owner_id)
+            if existing is None:
+                _graph.register_locus(locus_id, name=locus_id, owner_id=_owner_id)
+                log("memory", "gateway", f"Auto-registered locus '{locus_id}' during store")
+
         await _graph.add_triplet(
             subject=subject,
             predicate=predicate,
@@ -70,6 +77,24 @@ async def _spatial_store(subject: str, predicate: str, object: str, locus_id: Op
         return f"Stored fact: {subject} {predicate} {object} (Locus: {locus_id or 'Global'})"
     except Exception as e:
         return f"Error storing fact: {e}"
+
+
+async def _create_locus(locus_id: str, name: Optional[str] = None, description: str = "", _owner_id: Optional[str] = None) -> str:
+    """Register a new named spatial room (Locus) in the Memory Palace."""
+    if not _graph:
+        return "Memory graph not available."
+    try:
+        locus_name = name or locus_id
+        _graph.register_locus(locus_id, name=locus_name, description=description, owner_id=_owner_id)
+        return json.dumps({
+            "status": "created",
+            "locus_id": locus_id,
+            "name": locus_name,
+            "description": description,
+        })
+    except Exception as e:
+        return f"Error creating locus: {e}"
+
 
 async def _list_spatial_loci(_owner_id: Optional[str] = None) -> str:
     """List all available Rooms/Rooms (Loci) in the Memory Palace."""

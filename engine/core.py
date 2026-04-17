@@ -32,6 +32,7 @@ from engine.context_item_builders import (
     build_deterministic_facts_item,
     build_historical_context_item,
     build_loop_contract_item,
+    build_memory_authority_item,
     build_runtime_metadata_item,
     build_session_anchor_item,
     build_working_evidence_item,
@@ -3986,18 +3987,43 @@ class AgentCore:
         current_facts: Optional[list[tuple[str, str, str]]],
         *,
         correction_turn: bool,
+        direct_fact_memory_only: bool = False,
     ) -> str:
+        if direct_fact_memory_only:
+            return ""
+
         historical_anchors = list(unified_hits or [])
         if current_facts and historical_anchors:
+            from engine.direct_fact_policy import normalize_memory_predicate
+
             fact_strings = {f"{s} {p} {o}".lower() for (s, p, o) in current_facts}
+            current_fact_index = {
+                (
+                    str(subject or "").strip().lower(),
+                    normalize_memory_predicate(str(predicate or "")),
+                ): str(object_ or "").strip().lower()
+                for subject, predicate, object_ in current_facts
+                if str(subject or "").strip() and str(predicate or "").strip()
+            }
             filtered_anchors = []
             for anchor in historical_anchors:
                 anchor_text = (anchor.get("key", "") + " " + anchor.get("anchor", "")).lower()
+                subject = str(anchor.get("subject") or "").strip().lower()
+                predicate = normalize_memory_predicate(
+                    str(anchor.get("predicate") or anchor.get("raw_predicate") or "")
+                )
+                object_ = str(anchor.get("object") or "").strip().lower()
+                current_object = current_fact_index.get((subject, predicate))
+                conflicts_with_current = bool(
+                    current_object
+                    and object_
+                    and current_object != object_
+                )
                 already_covered = any(
                     all(word in anchor_text for word in fact.split() if len(word) > 3)
                     for fact in fact_strings
                 )
-                if not already_covered:
+                if not already_covered and not conflicts_with_current:
                     filtered_anchors.append(anchor)
             historical_anchors = filtered_anchors
 
@@ -4396,6 +4422,18 @@ class AgentCore:
         if session_anchor_item is not None:
             items.append(session_anchor_item)
 
+        items.append(
+            build_memory_authority_item(
+                correction_turn=correction_turn,
+                direct_fact_memory_only=direct_fact_memory_only,
+                source="runtime",
+                trace_id="objective:memory_authority",
+                priority=21,
+                max_chars=900,
+                provenance={"route_type": route_type},
+            )
+        )
+
         deterministic_facts_item = build_deterministic_facts_item(
             facts=current_facts or [],
             source="semantic_graph",
@@ -4535,6 +4573,7 @@ class AgentCore:
             unified_hits,
             current_facts,
             correction_turn=correction_turn,
+            direct_fact_memory_only=direct_fact_memory_only,
         )
         historical_context_item = build_historical_context_item(
             content=historical_content,

@@ -61,10 +61,10 @@ def test_context_compiler_filters_items_by_phase_policy():
     assert "Instruction" in compiled.content
     assert "Meta Context" in compiled.content
     assert "Working Evidence" in compiled.content
+    assert "Working State" in compiled.content
     assert "Tools" in compiled.content
-    assert "Working State" not in compiled.content
     excluded = {record.item_id: record.reason for record in compiled.excluded}
-    assert excluded["working"] == "kind_not_allowed"
+    assert "working" not in excluded
 
 
 def test_build_messages_records_typed_context_compilation_summary():
@@ -200,6 +200,67 @@ def test_agent_core_phase_context_can_include_working_evidence():
     evidence_item = next(item for item in compiled["included"] if item["item_id"] == "working_evidence")
     assert evidence_item["kind"] == "evidence"
     assert evidence_item["provenance"]["selected_count"] >= 1
+
+
+def test_historical_context_drops_conflicts_with_current_deterministic_facts():
+    agent = AgentCore(MagicMock(), MagicMock(), MagicMock(), MagicMock())
+
+    content = agent._build_historical_context_content(
+        unified_hits=[
+            {
+                "kind": "triplet",
+                "subject": "User",
+                "predicate": "preferred editor",
+                "object": "Cursor",
+                "key": "Editor Preference",
+                "anchor": "User prefers Cursor for coding.",
+                "source": "semantic_graph",
+                "metadata": {"fact": "User preferred_editor Cursor"},
+            },
+            {
+                "kind": "triplet",
+                "subject": "User",
+                "predicate": "location",
+                "object": "Toronto",
+                "key": "Current City",
+                "anchor": "User is based in Toronto.",
+                "source": "semantic_graph",
+                "metadata": {"fact": "User location Toronto"},
+            },
+        ],
+        current_facts=[
+            ("User", "preferred_editor", "VS Code"),
+            ("User", "location", "Toronto"),
+        ],
+        correction_turn=False,
+        direct_fact_memory_only=False,
+    )
+
+    assert "Toronto" in content
+    assert "Cursor" not in content
+
+
+def test_historical_context_is_skipped_for_direct_fact_memory_only_turns():
+    agent = AgentCore(MagicMock(), MagicMock(), MagicMock(), MagicMock())
+
+    content = agent._build_historical_context_content(
+        unified_hits=[
+            {
+                "kind": "triplet",
+                "subject": "User",
+                "predicate": "location",
+                "object": "Toronto",
+                "key": "Current City",
+                "anchor": "User is based in Toronto.",
+                "source": "semantic_graph",
+            },
+        ],
+        current_facts=[("User", "location", "Toronto")],
+        correction_turn=False,
+        direct_fact_memory_only=True,
+    )
+
+    assert content == ""
 
 
 def test_agent_core_build_messages_can_include_conversation_tension():

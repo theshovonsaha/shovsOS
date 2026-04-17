@@ -63,7 +63,6 @@ interface AgentSettingsProfile {
     system_prompt?: string;
     tools?: string[];
     default_use_planner?: boolean;
-    default_loop_mode?: 'auto' | 'single' | 'managed';
     default_context_mode?: 'v1' | 'v2' | 'v3';
 }
 
@@ -75,6 +74,7 @@ interface SessionMemoryState {
         stance_signal_count: number;
         context_line_count: number;
         memory_signal_count: number;
+        candidate_signal_source?: string;
     };
     deterministic_facts: Array<{
         subject: string;
@@ -106,6 +106,7 @@ interface SessionMemoryState {
         confidence?: string;
         superseded?: boolean;
     }>;
+    candidate_context_preview?: string;
     recent_memory_signals: Array<{
         event_type: string;
         label: string;
@@ -135,6 +136,10 @@ export interface Message {
     content: string;
     files?: Attachment[];
     blocks: MessageBlock[];
+    historyIndex?: number;
+    createdAt?: string | null;
+    edited?: boolean;
+    editedAt?: string | null;
     _pendingStructured?: string;
 }
 
@@ -290,11 +295,8 @@ export function useAgent() {
     const [isStreaming, setIsStreaming] = useState(false);
     const [pendingFiles, setPendingFiles] = useState<Attachment[]>([]);
     const [forcedTools, setForcedTools] = useState<string[]>([]);
-    // V10 Layer Controls
+    // Runtime controls
     const [usePlanner, setUsePlanner] = useState<boolean>(localStorage.getItem('shovs_use_planner') !== 'false');
-    const [loopMode, setLoopMode] = useState<'auto' | 'single' | 'managed'>(
-        (localStorage.getItem('shovs_loop_mode') as 'auto' | 'single' | 'managed') || 'auto'
-    );
     const [maxToolCalls, setMaxToolCalls] = useState<string>(localStorage.getItem('shovs_max_tool_calls') || '');
     const [maxTurns, setMaxTurns] = useState<string>(localStorage.getItem('shovs_max_turns') || '');
     const [plannerModel, setPlannerModel] = useState<string>(localStorage.getItem('shovs_planner_model') || '');
@@ -339,7 +341,6 @@ export function useAgent() {
                 if (profile.model) setCurrentModel(profile.model);
                 if (profile.embed_model) setEmbedModel(profile.embed_model);
                 setUsePlanner(profile.default_use_planner ?? true);
-                setLoopMode(profile.default_loop_mode || 'auto');
                 setContextMode(profile.default_context_mode || 'v2');
             } catch (e) {
                 console.error('Failed to load agent defaults', e);
@@ -367,10 +368,6 @@ export function useAgent() {
     useEffect(() => {
         localStorage.setItem('shovs_use_planner', usePlanner.toString());
     }, [usePlanner]);
-
-    useEffect(() => {
-        localStorage.setItem('shovs_loop_mode', loopMode);
-    }, [loopMode]);
 
     useEffect(() => {
         if (maxToolCalls) localStorage.setItem('shovs_max_tool_calls', maxToolCalls);
@@ -610,10 +607,14 @@ export function useAgent() {
                 }
 
                 return {
-                    id: `hist-${i}`,
+                    id: m.id || `hist-${i}`,
                     role: m.role,
                     content,
                     blocks,
+                    historyIndex: i,
+                    createdAt: m.created_at || null,
+                    edited: Boolean(m.edited),
+                    editedAt: m.edited_at || null,
                 };
             });
             setMessages(loaded);
@@ -692,6 +693,22 @@ export function useAgent() {
         } catch { }
     };
 
+    const editSessionMessage = async (messageIndex: number, content: string) => {
+        if (!currentSessionId) return;
+        const res = await fetch(`/api/sessions/${currentSessionId}/messages/${messageIndex}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(withOwnerPayload({ content })),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data?.detail || `HTTP ${res.status}`);
+        }
+        await loadSession(currentSessionId);
+        await refreshSessionMemoryState(currentSessionId);
+        await fetchSessions();
+    };
+
     const addFiles = (filesList: File[]) => {
         const newAttachments = filesList.map(file => {
             const id = Math.random().toString(36).slice(2);
@@ -722,11 +739,33 @@ export function useAgent() {
         const userMsgId = Date.now().toString();
         const assistantMsgId = (Date.now() + 1).toString();
 
-        setMessages(prev => [
-            ...prev,
-            { id: userMsgId, role: 'user', content: text, files: filesToSend, blocks: [] },
-            { id: assistantMsgId, role: 'assistant', content: '', blocks: [] },
-        ]);
+        setMessages(prev => {
+            const nextIndex = prev.length;
+            return [
+                ...prev,
+                {
+                    id: userMsgId,
+                    role: 'user',
+                    content: text,
+                    files: filesToSend,
+                    blocks: [],
+                    historyIndex: nextIndex,
+                    createdAt: new Date().toISOString(),
+                    edited: false,
+                    editedAt: null,
+                },
+                {
+                    id: assistantMsgId,
+                    role: 'assistant',
+                    content: '',
+                    blocks: [],
+                    historyIndex: nextIndex + 1,
+                    createdAt: new Date().toISOString(),
+                    edited: false,
+                    editedAt: null,
+                },
+            ];
+        });
 
         try {
             const fd = appendOwnerId(new FormData());
@@ -741,7 +780,6 @@ export function useAgent() {
             fd.append('context_mode', contextMode);
             fd.append('embed_model', embedModel);
             fd.append('use_planner', usePlanner.toString());
-            fd.append('loop_mode', loopMode);
             if (maxToolCalls.trim()) fd.append('max_tool_calls', maxToolCalls.trim());
             if (maxTurns.trim()) fd.append('max_turns', maxTurns.trim());
 
@@ -1208,7 +1246,6 @@ export function useAgent() {
         lastUserText, currentToken, lastAgentResponse,
         startRecording, stopRecording, stopSpeaking,
         usePlanner, setUsePlanner,
-        loopMode, setLoopMode,
         maxToolCalls, setMaxToolCalls,
         maxTurns, setMaxTurns,
         plannerModel, setPlannerModel,
@@ -1225,6 +1262,7 @@ export function useAgent() {
         setShowObserverActivity,
         clearSessionContext,
         refreshSessionMemoryState,
+        editSessionMessage,
         loadSession, newSession, deleteSession,
         addFiles, removeFile, sendMessage, stopExecution, bottomRef, conversationRef,
         pendingConfirmation, approveConfirmation, denyConfirmation,

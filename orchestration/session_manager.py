@@ -122,6 +122,13 @@ class SessionManager:
                 self._sessions[s.id] = s
 
     def _row_to_session(self, r) -> Session:
+        candidate_signals = (
+            json.loads(r["candidate_signals_json"])
+            if "candidate_signals_json" in r.keys() and r["candidate_signals_json"]
+            else parse_candidate_context(r["candidate_context"] if "candidate_context" in r.keys() else "")
+        )
+        full_history = self._normalize_history(json.loads(r["full_history"]))
+        sliding_window = self._normalize_history(json.loads(r["sliding_window"]))
         return Session(
             id=r["id"],
             agent_id=r["agent_id"] if "agent_id" in r.keys() else "default",
@@ -131,14 +138,10 @@ class SessionManager:
             model=r["model"],
             system_prompt=r["system_prompt"],
             compressed_context=r["compressed_context"] or "",
-            candidate_context=r["candidate_context"] if "candidate_context" in r.keys() else "",
-            candidate_signals=(
-                json.loads(r["candidate_signals_json"])
-                if "candidate_signals_json" in r.keys() and r["candidate_signals_json"]
-                else parse_candidate_context(r["candidate_context"] if "candidate_context" in r.keys() else "")
-            ),
-            sliding_window=json.loads(r["sliding_window"]),
-            full_history=json.loads(r["full_history"]),
+            candidate_context=render_candidate_signals(candidate_signals) if candidate_signals else "",
+            candidate_signals=candidate_signals,
+            sliding_window=sliding_window,
+            full_history=full_history,
             title=r["title"],
             first_message=r["first_message"] if "first_message" in r.keys() else None,
             parent_id=r["parent_id"] if "parent_id" in r.keys() else None,
@@ -147,6 +150,8 @@ class SessionManager:
         )
 
     def _save_to_db(self, s: Session):
+        candidate_context = render_candidate_signals(s.candidate_signals) if s.candidate_signals else ""
+        s.candidate_context = candidate_context
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO sessions
@@ -156,7 +161,7 @@ class SessionManager:
             ''', (
                 s.id, s.agent_id, s.owner_id, s.created_at, s.updated_at, s.model, s.system_prompt,
                 s.compressed_context,
-                s.candidate_context,
+                candidate_context,
                 json.dumps(s.candidate_signals),
                 json.dumps(s.sliding_window),
                 json.dumps(s.full_history),
@@ -311,8 +316,8 @@ class SessionManager:
 
     def update_candidate_context(self, session_id: str, candidate_context: str):
         if s := self.get(session_id):
-            s.candidate_context = candidate_context
             s.candidate_signals = parse_candidate_context(candidate_context)
+            s.candidate_context = render_candidate_signals(s.candidate_signals) if s.candidate_signals else ""
             s.updated_at = datetime.now(timezone.utc).isoformat()
             self._save_to_db(s)
 
@@ -322,6 +327,85 @@ class SessionManager:
             s.candidate_context = render_candidate_signals(s.candidate_signals)
             s.updated_at = datetime.now(timezone.utc).isoformat()
             self._save_to_db(s)
+
+    @staticmethod
+    def _normalize_history(history: list[dict]) -> list[dict]:
+        normalized: list[dict] = []
+        for index, item in enumerate(history or []):
+            role = str((item or {}).get("role") or "user")
+            content = str((item or {}).get("content") or "")
+            normalized.append(
+                {
+                    "id": str((item or {}).get("id") or uuid.uuid4()),
+                    "role": role,
+                    "content": content,
+                    "created_at": (item or {}).get("created_at"),
+                    "edited": bool((item or {}).get("edited", False)),
+                    "edited_at": (item or {}).get("edited_at"),
+                    "sequence": int((item or {}).get("sequence") or index),
+                }
+            )
+        return normalized
+
+    def clear_derived_state(self, session_id: str, owner_id: Optional[str] = None) -> bool:
+        s = self.get(session_id, owner_id=owner_id)
+        if not s:
+            return False
+        s.compressed_context = ""
+        s.candidate_signals = []
+        s.candidate_context = ""
+        s.updated_at = datetime.now(timezone.utc).isoformat()
+        self._save_to_db(s)
+        return True
+
+    def edit_message(
+        self,
+        session_id: str,
+        *,
+        content: str,
+        message_id: Optional[str] = None,
+        message_index: Optional[int] = None,
+        owner_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        s = self.get(session_id, owner_id=owner_id)
+        if not s:
+            return None
+
+        target_index: Optional[int] = None
+        if message_id is not None:
+            for index, item in enumerate(s.full_history):
+                if str(item.get("id") or "") == str(message_id):
+                    target_index = index
+                    break
+        elif message_index is not None and 0 <= int(message_index) < len(s.full_history):
+            target_index = int(message_index)
+
+        if target_index is None:
+            return None
+
+        target = dict(s.full_history[target_index])
+        target["content"] = str(content or "")
+        target["edited"] = True
+        target["edited_at"] = datetime.now(timezone.utc).isoformat()
+        target.setdefault("created_at", target["edited_at"])
+        target.setdefault("id", str(uuid.uuid4()))
+        target["sequence"] = target_index
+        s.full_history[target_index] = target
+        s.sliding_window = s.full_history[-SLIDING_WINDOW_SIZE:]
+        s.message_count = len(s.full_history)
+
+        first_user = next(
+            (str(item.get("content") or "") for item in s.full_history if str(item.get("role") or "") == "user"),
+            None,
+        )
+        s.first_message = first_user
+        s.title = (first_user or "New Chat")[:60] + ("…" if first_user and len(first_user) > 60 else "")
+        s.compressed_context = ""
+        s.candidate_signals = []
+        s.candidate_context = ""
+        s.updated_at = datetime.now(timezone.utc).isoformat()
+        self._save_to_db(s)
+        return target
 
     def append_message(self, session_id: str, role: str, content: str) -> bool:
         """
@@ -333,7 +417,16 @@ class SessionManager:
             return False
 
         is_first = False
-        msg = {"role": role, "content": content}
+        now = datetime.now(timezone.utc).isoformat()
+        msg = {
+            "id": str(uuid.uuid4()),
+            "role": role,
+            "content": content,
+            "created_at": now,
+            "edited": False,
+            "edited_at": None,
+            "sequence": len(s.full_history),
+        }
         s.full_history.append(msg)
         s.sliding_window.append(msg)
 

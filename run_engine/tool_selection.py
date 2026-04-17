@@ -31,6 +31,11 @@ def build_actor_request_content(
         )
     return (
         f"{objective_block}"
+        "Decision policy:\n"
+        "- Use the smallest sufficient next step.\n"
+        "- If deterministic facts in context already answer the user, answer directly and do not call tools.\n"
+        "- If one exact probe can close the gap, prefer that over broad multi-step exploration.\n"
+        "- Do not repeat stale context or speculative candidate signals as if they were facts.\n\n"
         "The allowed tools below are available in this runtime right now. If a current-information request can be answered with an allowed tool, use that tool instead of claiming you lack access.\n\n"
         f"Allowed tools: {', '.join(allowed_tools)}\n\n"
         f"Recent tool results:\n{recent_results}\n\n"

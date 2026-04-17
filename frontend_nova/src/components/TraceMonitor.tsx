@@ -1,7 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   buildMonitorOverview as buildNovaMonitorOverview,
-  buildReplaySections as buildNovaReplaySections,
   buildTimelineEntries as buildNovaTimelineEntries,
   describeTraceEvent as describeNovaTraceEvent,
   humanizeTraceEvent as humanizeNovaTraceEvent,
@@ -56,6 +55,10 @@ interface RunReplaySummary {
   eval_count: number;
   trace_event_count: number;
   evidence_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  estimated_cost_usd: number;
 }
 
 interface RunReplayArtifact {
@@ -89,6 +92,11 @@ interface RunReplayPass {
   notes?: string;
   selected_tools?: string[];
   response_preview?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  total_tokens?: number;
+  estimated_cost_usd?: number;
+  cumulative_cost_usd?: number;
   created_at?: string;
 }
 
@@ -178,6 +186,19 @@ const BASE_EVENT_TYPES = [
   'assistant_response',
 ] as const;
 
+function formatCurrency(value?: number): string {
+  const safe = Number(value || 0);
+  if (!safe) return '$0.00';
+  if (safe < 0.01) return `$${safe.toFixed(4)}`;
+  return `$${safe.toFixed(2)}`;
+}
+
+function formatTokens(value?: number): string {
+  const safe = Number(value || 0);
+  if (safe >= 1000) return `${(safe / 1000).toFixed(1)}k`;
+  return String(safe);
+}
+
 function formatTime(ts?: number): string {
   if (!ts) return '--';
   const d = new Date(ts * 1000);
@@ -223,10 +244,10 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   onDenyConfirmation,
   onStopExecution,
 }) => {
-  const [focusMode, setFocusMode] = useState<'overview' | 'timeline' | 'inspect'>(() => {
+  const [focusMode, setFocusMode] = useState<'story' | 'passes' | 'inspect'>(() => {
     const stored = localStorage.getItem(TRACE_FOCUS_KEY);
-    if (stored === 'inspect' || stored === 'timeline') return stored;
-    return 'overview';
+    if (stored === 'inspect' || stored === 'passes') return stored;
+    return 'story';
   });
   const [scope, setScope] = useState<'session' | 'all'>(() => {
     const stored = localStorage.getItem(VIEW_SCOPE_KEY);
@@ -286,7 +307,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         .toLowerCase();
       return haystack.includes(needle);
     });
-  }, [events, search]);
+  }, [eventType, events, search]);
 
   const oldestTs = events.length ? events[events.length - 1].ts : undefined;
   const overview = useMemo(
@@ -298,18 +319,59 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
       }),
     [events, pendingConfirmation, runReplay],
   );
-  const timelineEntries = useMemo(
-    () => buildNovaTimelineEntries(filteredEvents, 32),
-    [filteredEvents],
-  );
   const recentTimelineEntries = useMemo(
     () => buildNovaTimelineEntries(events, 6),
     [events],
   );
-  const replaySections = useMemo(
-    () => buildNovaReplaySections(runReplay),
+  const recentReplayPasses = useMemo(
+    () => [...(runReplay?.passes || [])].slice(-8).reverse(),
     [runReplay],
   );
+  const runStoryCards = useMemo(() => {
+    const items: Array<{
+      id: string;
+      title: string;
+      eyebrow: string;
+      summary: string;
+      detail?: string;
+    }> = [];
+    if (runReplay?.latest_pass) {
+      items.push({
+        id: 'latest-pass',
+        title: runReplay.latest_pass.phase || 'Latest pass',
+        eyebrow: 'Latest pass',
+        summary:
+          runReplay.latest_pass.objective ||
+          runReplay.latest_pass.strategy ||
+          runReplay.latest_pass.response_preview ||
+          'No pass summary stored.',
+        detail:
+          (runReplay.latest_pass.selected_tools || []).length > 0
+            ? `tools: ${(runReplay.latest_pass.selected_tools || []).join(', ')}`
+            : undefined,
+      });
+    }
+    if ((runReplay?.evidence || []).length > 0) {
+      const firstEvidence = runReplay?.evidence?.[0];
+      items.push({
+        id: 'latest-evidence',
+        title: firstEvidence?.phase || 'Evidence',
+        eyebrow: 'Best evidence',
+        summary: firstEvidence?.summary || 'Evidence was collected.',
+        detail: firstEvidence?.source || undefined,
+      });
+    }
+    for (const entry of recentTimelineEntries.slice(0, 4)) {
+      items.push({
+        id: `timeline-${entry.id}`,
+        title: entry.stage,
+        eyebrow: entry.passLabel || 'Timeline',
+        summary: entry.headline,
+        detail: entry.lines.join(' · '),
+      });
+    }
+    return items.slice(0, 6);
+  }, [recentTimelineEntries, runReplay]);
 
   const fetchRecent = useCallback(
     async (opts?: { append?: boolean; beforeTs?: number }) => {
@@ -542,10 +604,6 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     () => [...(runReplay?.checkpoints || [])].slice(-4).reverse(),
     [runReplay],
   );
-  const recentReplayPasses = useMemo(
-    () => [...(runReplay?.passes || [])].slice(-4).reverse(),
-    [runReplay],
-  );
 
   return (
     <div className='trace-monitor-shell'>
@@ -560,16 +618,16 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         <div className='trace-controls'>
           <div className='trace-mode-switch'>
             <button
-              className={focusMode === 'overview' ? 'active' : ''}
-              onClick={() => setFocusMode('overview')}
+              className={focusMode === 'story' ? 'active' : ''}
+              onClick={() => setFocusMode('story')}
             >
-              Overview
+              Story
             </button>
             <button
-              className={focusMode === 'timeline' ? 'active' : ''}
-              onClick={() => setFocusMode('timeline')}
+              className={focusMode === 'passes' ? 'active' : ''}
+              onClick={() => setFocusMode('passes')}
             >
-              Timeline
+              Passes
             </button>
             <button
               className={focusMode === 'inspect' ? 'active' : ''}
@@ -653,10 +711,18 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             {(stats?.max_pass_index ?? -1) >= 0 ? stats?.max_pass_index : '--'}
           </span>
         </div>
+        <div className='trace-stat-card'>
+          <span className='k'>run tokens</span>
+          <span className='v'>{formatTokens(runReplay?.summary?.total_tokens ?? 0)}</span>
+        </div>
+        <div className='trace-stat-card'>
+          <span className='k'>run cost</span>
+          <span className='v'>{formatCurrency(runReplay?.summary?.estimated_cost_usd ?? 0)}</span>
+        </div>
       </div>
 
       {error && <div className='trace-error'>{error}</div>}
-      {focusMode === 'overview' ? (
+      {focusMode === 'story' ? (
         <div className='trace-overview-shell'>
           <section className='trace-overview-section'>
             <div className='trace-section-head'>
@@ -692,132 +758,72 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
 
           <section className='trace-overview-section'>
             <div className='trace-section-head'>
-              <div className='trace-section-title'>Recent Timeline</div>
+              <div className='trace-section-title'>Run Story</div>
               <div className='trace-section-subtitle'>
-                The latest execution steps in plain language
+                One condensed path through what happened, when, and why
               </div>
             </div>
-            <div className='trace-timeline-list compact'>
-              {recentTimelineEntries.length === 0 ? (
-                <div className='trace-empty'>No timeline activity yet.</div>
+            <div className='trace-replay-grid'>
+              {runStoryCards.length === 0 ? (
+                <div className='trace-empty'>No run story available yet.</div>
               ) : (
-                recentTimelineEntries.map((entry) => (
-                  <button
-                    key={entry.id}
-                    className={`trace-timeline-card tone-${entry.tone}`}
-                    onClick={() => {
-                      setSelectedId(entry.id);
-                      setFocusMode('inspect');
-                    }}
-                  >
-                    <div className='trace-timeline-top'>
-                      <span className='trace-timeline-stage'>{entry.stage}</span>
-                      <span className='trace-timeline-time'>{formatTime(entry.ts)}</span>
-                    </div>
-                    <div className='trace-timeline-headline'>{entry.headline}</div>
-                    <div className='trace-timeline-lines'>
-                      {entry.lines.map((line, index) => (
-                        <div key={`${entry.id}-line-${index}`} className='trace-timeline-line'>
-                          {line}
+                runStoryCards.map((card) => (
+                  <div key={card.id} className='trace-replay-panel'>
+                    <div className='trace-replay-panel-title'>{card.eyebrow}</div>
+                    <div className='trace-replay-panel-list'>
+                      <div className='trace-replay-card tone-neutral'>
+                        <div className='trace-replay-card-top'>
+                          <span>{card.title}</span>
                         </div>
-                      ))}
+                        <div className='trace-replay-card-summary'>{card.summary}</div>
+                        {card.detail ? (
+                          <div className='trace-replay-card-detail'>{card.detail}</div>
+                        ) : null}
+                      </div>
                     </div>
-                    <div className='trace-timeline-meta'>
-                      {entry.passLabel ? <span>{entry.passLabel}</span> : null}
-                      {entry.toolName ? <span>{entry.toolName}</span> : null}
-                    </div>
-                  </button>
+                  </div>
                 ))
               )}
             </div>
           </section>
-
-          {replaySections.length > 0 ? (
-            <section className='trace-overview-section'>
-              <div className='trace-section-head'>
-                <div className='trace-section-title'>Run Replay Snapshot</div>
-                <div className='trace-section-subtitle'>
-                  Evidence, passes, and artifacts without leaving overview
-                </div>
-              </div>
-              <div className='trace-replay-grid'>
-                {replaySections.map((section) => (
-                  <div key={section.id} className='trace-replay-panel'>
-                    <div className='trace-replay-panel-title'>{section.title}</div>
-                    <div className='trace-replay-panel-list'>
-                      {section.entries.map((entry) => (
-                        <div key={entry.id} className={`trace-replay-card tone-${entry.tone}`}>
-                          <div className='trace-replay-card-top'>
-                            <span>{entry.title}</span>
-                            <span>{entry.eyebrow || ''}</span>
-                          </div>
-                          <div className='trace-replay-card-summary'>{entry.summary}</div>
-                          {entry.detail ? (
-                            <div className='trace-replay-card-detail'>{entry.detail}</div>
-                          ) : null}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
-          ) : null}
         </div>
-      ) : focusMode === 'timeline' ? (
+      ) : focusMode === 'passes' ? (
         <div className='trace-overview-shell'>
           <section className='trace-overview-section'>
             <div className='trace-list-head timeline-head'>
-              <input
-                className='trace-search'
-                placeholder='search timeline'
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-              />
-              <span className='trace-count'>{timelineEntries.length}</span>
+              <div className='trace-section-title'>Passes and Cost</div>
+              <span className='trace-count'>{recentReplayPasses.length}</span>
             </div>
-            <div className='trace-timeline-list'>
-              {timelineEntries.length === 0 ? (
-                <div className='trace-empty'>No timeline events for this filter.</div>
+            <div className='trace-run-list'>
+              {recentReplayPasses.length === 0 ? (
+                <div className='trace-empty'>No run passes stored yet.</div>
               ) : (
-                timelineEntries.map((entry) => (
-                  <button
-                    key={entry.id}
-                    className={`trace-timeline-card tone-${entry.tone}`}
-                    onClick={() => {
-                      setSelectedId(entry.id);
-                      setFocusMode('inspect');
-                    }}
-                  >
-                    <div className='trace-timeline-top'>
-                      <span className='trace-timeline-stage'>{entry.stage}</span>
-                      <span className='trace-timeline-time'>{formatTime(entry.ts)}</span>
+                recentReplayPasses.map((pass) => (
+                  <div key={`pass-${pass.pass_id}`} className='trace-run-card'>
+                    <div className='trace-run-card-head'>
+                      <span>
+                        {pass.phase || 'phase'} · {pass.status || '--'}
+                      </span>
+                      <span>{formatTime(pass.created_at ? Date.parse(pass.created_at) / 1000 : undefined)}</span>
                     </div>
-                    <div className='trace-timeline-headline'>{entry.headline}</div>
-                    <div className='trace-timeline-lines'>
-                      {entry.lines.map((line, index) => (
-                        <div key={`${entry.id}-line-${index}`} className='trace-timeline-line'>
-                          {line}
-                        </div>
-                      ))}
+                    <div className='trace-run-card-copy'>
+                      {(pass.objective || pass.strategy || pass.response_preview || 'No pass summary stored.').trim()}
                     </div>
                     <div className='trace-timeline-meta'>
-                      {entry.passLabel ? <span>{entry.passLabel}</span> : null}
-                      {entry.toolName ? <span>{entry.toolName}</span> : null}
-                      {entry.runId ? <span>{entry.runId.slice(0, 10)}</span> : null}
+                      <span>in {formatTokens(pass.input_tokens || 0)}</span>
+                      <span>out {formatTokens(pass.output_tokens || 0)}</span>
+                      <span>total {formatTokens(pass.total_tokens || 0)}</span>
+                      <span>turn {formatCurrency(pass.estimated_cost_usd || 0)}</span>
+                      <span>run {formatCurrency(pass.cumulative_cost_usd || 0)}</span>
                     </div>
-                  </button>
+                    {(pass.selected_tools || []).length > 0 ? (
+                      <div className='trace-run-card-copy'>
+                        tools: {(pass.selected_tools || []).join(', ')}
+                      </div>
+                    ) : null}
+                  </div>
                 ))
               )}
-            </div>
-            <div className='trace-list-foot'>
-              <button
-                className='trace-action'
-                onClick={loadOlder}
-                disabled={!oldestTs || loadingOlder}
-              >
-                {loadingOlder ? 'loading...' : 'load older'}
-              </button>
             </div>
           </section>
         </div>

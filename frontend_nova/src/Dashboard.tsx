@@ -14,7 +14,6 @@ interface AgentProfile {
     bootstrap_files?: string[];
     bootstrap_max_chars?: number;
     default_use_planner?: boolean;
-    default_loop_mode?: 'auto' | 'single' | 'managed';
     default_context_mode?: 'v1' | 'v2' | 'v3';
 }
 
@@ -276,7 +275,6 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
     const [bootstrapFilesText, setBootstrapFilesText] = useState((initialAgent?.bootstrap_files || ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md']).join(', '));
     const [bootstrapMaxChars, setBootstrapMaxChars] = useState(String(initialAgent?.bootstrap_max_chars || 8000));
     const [defaultUsePlanner, setDefaultUsePlanner] = useState(initialAgent?.default_use_planner ?? true);
-    const [defaultLoopMode, setDefaultLoopMode] = useState<'auto' | 'single' | 'managed'>(initialAgent?.default_loop_mode || 'auto');
     const [defaultContextMode, setDefaultContextMode] = useState<'v1' | 'v2' | 'v3'>(initialAgent?.default_context_mode || 'v2');
     const [selectedTools, setSelectedTools] = useState<string[]>(initialAgent?.tools || ['web_search', 'web_fetch', 'query_memory', 'store_memory']);
     const [availableTools, setAvailableTools] = useState<any[]>([]);
@@ -307,7 +305,6 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
         if (!description.trim() || !isEdit) setDescription(preset.description);
         if (!systemPrompt.trim() || !isEdit) setSystemPrompt(preset.systemPrompt);
         setSelectedTools(preset.tools);
-        setDefaultLoopMode(preset.defaultLoopMode);
         setDefaultContextMode(preset.defaultContextMode);
         setDefaultUsePlanner(preset.defaultUsePlanner);
         setBootstrapFilesText(preset.bootstrapFiles.join(', '));
@@ -335,7 +332,6 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                     .filter(Boolean),
                 bootstrap_max_chars: Number(bootstrapMaxChars) || 8000,
                 default_use_planner: defaultUsePlanner,
-                default_loop_mode: defaultLoopMode,
                 default_context_mode: defaultContextMode,
             });
             await fetch(isEdit ? withOwnerQuery(`/api/agents/${initialAgent!.id}`) : '/api/agents', {
@@ -444,15 +440,6 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
 
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
                         <div className="input-group">
-                            <label>Default Loop</label>
-                            <PremiumSelect
-                                label="Execution Loop"
-                                value={defaultLoopMode}
-                                options={{ runtime: ['auto', 'single', 'managed'] }}
-                                onChange={(value) => setDefaultLoopMode(value as 'auto' | 'single' | 'managed')}
-                            />
-                        </div>
-                        <div className="input-group">
                             <label>Default Context Mode</label>
                             <PremiumSelect
                                 label="Context Engine"
@@ -532,13 +519,13 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                                 <div><span>Bootstrap Docs</span><strong>{parsedBootstrapFiles.length}</strong></div>
                                 <div><span>Bootstrap Budget</span><strong>{effectiveBootstrapBudget} chars</strong></div>
                                 <div><span>Per Doc Budget</span><strong>{estimatedPerDocBudget} chars</strong></div>
-                                <div><span>Loop Mode</span><strong>{defaultLoopMode}</strong></div>
+                                <div><span>Runtime</span><strong>managed</strong></div>
                                 <div><span>Context Mode</span><strong>{defaultContextMode}</strong></div>
                                 <div><span>Planner</span><strong>{defaultUsePlanner ? 'on' : 'off'}</strong></div>
                                 <div><span>Selected Tools</span><strong>{selectedTools.length}</strong></div>
                             </div>
                             <div className="agent-builder-note">
-                                Runtime shape: platform core prompt + agent prompt + selected bootstrap docs + tool registry + loop/context defaults.
+                                Runtime shape: platform core prompt + agent prompt + selected bootstrap docs + tool registry + managed runtime context defaults.
                             </div>
                         </div>
                     </div>

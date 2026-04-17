@@ -9,6 +9,7 @@ import pytest
 import asyncio
 import os
 import json
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
 
 # Force the semantic graph to use a test DB
@@ -83,7 +84,7 @@ async def test_store_and_query_tools():
         assert "peanuts" in res_store
         mock_instance.add_triplet.assert_called_once()
         call_args = mock_instance.add_triplet.call_args
-        assert call_args[0] == ("User", "is allergic to", "peanuts")
+        assert call_args[0] == ("User", "is_allergic_to", "peanuts")
         
         # Test Query
         res_query = await _query_memory("allergies")
@@ -110,3 +111,74 @@ async def test_store_memory_uses_runtime_embed_model():
 
         assert "Successfully stored" in res_store
         MockGraph.assert_called_once_with(embedding_model="lmstudio:text-embedding-nomic-embed-text-v1.5")
+
+
+@pytest.mark.asyncio
+async def test_store_memory_defaults_missing_subject_to_user():
+    from plugins.tools import _store_memory
+
+    with patch("memory.semantic_graph.SemanticGraph") as MockGraph:
+        mock_instance = MagicMock()
+        mock_instance.add_triplet = AsyncMock()
+        MockGraph.return_value = mock_instance
+
+        res_store = await _store_memory(
+            predicate="location",
+            object_="Toronto",
+        )
+
+        assert "Successfully stored" in res_store
+        mock_instance.add_triplet.assert_called_once_with(
+            "User",
+            "location",
+            "Toronto",
+            owner_id=None,
+            run_id=None,
+            locus_id=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_update_memory_supersedes_existing_session_fact_and_indexes_semantic_memory():
+    from plugins.tools import _update_memory
+
+    with patch("memory.semantic_graph.SemanticGraph") as MockGraph, patch("plugins.tools.SessionManager") as MockSessionManager:
+        mock_instance = MagicMock()
+        mock_instance.add_triplet = AsyncMock()
+        MockGraph.return_value = mock_instance
+        MockSessionManager.return_value.get.return_value = SimpleNamespace(message_count=7)
+
+        res_update = await _update_memory(
+            predicate="location",
+            object_="Toronto",
+            _session_id="session-1",
+            _owner_id="owner-1",
+            _run_id="run-1",
+        )
+
+        assert "Successfully updated memory" in res_update
+        mock_instance.void_temporal_fact.assert_called_once_with(
+            "session-1",
+            "User",
+            "location",
+            7,
+            owner_id="owner-1",
+        )
+        mock_instance.add_temporal_fact.assert_called_once_with(
+            "session-1",
+            "User",
+            "location",
+            "Toronto",
+            7,
+            owner_id="owner-1",
+            run_id="run-1",
+            locus_id=None,
+        )
+        mock_instance.add_triplet.assert_called_once_with(
+            "User",
+            "location",
+            "Toronto",
+            owner_id="owner-1",
+            run_id="run-1",
+            locus_id=None,
+        )

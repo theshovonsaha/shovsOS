@@ -8,9 +8,11 @@ from typing import Any, AsyncIterator, Optional
 from config.logger import log
 from engine.candidate_signals import extract_stance_signals
 from engine.conversation_tension import analyze_conversation_tension
+from engine.core import _get_token_encoding
 from engine.context_schema import ContextPhase
 from engine.context_governor import ContextGovernor
 from engine.deterministic_facts import extract_user_stated_fact_updates
+from engine.direct_fact_policy import should_answer_direct_fact_from_memory
 from engine.tool_loop_guard import ToolLoopGuard
 from engine.tool_contract import (
     canonical_tool_call,
@@ -38,12 +40,7 @@ from run_engine.evidence_lane import (
     tool_kind_priority,
     tool_result_matches_exact_target,
 )
-from run_engine.memory_pipeline import (
-    apply_memory_commit,
-    build_deterministic_memory_commit,
-    build_grounding_text,
-    plan_memory_commit,
-)
+from run_engine.memory_pipeline import build_grounding_text
 from run_engine.skill_loader import list_available_skills, load_skill_context
 from run_engine.tool_selection import (
     build_actor_request_content,
@@ -85,6 +82,48 @@ Rules:
 - If the phase context shows drift or contradiction between the user's current turn and earlier user-stated facts, name that tension plainly.
 - Do not optimize only for comfort or agreement. If the user's current claim conflicts with earlier facts or evidence, challenge it directly and ask for reconciliation when needed.
 """
+
+
+def _estimate_text_tokens(text: str) -> int:
+    normalized = str(text or "")
+    if not normalized:
+        return 0
+    encoding = _get_token_encoding()
+    if encoding is None:
+        return max(1, len(normalized) // 4)
+    try:
+        return len(encoding.encode(normalized))
+    except Exception:
+        return max(1, len(normalized) // 4)
+
+
+def _estimate_message_tokens(messages: list[dict[str, Any]]) -> int:
+    total = 0
+    for item in messages or []:
+        total += _estimate_text_tokens(str(item.get("content") or ""))
+        total += 4
+    return total
+
+
+def _estimate_model_cost_usd(model: str, input_tokens: int, output_tokens: int) -> float:
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return 0.0
+
+    rates: dict[str, tuple[float, float]] = {
+        "openai:gpt-5": (1.25 / 1_000_000, 10.0 / 1_000_000),
+        "openai:gpt-4.1": (2.0 / 1_000_000, 8.0 / 1_000_000),
+        "openai:gpt-4o": (2.5 / 1_000_000, 10.0 / 1_000_000),
+        "groq:llama3-groq-tool-use": (0.0, 0.0),
+        "groq:": (0.0, 0.0),
+        "ollama:": (0.0, 0.0),
+        "lmstudio:": (0.0, 0.0),
+        "llamacpp:": (0.0, 0.0),
+        "local_openai:": (0.0, 0.0),
+    }
+    matched = next((price for prefix, price in rates.items() if normalized.startswith(prefix)), (0.0, 0.0))
+    input_rate, output_rate = matched
+    return round((max(0, input_tokens) * input_rate) + (max(0, output_tokens) * output_rate), 8)
 
 
 class RunEngine:
@@ -224,6 +263,7 @@ class RunEngine:
         try:
             tool_results: list[dict[str, Any]] = []
             selected_tools = list(request.forced_tools)
+            failed_tool_names: set[str] = set()
             planner_enabled = bool(request.use_planner)
             allowed_tools_list = self._list_allowed_tools(request.allowed_tools)
             latest_strategy = ""
@@ -239,7 +279,10 @@ class RunEngine:
             max_turns = max(1, min(int(request.max_turns or 3), 6))
             if normalized_max_tool_calls is not None:
                 max_turns = min(max_turns, normalized_max_tool_calls)
-            current_facts = self._current_facts(session.id, request.owner_id)
+            current_facts = self._context_governor.get_current_facts(
+                session.id,
+                owner_id=request.owner_id,
+            )
             stance_signals = extract_stance_signals(
                 request.user_message,
                 turn_index=int(getattr(session, "message_count", 0) or 0),
@@ -264,6 +307,10 @@ class RunEngine:
             deterministic_keyed_facts, deterministic_voids = extract_user_stated_fact_updates(
                 request.user_message,
                 current_facts=current_facts,
+            )
+            direct_fact_memory_only = should_answer_direct_fact_from_memory(
+                request.user_message,
+                current_facts,
             )
             conversation_tension = analyze_conversation_tension(
                 user_message=request.user_message,
@@ -370,7 +417,7 @@ class RunEngine:
                     "risk_tier": code_intent.execution_risk_tier,
                 }
 
-            if not selected_tools and planner_enabled and self.orchestrator is not None:
+            if not selected_tools and not direct_fact_memory_only and planner_enabled and self.orchestrator is not None:
                 planning_packet = self._compile_phase_packet(
                     context_engine=active_context_engine,
                     run_id=run.run_id,
@@ -394,8 +441,8 @@ class RunEngine:
                     tools_list=allowed_tools_list,
                     model=request.planner_model or session_model,
                     session_has_history=bool(session.full_history),
-                    current_fact_count=0,
-                    failed_tools=[],
+                    current_fact_count=len(current_facts),
+                    failed_tools=sorted(failed_tool_names),
                     compiled_context=planning_packet.content,
                     skills_list=available_skills if available_skills else None,
                 )
@@ -458,7 +505,7 @@ class RunEngine:
                     packet=planning_packet,
                 )
 
-            if not selected_tools:
+            if not selected_tools and not direct_fact_memory_only:
                 selected_tools = self._bootstrap_tools_for_turn(
                     user_message=request.user_message,
                     allowed_tools=allowed_tools_list,
@@ -597,6 +644,7 @@ class RunEngine:
                 )
                 yield {"type": "tool_call", **call_payload}
                 if validation_error:
+                    failed_tool_names.add(tool_call.tool_name)
                     result_payload = {
                         "tool_name": tool_call.tool_name,
                         "success": False,
@@ -642,6 +690,7 @@ class RunEngine:
                 if is_retry_sensitive_tool(tool_call.tool_name):
                     repeat_count = repeated_tool_signatures.get(signature, 0)
                     if repeat_count >= 1:
+                        failed_tool_names.add(tool_call.tool_name)
                         duplicate_message = (
                             f"Duplicate {tool_call.tool_name} call suppressed for this run. "
                             "Use the existing result or pivot to a different query/source."
@@ -808,6 +857,8 @@ class RunEngine:
                     "arguments": dict(tool_call.arguments or {}),
                 }
                 tool_results.append(result_payload)
+                if not tool_result.success:
+                    failed_tool_names.add(tool_result.tool_name)
 
                 self.run_store.save_checkpoint(
                     run_id=run.run_id,
@@ -847,8 +898,9 @@ class RunEngine:
                     content=str(tool_result.content or ""),
                 )
                 if stall_alert:
-                    latest_notes = str(stall_alert["message"] or "")
                     alert_tool_name = str(stall_alert.get("tool_name") or tool_result.tool_name or "unknown")
+                    failed_tool_names.add(alert_tool_name)
+                    latest_notes = str(stall_alert["message"] or "")
                     alert_payload = {
                         "tool_name": alert_tool_name,
                         "success": False,
@@ -1047,6 +1099,10 @@ class RunEngine:
                 selected_tools=[],
                 tool_results=tool_results[-5:],
                 packet=response_packet,
+                output_tokens=0,
+                input_tokens=0,
+                estimated_cost_usd=0.0,
+                model=session_model,
             )
             async for token in current_adapter.stream(
                 model=clean_model,
@@ -1085,6 +1141,8 @@ class RunEngine:
                 tool_results=tool_results[-5:],
                 packet=response_packet,
                 response_preview=final_response,
+                prompt_messages=final_messages,
+                model=session_model,
             )
 
             verification = {"supported": True, "issues": [], "confidence": 0.0}
@@ -1507,16 +1565,18 @@ class RunEngine:
         existing_candidate_context = getattr(session, "candidate_context", "") if session is not None else ""
 
         if context_engine is None or not hasattr(context_engine, "compress_exchange"):
-            commit_plan = build_deterministic_memory_commit(
+            commit_plan = self._context_governor.build_memory_commit_plan(
+                user_message=request.user_message,
+                tool_results=tool_results,
                 deterministic_keyed_facts=deterministic_keyed_facts,
                 deterministic_voids=deterministic_voids,
+                current_facts=current_facts,
                 existing_candidate_signals=existing_candidate_signals,
                 existing_candidate_context=existing_candidate_context,
-                user_message=request.user_message,
                 new_candidate_signals=stance_signals,
                 current_turn=self._message_count(session_id, request.owner_id),
             )
-            outcome = await apply_memory_commit(
+            outcome = await self._context_governor.apply_memory_commit(
                 sessions=self.sessions,
                 session_id=session_id,
                 owner_id=request.owner_id,
@@ -1525,7 +1585,6 @@ class RunEngine:
                 run_id=run_id,
                 user_message=request.user_message,
                 assistant_response=assistant_response,
-                graph=self.graph,
                 plan=commit_plan,
                 current_context=current_context,
             )
@@ -1548,16 +1607,18 @@ class RunEngine:
         if inspect.isawaitable(maybe_result):
             maybe_result = await maybe_result
         if not isinstance(maybe_result, tuple) or not maybe_result:
-            commit_plan = build_deterministic_memory_commit(
+            commit_plan = self._context_governor.build_memory_commit_plan(
+                user_message=request.user_message,
+                tool_results=tool_results,
                 deterministic_keyed_facts=deterministic_keyed_facts,
                 deterministic_voids=deterministic_voids,
+                current_facts=current_facts,
                 existing_candidate_signals=existing_candidate_signals,
                 existing_candidate_context=existing_candidate_context,
-                user_message=request.user_message,
                 new_candidate_signals=stance_signals,
                 current_turn=self._message_count(session_id, request.owner_id),
             )
-            outcome = await apply_memory_commit(
+            outcome = await self._context_governor.apply_memory_commit(
                 sessions=self.sessions,
                 session_id=session_id,
                 owner_id=request.owner_id,
@@ -1566,7 +1627,6 @@ class RunEngine:
                 run_id=run_id,
                 user_message=request.user_message,
                 assistant_response=assistant_response,
-                graph=self.graph,
                 plan=commit_plan,
                 current_context=current_context,
             )
@@ -1578,7 +1638,7 @@ class RunEngine:
                     data={"facts": list(outcome.indexed_fact_keys), "context_lines": outcome.context_lines},
                 )
             return
-        commit_plan = plan_memory_commit(
+        commit_plan = self._context_governor.build_memory_commit_plan(
             context_result=maybe_result,
             user_message=request.user_message,
             tool_results=tool_results,
@@ -1590,7 +1650,7 @@ class RunEngine:
             new_candidate_signals=stance_signals,
             current_turn=self._message_count(session_id, request.owner_id),
         )
-        outcome = await apply_memory_commit(
+        outcome = await self._context_governor.apply_memory_commit(
             sessions=self.sessions,
             session_id=session_id,
             owner_id=request.owner_id,
@@ -1599,7 +1659,6 @@ class RunEngine:
             run_id=run_id,
             user_message=request.user_message,
             assistant_response=assistant_response,
-            graph=self.graph,
             plan=commit_plan,
             current_context=current_context,
         )
@@ -1681,7 +1740,16 @@ class RunEngine:
         active_skill_name: str = "",
         code_intent_note: str = "",
         execution_risk_tier: str = "",
+        correction_turn: bool = False,
+        direct_fact_memory_only: bool = False,
     ) -> CompiledPassPacket:
+        inferred_correction_turn = correction_turn or bool(
+            re.search(r"\b(actually|instead|correction|updated|changed|not .* anymore|moved to|call me)\b", request.user_message or "", re.IGNORECASE)
+        )
+        inferred_direct_fact_memory_only = direct_fact_memory_only or should_answer_direct_fact_from_memory(
+            request.user_message,
+            current_facts,
+        )
         packet = build_phase_packet(
             context_engine=context_engine,
             context_governor=self._context_governor,
@@ -1706,6 +1774,8 @@ class RunEngine:
                 active_skill_name=active_skill_name,
                 code_intent_note=code_intent_note,
                 execution_risk_tier=execution_risk_tier,
+                correction_turn=inferred_correction_turn,
+                direct_fact_memory_only=inferred_direct_fact_memory_only,
             ),
         )
         phase_trace = dict(packet.trace)
@@ -1743,7 +1813,26 @@ class RunEngine:
         tool_results: list[dict[str, Any]],
         packet: CompiledPassPacket,
         response_preview: str = "",
+        prompt_messages: Optional[list[dict[str, Any]]] = None,
+        input_tokens: Optional[int] = None,
+        output_tokens: Optional[int] = None,
+        estimated_cost_usd: Optional[float] = None,
+        model: str = "",
     ) -> None:
+        resolved_input_tokens = max(
+            0,
+            int(input_tokens if input_tokens is not None else _estimate_message_tokens(prompt_messages or [])),
+        )
+        resolved_output_tokens = max(
+            0,
+            int(output_tokens if output_tokens is not None else _estimate_text_tokens(response_preview)),
+        )
+        resolved_total_tokens = resolved_input_tokens + resolved_output_tokens
+        resolved_cost = (
+            float(estimated_cost_usd)
+            if estimated_cost_usd is not None
+            else _estimate_model_cost_usd(model, resolved_input_tokens, resolved_output_tokens)
+        )
         self.run_store.save_pass(
             run_id=run_id,
             phase=phase.value if isinstance(phase, ContextPhase) else str(phase),
@@ -1756,6 +1845,10 @@ class RunEngine:
             tool_results=summarize_tool_results(tool_results, limit=4, preview_chars=220),
             compiled_context=packet.trace,
             response_preview=clip_text(response_preview, 400),
+            input_tokens=resolved_input_tokens,
+            output_tokens=resolved_output_tokens,
+            total_tokens=resolved_total_tokens,
+            estimated_cost_usd=resolved_cost,
         )
 
     @staticmethod
@@ -1891,12 +1984,7 @@ class RunEngine:
         return tool_result_matches_exact_target(item, exact_targets)
 
     def _current_facts(self, session_id: str, owner_id: Optional[str]) -> list[tuple[str, str, str]]:
-        if self.graph is None:
-            return []
-        try:
-            return list(self.graph.get_current_facts(session_id, owner_id=owner_id) or [])
-        except Exception:
-            return []
+        return self._context_governor.get_current_facts(session_id, owner_id=owner_id)
 
     def _message_count(self, session_id: str, owner_id: Optional[str]) -> int:
         session = self.sessions.get(session_id, owner_id=owner_id)

@@ -298,7 +298,7 @@ class ChatRequest(BaseModel):
     session_id:    Optional[str] = None
     agent_id:      Optional[str] = "default"
     system_prompt: Optional[str] = None
-    force_memory:  Optional[bool] = False
+    force_memory:  Optional[bool] = False  # compatibility shim; managed runtime ignores this knob
     forced_tools:  Optional[List[str]] = Field(default_factory=list)
 
 
@@ -411,9 +411,9 @@ async def chat_stream(
     system_prompt:     Optional[str]    = Form(None),
     search_backend:    Optional[str]    = Form(None),
     search_engine:     Optional[str]    = Form(None),
-    force_memory:      Optional[bool]   = Form(False),
+    force_memory:      Optional[bool]   = Form(False),  # compatibility shim
     use_planner:       Optional[bool]   = Form(True),
-    loop_mode:         Optional[str]    = Form("auto"),
+    loop_mode:         Optional[str]    = Form("auto"),  # compatibility shim
     context_mode:      Optional[str]    = Form(None),
     max_tool_calls:    Optional[int]    = Form(None),
     max_turns:         Optional[int]    = Form(None),
@@ -489,7 +489,6 @@ async def chat_stream(
                     session_manager.set_context_mode(effective_session_id, resolved_context_mode)
 
             resolved_use_planner = use_planner if use_planner is not None else bool(getattr(profile, "default_use_planner", True))
-            resolved_loop_mode = loop_mode or getattr(profile, "default_loop_mode", "auto")
             resolved_planner_model = planner_model or None
             resolved_context_model = context_model or None
             resolved_embed_model = embed_model or getattr(profile, "embed_model", None) or "nomic-embed-text"
@@ -635,6 +634,60 @@ async def get_session(session_id: str, owner_id: Optional[str] = None):
         "history": s.full_history,
     }
 
+
+@app.patch("/sessions/{session_id}/messages/{message_index}")
+async def edit_session_message(session_id: str, message_index: int, payload: dict = Body(...)):
+    owner_id = _require_owner_id(payload.get("owner_id"))
+    new_content = str(payload.get("content") or "")
+    if not new_content.strip():
+        raise HTTPException(400, "content is required")
+
+    session = session_manager.get(session_id, owner_id=owner_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    message = session_manager.edit_message(
+        session_id,
+        content=new_content,
+        message_index=message_index,
+        owner_id=owner_id,
+    )
+    if message is None:
+        raise HTTPException(404, "Message not found")
+
+    try:
+        semantic_graph.clear_session_facts(session_id, owner_id=owner_id)
+    except Exception:
+        pass
+
+    try:
+        from memory.vector_engine import VectorEngine
+        from memory.bm25_engine import BM25Engine
+
+        await VectorEngine(session_id, agent_id=session.agent_id or "default", owner_id=owner_id).clear()
+        BM25Engine(session_id=session_id, agent_id=session.agent_id or "default", owner_id=owner_id).clear()
+    except Exception:
+        pass
+
+    try:
+        from memory.session_rag import clear_session_rag
+
+        await clear_session_rag(session_id, owner_id=owner_id)
+    except Exception:
+        pass
+
+    return {
+        "session_id": session_id,
+        "message": message,
+        "derived_state_reset": {
+            "compressed_context": True,
+            "candidate_signals": True,
+            "deterministic_facts": True,
+            "vector_memory": True,
+            "session_rag": True,
+        },
+    }
+
 @app.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, owner_id: Optional[str] = None):
     owner_id = _require_owner_id(owner_id)
@@ -686,10 +739,8 @@ async def list_memories(limit: int = 100, owner_id: Optional[str] = None):
 
 @app.post("/memory/search")
 async def search_memory(payload: MemorySearchPayload):
-    from memory.retrieval import unified_memory_search
-
     owner_id = _require_owner_id(payload.owner_id)
-    return await unified_memory_search(
+    return await run_engine._context_governor.search_memory(
         payload.query,
         owner_id=owner_id,
         session_id=payload.session_id,

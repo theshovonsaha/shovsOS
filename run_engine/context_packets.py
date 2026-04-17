@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from engine.candidate_signals import parse_candidate_context, render_candidate_signals
 from engine.context_compiler import CompiledPhaseContext, compile_context_items
 from engine.context_item_builders import (
     build_available_tools_item,
@@ -12,11 +13,11 @@ from engine.context_item_builders import (
     build_deterministic_facts_item,
     build_historical_context_item,
     build_loop_contract_item,
+    build_memory_authority_item,
     build_runtime_metadata_item,
     build_session_anchor_item,
     build_working_evidence_item,
 )
-from engine.context_memory_items import build_context_engine_memory_items
 from engine.conversation_tension import ConversationTension, render_conversation_tension
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from run_engine.evidence_lane import build_working_evidence_block, build_working_evidence_snapshot
@@ -56,6 +57,8 @@ class PacketBuildInputs:
     active_skill_name: str = ""
     code_intent_note: str = ""
     execution_risk_tier: str = ""
+    correction_turn: bool = False
+    direct_fact_memory_only: bool = False
 
 
 def build_phase_packet(
@@ -134,7 +137,69 @@ def build_phase_packet(
             )
         )
 
-    candidate_context = str(getattr(session, "candidate_context", "") or "").strip()
+    governed_memory = None
+    if context_governor is not None and hasattr(context_governor, "build_memory_surface"):
+        try:
+            governed_memory = context_governor.build_memory_surface(
+                engine=context_engine,
+                session=session,
+                context=inputs.current_context,
+                current_facts=inputs.current_facts,
+                trace_prefix="memory:context_engine",
+                correction_turn=inputs.correction_turn,
+                direct_fact_memory_only=inputs.direct_fact_memory_only,
+            )
+        except Exception:
+            governed_memory = None
+    if governed_memory is None:
+        candidate_signals = list(getattr(session, "candidate_signals", []) or [])
+        candidate_context = str(getattr(session, "candidate_context", "") or "").strip()
+        if candidate_signals:
+            candidate_context = render_candidate_signals(candidate_signals)
+            candidate_source = "structured_candidate_signals"
+        else:
+            candidate_source = "legacy_candidate_context" if candidate_context else "none"
+            if not candidate_context:
+                candidate_signals = parse_candidate_context(candidate_context)
+        from engine.context_memory_items import build_context_engine_memory_items
+
+        governed_memory = {
+            "candidate_context": candidate_context,
+            "historical_context": _build_historical_context(inputs),
+            "memory_items": build_context_engine_memory_items(
+                context_engine,
+                inputs.current_context,
+                context_governor=context_governor,
+                current_facts=inputs.current_facts,
+                fallback_trace_id="memory:context_engine",
+                fallback_source="context_engine",
+                fallback_provenance={"engine": context_engine.__class__.__name__} if context_engine is not None else None,
+            ),
+            "provenance": {
+                "mode": "fallback",
+                "candidate_source": candidate_source,
+                "candidate_count": len(candidate_signals),
+                "historical_segments": len([
+                    seg for seg in _build_historical_context(inputs).split("\n\n---\n") if seg.strip()
+                ]),
+                "memory_item_count": len(
+                    build_context_engine_memory_items(
+                        context_engine,
+                        inputs.current_context,
+                        context_governor=context_governor,
+                        current_facts=inputs.current_facts,
+                        fallback_trace_id="memory:context_engine",
+                        fallback_source="context_engine",
+                        fallback_provenance={"engine": context_engine.__class__.__name__} if context_engine is not None else None,
+                    )
+                ),
+                "direct_fact_memory_only": bool(inputs.direct_fact_memory_only),
+                "correction_turn": bool(inputs.correction_turn),
+            },
+        }
+    candidate_context = (
+        str((getattr(governed_memory, "candidate_context", None) if not isinstance(governed_memory, dict) else governed_memory.get("candidate_context")) or "").strip()
+    )
     evidence_objective = inputs.effective_objective or inputs.request.user_message
     evidence_snapshot = build_working_evidence_snapshot(
         inputs.tool_results,
@@ -168,6 +233,9 @@ def build_phase_packet(
                     "evidence_count": meta_snapshot.evidence_count,
                     "exact_match_count": meta_snapshot.exact_match_count,
                     "substantive_evidence_count": meta_snapshot.substantive_evidence_count,
+                    "memory_mode": meta_snapshot.memory_mode,
+                    "tool_economy": meta_snapshot.tool_economy,
+                    "contradiction_policy": meta_snapshot.contradiction_policy,
                 },
                 phase_visibility=frozenset({
                     ContextPhase.PLANNING,
@@ -198,6 +266,16 @@ def build_phase_packet(
     if session_anchor_item is not None:
         items.append(session_anchor_item)
 
+    items.append(
+        build_memory_authority_item(
+            correction_turn=inputs.correction_turn,
+            direct_fact_memory_only=inputs.direct_fact_memory_only,
+            source="run_engine",
+            trace_id="run_engine:memory_authority",
+            provenance={"phase": inputs.phase.value},
+        )
+    )
+
     deterministic_facts_item = build_deterministic_facts_item(
         facts=inputs.current_facts or [],
         source="semantic_graph",
@@ -208,7 +286,16 @@ def build_phase_packet(
 
     candidate_context_item = build_candidate_context_item(
         candidate_context=candidate_context,
-        source="session_manager",
+        source=(
+            str(
+                (
+                    getattr(governed_memory, "provenance", None)
+                    if not isinstance(governed_memory, dict)
+                    else governed_memory.get("provenance", {})
+                ).get("candidate_source")
+                or "session_manager"
+            )
+        ),
         trace_id="run_engine:candidate_context",
     )
     if candidate_context_item is not None:
@@ -361,25 +448,35 @@ def build_phase_packet(
             )
         )
 
-    historical_context = _build_historical_context(inputs)
+    historical_context = (
+        str((getattr(governed_memory, "historical_context", None) if not isinstance(governed_memory, dict) else governed_memory.get("historical_context")) or "")
+    )
     historical_context_item = build_historical_context_item(
         content=historical_context,
-        source="session_history",
+        source="context_governor" if governed_memory is not None else "session_history",
         trace_id="run_engine:historical_context",
-        provenance={"history_count": len(getattr(session, "full_history", []) or [])},
+        provenance=(
+            dict(
+                (
+                    getattr(governed_memory, "provenance", None)
+                    if not isinstance(governed_memory, dict)
+                    else governed_memory.get("provenance", {})
+                )
+                or {}
+            )
+        ),
     )
     if historical_context_item is not None:
         items.append(historical_context_item)
 
     items.extend(
-        build_context_engine_memory_items(
-            context_engine,
-            inputs.current_context,
-            context_governor=context_governor,
-            current_facts=inputs.current_facts,
-            fallback_trace_id="memory:context_engine",
-            fallback_source="context_engine",
-            fallback_provenance={"engine": context_engine.__class__.__name__} if context_engine is not None else None,
+        list(
+            (
+                getattr(governed_memory, "memory_items", None)
+                if not isinstance(governed_memory, dict)
+                else governed_memory.get("memory_items", [])
+            )
+            or []
         )
     )
 
@@ -413,6 +510,14 @@ def build_phase_packet(
         "input_count": len(getattr(session, "sliding_window", []) or []),
         "max_chars_per_window_msg": max_chars_per_window_msg,
     }
+    trace["governed_memory"] = dict(
+        (
+            getattr(governed_memory, "provenance", None)
+            if not isinstance(governed_memory, dict)
+            else governed_memory.get("provenance", {})
+        )
+        or {}
+    )
     return CompiledPassPacket(
         phase=inputs.phase,
         content=compiled.content,
@@ -470,6 +575,9 @@ def _build_observation_state(inputs: PacketBuildInputs) -> str:
 
 
 def _build_historical_context(inputs: PacketBuildInputs) -> str:
+    if inputs.direct_fact_memory_only:
+        return ""
+
     history = list(getattr(inputs.session, "full_history", []) or [])
     recent = list(getattr(inputs.session, "sliding_window", []) or [])
     if len(history) <= len(recent):

@@ -83,6 +83,37 @@ _PREDICATE_ALIASES: dict[str, set[str]] = {
         "follow up directive",
         "directive",
     },
+    "current_employer": {
+        "employer",
+        "current employer",
+        "work at",
+        "works at",
+        "employed at",
+        "company",
+    },
+    "current_project": {
+        "project",
+        "current project",
+        "building project",
+        "open source project",
+    },
+    "professional_role": {
+        "role",
+        "job title",
+        "professional role",
+        "work as",
+    },
+    "professional_focus": {
+        "focus",
+        "current focus",
+        "professional focus",
+        "role focus",
+    },
+    "years_experience": {
+        "years experience",
+        "experience",
+        "years of experience",
+    },
 }
 
 
@@ -127,6 +158,16 @@ def direct_fact_predicates(query: str) -> set[str]:
         predicates.add("task_constraint")
     if any(token in q for token in ("directive", "follow up", "followup", "check back", "remind me")):
         predicates.add("followup_directive")
+    if any(token in q for token in ("employer", "work for", "company do i work", "where do i work")):
+        predicates.add("current_employer")
+    if any(token in q for token in ("project am i building", "what project", "current project", "open source project")):
+        predicates.add("current_project")
+    if any(token in q for token in ("my role", "job title", "professional role", "what do i work as")):
+        predicates.add("professional_role")
+    if any(token in q for token in ("current focus", "professional focus", "focused on", "ai integration or enterprise apps")):
+        predicates.add("professional_focus")
+    if any(token in q for token in ("years experience", "years of experience", "how much experience")):
+        predicates.add("years_experience")
     return predicates
 
 
@@ -134,6 +175,26 @@ def should_answer_direct_fact_from_memory(
     query: str,
     current_facts: Optional[list[tuple[str, str, str]]],
 ) -> bool:
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    if any(token in q for token in (
+        "research",
+        "investigate",
+        "compare",
+        "summarize the latest",
+        "latest trends",
+        "set up",
+        "setup",
+        "explain ",
+        "recommend",
+        "optimize",
+        "how do i",
+        "how would you",
+    )):
+        return False
+    if any(token in q for token in ("actually", "correction:", "update:", "call me ")) and "?" not in q:
+        return False
     predicates = direct_fact_predicates(query)
     if not predicates or not current_facts:
         return False

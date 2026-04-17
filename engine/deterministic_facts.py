@@ -8,6 +8,10 @@ from engine.direct_fact_policy import normalize_memory_predicate
 
 _NAME_PATTERNS = [
     re.compile(
+        r"\b(?:hi|hello|hey)[,! ]+\s*i(?:'m| am) (?P<value>[a-z][a-z' -]{0,40}?)(?:\s*$|[.!?,])",
+        re.IGNORECASE,
+    ),
+    re.compile(
         r"\bcall me (?P<value>[a-z][a-z' -]{0,40}?)(?:\s+from now on|\s+going forward|\s+please|\s*$|[.!?,])",
         re.IGNORECASE,
     ),
@@ -41,6 +45,7 @@ _EDITOR_VALUES = (
     "zed",
 )
 _EDITOR_PATTERNS = [
+    re.compile(r"\bi switched from (?:vs code|vscode|cursor|neovim|vim|emacs|zed) to (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
     re.compile(r"\bi use (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
     re.compile(r"\bi prefer (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
     re.compile(r"\bmy editor is (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
@@ -96,6 +101,27 @@ _BUDGET_PATTERNS = [
     re.compile(r"\b(?:my\s+|the\s+)?(?:budget|time budget|cost cap)\s+is\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
     re.compile(r"\bkeep\s+(?:it|this|the work)\s+under\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
     re.compile(r"\blimit\s+(?:this|the work)\s+to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_EMPLOYER_PATTERNS = [
+    re.compile(r"\bi work as [^.!?\n]+ at (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi work at (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi(?:'m| am) at (?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_PROJECT_PATTERNS = [
+    re.compile(r"\bi(?:'m| am) building (?:an? )?(?:open source )?project called (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bmy project is called (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi(?:'m| am) building (?P<value>shovsos)\b", re.IGNORECASE),
+]
+_ROLE_PATTERNS = [
+    re.compile(r"\bi work as (?:an? )?(?P<value>[^.!?\n]+?)(?: at [^.!?\n]+)?(?:\s*$|[.!?,])", re.IGNORECASE),
+    re.compile(r"\bmy role is (?!now focused on)(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_FOCUS_PATTERNS = [
+    re.compile(r"\bmy role is now focused on (?P<value>[^,!.?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi(?:'m| am) focused on (?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_EXPERIENCE_PATTERNS = [
+    re.compile(r"\bi have (?P<value>\d+\+?\s+years?(?:\s+of)?\s+experience[^.!?\n]*)", re.IGNORECASE),
 ]
 _TASK_CONSTRAINT_PATTERNS = [
     re.compile(
@@ -252,6 +278,32 @@ def _clean_pronouns(raw: str) -> str:
 def _clean_environment_mode(raw: str) -> str:
     value = _clean_generic_value(raw).lower()
     return _ENVIRONMENT_NORMALIZATION.get(value, "")
+
+
+def _clean_budget_value(raw: str) -> str:
+    text = _clean_generic_value(raw)
+    if not text:
+        return ""
+    money_match = re.search(r"[$€£]\s*\d+(?:[.,]\d+)?\s*[kKmM]?", text)
+    if money_match:
+        return money_match.group(0).replace(" ", "")
+    return text.split(",", 1)[0].strip()
+
+
+def _clean_title_case_value(raw: str) -> str:
+    text = _clean_generic_value(raw)
+    if not text:
+        return ""
+    parts = []
+    small_words = {"and", "or", "of", "at", "in", "on", "for", "to", "the"}
+    for index, token in enumerate(text.split()):
+        if token.isupper():
+            parts.append(token)
+        elif index > 0 and token.lower() in small_words:
+            parts.append(token.lower())
+        else:
+            parts.append(token[:1].upper() + token[1:])
+    return " ".join(parts)
 
 
 def _build_fact(subject: str, predicate: str, object_: str) -> dict:
@@ -433,9 +485,49 @@ def extract_user_stated_fact_updates(
     for pattern in _BUDGET_PATTERNS:
         match = pattern.search(text)
         if match:
-            value = _clean_generic_value(match.group("value"))
+            value = _clean_budget_value(match.group("value"))
             if value:
                 extracted.append(_build_fact("Task", "budget_limit", value))
+            break
+
+    for pattern in _EMPLOYER_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_title_case_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "current_employer", value))
+            break
+
+    for pattern in _PROJECT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "current_project", value))
+            break
+
+    for pattern in _ROLE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_title_case_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "professional_role", value))
+            break
+
+    for pattern in _FOCUS_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "professional_focus", value))
+            break
+
+    for pattern in _EXPERIENCE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "years_experience", value))
             break
 
     for pattern in _TASK_CONSTRAINT_PATTERNS:

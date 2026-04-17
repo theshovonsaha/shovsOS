@@ -7,6 +7,7 @@ from engine.context_item_builders import (
     CONVERSATION_TENSION_PHASES,
     DETERMINISTIC_FACT_PHASES,
     LOOP_CONTRACT_PHASES,
+    MEMORY_AUTHORITY_PHASES,
     SESSION_ANCHOR_PHASES,
     WORKING_EVIDENCE_PHASES,
     build_available_tools_item,
@@ -14,6 +15,7 @@ from engine.context_item_builders import (
     build_conversation_tension_item,
     build_deterministic_facts_item,
     build_loop_contract_item,
+    build_memory_authority_item,
     build_session_anchor_item,
     build_working_evidence_item,
 )
@@ -50,6 +52,12 @@ def test_shared_context_item_builders_expose_canonical_phase_visibility():
         source="runtime",
         trace_id="test:tension",
     )
+    authority = build_memory_authority_item(
+        correction_turn=True,
+        direct_fact_memory_only=False,
+        source="runtime",
+        trace_id="test:authority",
+    )
     evidence = build_working_evidence_item(
         content="- web_fetch [ok]: homepage",
         source="runtime",
@@ -66,6 +74,7 @@ def test_shared_context_item_builders_expose_canonical_phase_visibility():
     assert facts is not None
     assert candidate is not None
     assert tension is not None
+    assert authority is not None
     assert evidence is not None
     assert tools is not None
 
@@ -74,8 +83,20 @@ def test_shared_context_item_builders_expose_canonical_phase_visibility():
     assert facts.phase_visibility == DETERMINISTIC_FACT_PHASES
     assert candidate.phase_visibility == CANDIDATE_CONTEXT_PHASES
     assert tension.phase_visibility == CONVERSATION_TENSION_PHASES
+    assert authority.phase_visibility == MEMORY_AUTHORITY_PHASES
     assert evidence.phase_visibility == WORKING_EVIDENCE_PHASES
     assert tools.phase_visibility == AVAILABLE_TOOLS_PHASES
+
+
+def test_candidate_context_is_hidden_in_response_phase():
+    candidate = build_candidate_context_item(
+        candidate_context="Candidate: User may be in Berlin",
+        source="session",
+        trace_id="test:candidate",
+    )
+
+    assert candidate is not None
+    assert ContextPhase.RESPONSE not in candidate.phase_visibility
 
 
 def test_managed_and_legacy_context_surfaces_share_canonical_item_titles():
