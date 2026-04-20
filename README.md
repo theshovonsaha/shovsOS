@@ -1,66 +1,327 @@
 # Shovs LLM OS
 
-Shovs LLM OS is a local-first, open-source control center for autonomous agents.
+A local-first **thinking runtime** for autonomous agents.
 
-It is not just a chatbot shell or a prompt wrapper. It is a runtime with:
-- phase-aware context compilation
-- run identity and checkpoints
-- single-loop and managed-loop execution
-- tools, memory, traces, artifacts, and evals
-- local and cloud model adapters
-- Nova and consumer planes on top of the same kernel
-- agent-builder controls for composing stronger agents without changing the kernel
-
-## Human Control Center + Agent Body
-
-Shovs is designed as:
-- a human control center (`frontend_nova`) for planning, inspection, intervention, and audits
-- a consumer plane (`frontend_consumer`) for clean end-user interaction
-- an autonomous agent body (runtime, tools, memory, and orchestration) that executes work
-
-The project currently runs with one canonical execution center:
-- managed path: `run_engine/engine.py`
-
-The open-source direction is explicit convergence to one canonical runtime contract while preserving proven reliability behaviors behind controlled compatibility flags.
+Not a chat wrapper. Not a RAG pipeline. A runtime that compiles **typed, phase-aware context** for every model call, separates **truth from candidates**, executes tools with **side-effect honesty**, and remembers across sessions through a **unified convergent memory engine**.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)
 ![Frontend](https://img.shields.io/badge/frontend-React-61dafb.svg)
 
-## What This Project Is
+---
 
-Shovs treats language as the interface, not the entire runtime state.
+## Why this exists
 
-The core idea is:
-- parse language into structured runtime state
-- run explicit phases over that state
-- ground actions in tool results and verified evidence
-- compile only the context needed for the current phase
-- serialize back into language only when the model actually needs it
+Most "agent platforms" hand the LLM a chat transcript and a tool list, then hope. Shovs treats language as the I/O medium, not the runtime state. Each LLM call receives a **compiled phase packet** — a structured assembly of typed `ContextItem`s drawn from explicit lanes (deterministic facts, candidate signals, working evidence, conversation tension, skill instructions, historical anchors, and more). The packet shape changes with the phase: planning sees durable anchors; acting sees tool evidence; verification sees fact records.
 
-That is the basis of the "Language OS" claim and the control-center product direction.
+Five things make this different from a prompt wrapper:
 
-Read the public vision document: [documentation/public/VISION.md](documentation/public/VISION.md)
+| | What it means |
+|---|---|
+| **Voids & Updates** | Corrections write a void over the stale claim. "Actually, I moved to Berlin" invalidates the prior location — the engine doesn't keep both. |
+| **Side-Effect Honesty** | Tool results carry structured contracts. `bash` and `file_create` emit mandatory verification metadata; the runtime returns `HARD_FAILURE` if expected paths don't exist post-execution. The planner sees real consequences, not prose. |
+| **Sticky Skills** | Skills declare triggers in `SKILL.md` frontmatter. The loader keeps a registry; activation is per-turn, scoped to PLANNING + ACTING phases only — never bleeding into RESPONSE. |
+| **Phase-Aware Context** | `ContextItem`s declare `phase_visibility`. Skill instructions appear in PLANNING/ACTING, never in RESPONSE or MEMORY_COMMIT. Working evidence is acting-time. Deterministic facts are visible everywhere. |
+| **Resonance** | A second-pass scoring step lifts modules that share goals with confidently-relevant ones. The packet emerges as a **coherent theme**, not a top-N grab bag. |
 
-Memory wedge: [documentation/public/SHOVS_MEMORY.md](documentation/public/SHOVS_MEMORY.md)
+---
 
-## What `shovs-memory` Is
+## Architecture (real, not aspirational)
 
-`shovs-memory` is the smallest adoptable surface of this repo.
+```
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                               FRONTEND PLANES                                 │
+│  ┌─────────────────────────────────┐    ┌────────────────────────────────┐    │
+│  │  frontend_nova                  │    │  frontend_consumer             │    │
+│  │  operator workspace, agent      │    │  end-user chat surface         │    │
+│  │  builder, monitor, options      │    │  (managed runtime, narrowed)   │    │
+│  └────────────────┬────────────────┘    └───────────────┬────────────────┘    │
+└──────────────────────────────────────────────────────────────────────────────┘
+                   │                                        │
+                   ▼                                        ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                           FastAPI ENTRYPOINTS                                 │
+│  /chat/stream    /consumer/chat/stream    /sessions/*    /agents/*            │
+│  /memory/*       /rag/*                   /logs/*        /trace/*             │
+│  → owner-scoped, SSE-streamed, single managed runtime spine                   │
+└────────────────────────────────────┬─────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                       RunEngine  (run_engine/engine.py)                       │
+│                       canonical managed runtime                               │
+│                                                                               │
+│   ┌─────────┐   ┌────────┐   ┌────────────┐   ┌─────────┐   ┌────────────┐    │
+│   │ PLAN    │──▶│  ACT   │──▶│  OBSERVE   │──▶│ VERIFY  │──▶│  COMMIT    │    │
+│   └─────────┘   └────────┘   └────────────┘   └─────────┘   └────────────┘    │
+│        ▲             │              │              │              │           │
+│        │             ▼              ▼              ▼              ▼           │
+│        │        ┌─────────┐   ┌──────────┐   ┌─────────┐   ┌──────────┐       │
+│        │        │  Tool   │   │ Run      │   │ Side-   │   │ Memory   │       │
+│        │        │ Loop    │   │ Store    │   │ effect  │   │ Pipeline │       │
+│        │        │ +Hooks  │   │ ledger   │   │ guard   │   │ (facts/  │       │
+│        │        └─────────┘   └──────────┘   └─────────┘   │ voids/   │       │
+│        │                                                    │ candid.) │       │
+│        │                                                    └──────────┘       │
+│        │                                                                       │
+│        └────── PacketBuildInputs ──── build_phase_packet() ──┐                │
+│                                                              │                │
+└──────────────────────────────────────────────────────────────┼────────────────┘
+                                                               ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│             CONTEXT GOVERNOR  (engine/context_governor.py)                    │
+│             one engine, four streams, per-phase compilation                   │
+│                                                                               │
+│  ┌─────────────────────────────────────────────────────────────────────┐      │
+│  │  ContextEngineV3 — Unified Convergent Memory                        │      │
+│  │   1. Linear lane          recent turns verbatim (sliding window)    │      │
+│  │   2. Compression          older exchanges → durable bullets (V1)    │      │
+│  │   3. Convergent ranking   active goals + module registry (V2)       │      │
+│  │   4. Resonance            theme lift on confidently-relevant mods   │      │
+│  │                                                                     │      │
+│  │  Knobs: durable_cap=8  convergent_top_n=12  resonance_weight=0.15   │      │
+│  └─────────────────────────────────────────────────────────────────────┘      │
+│                                  │                                            │
+│                                  ▼                                            │
+│  ┌─────────────────────────────────────────────────────────────────────┐      │
+│  │  compile_context_items()  — engine/context_compiler.py              │      │
+│  │  Reads ContextItem.phase_visibility, priority, max_chars            │      │
+│  │  Emits per-phase compiled packet + included/excluded trace          │      │
+│  └─────────────────────────────────────────────────────────────────────┘      │
+└───────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                              CONTEXT LANES                                    │
+│    (priority order — lower = closer to top of the prompt)                     │
+│                                                                               │
+│   10  runtime_metadata       model, session, turn count                       │
+│   20  core_instruction       agent system prompt                              │
+│   25  active_skill           SKILL.md (PLANNING + ACTING only, TTL=1)         │
+│   30  current_objective      effective user goal                              │
+│   31  meta_context           verification posture, falsifier, probe rule      │
+│   32  loop_contract          tool budget, execution risk tier                 │
+│   35  session_anchor         first message, turn count                        │
+│   36  deterministic_facts    hardened temporal facts (voided when superseded) │
+│   40  phase_guidance         acting/response rules + code intent note         │
+│   41  candidate_context      weak signals, not yet hardened                   │
+│   42  conversation_tension   contradictions + challenge calibration           │
+│   43  observation_state      loop status, evidence posture                    │
+│   44  working_evidence       tool results from this run                       │
+│   45  working_state          task list, objectives                            │
+│   55  historical_context     scored durable anchors from prior sessions       │
+│                                                                               │
+│   Each item carries: source, trace_id, provenance, phase_visibility,          │
+│   max_chars, formatted-flag. Compilation is traceable end-to-end.             │
+└───────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                            STORAGE TOPOLOGY                                   │
+│                                                                               │
+│   sessions.db          session state, sliding window, compressed_context      │
+│   consumer_sessions.db consumer-plane sessions                                │
+│   agents.db            profiles + dashboard config                            │
+│   runs.db              run identity, pass ledger, checkpoints, artifacts      │
+│   tool_results.db      raw tool result archive                                │
+│   memory_graph.db      temporal facts, voids, loci registry, vectors          │
+│   chroma_db/           vector memory + RAG chunks                             │
+│   data/chroma/         per-session RAG                                        │
+│   logs/tool_audit.jsonl + trace_index.jsonl + payload blobs                   │
+└───────────────────────────────────────────────────────────────────────────────┘
+                                     │
+                                     ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│                    PROVIDERS  (llm/adapter_factory.py)                        │
+│                                                                               │
+│   Local           Ollama  ·  LM Studio  ·  llama.cpp  ·  local OpenAI-compat  │
+│   Cloud           OpenAI  ·  Anthropic  ·  Groq  ·  Gemini  ·  NVIDIA         │
+│                                                                               │
+│   All stream tokens, support reasoning models (o1/gpt-5/deepseek-r1/...),     │
+│   carry an unified embedding transport (/api/embed + /v1/embeddings).         │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
 
-Use it when you want:
-- deterministic user fact writes
-- deterministic task-state capture (constraints, scope, follow-up directives)
-- correction-aware temporal memory
-- semantic retrieval
-- an inspectable memory state view
+### Phase packet flow (one turn, end-to-end)
 
-Use the full runtime when you also want:
-- loop orchestration
-- tool execution
-- traces, checkpoints, artifacts, and full session runtime control
+```
+user message
+     │
+     ▼
+session_manager.create() ──── HOOK: session_started ────▶ subscribers
+     │
+     ▼
+RunEngine.stream()
+     │
+     ├─ Load session + current facts
+     ├─ Analyze conversation tension
+     ├─ Discover available skills          (run_engine/skill_loader.py)
+     ├─ Classify code intent               (run_engine/code_intent.py)
+     │
+     ├─ PLANNING phase
+     │     PacketBuildInputs → build_phase_packet()
+     │     orchestrator.plan_with_context()
+     │     ──── HOOK: plan_generated ──▶ subscribers
+     │
+     ├─ Inject active skill into PacketBuildInputs.active_skill_context
+     │
+     ├─ ACTING phase (loop)
+     │     For each tool turn:
+     │       compile packet → actor selects tool
+     │         ──── HOOK: tool_selected ──▶ subscribers
+     │       ToolRegistry executes (Docker sandbox for bash)
+     │       side_effect_guard verifies expected paths
+     │         ──── HOOK: tool_completed ──▶ subscribers
+     │         ──── HOOK: hard_failure   ──▶ if status=HARD_FAILURE
+     │       ToolLoopGuard circuit-breaks repeat failures
+     │
+     ├─ OBSERVATION phase
+     │     orchestrator decides continue / finalize
+     │
+     ├─ RESPONSE phase
+     │     actor generates final answer (skill context REMOVED)
+     │
+     ├─ VERIFICATION phase
+     │     check response against tool evidence
+     │     reject if claims unsupported
+     │
+     └─ MEMORY_COMMIT phase
+           deterministic extraction → fact_guard → semantic graph
+           compression-side facts → candidate signals if ungrounded
+             ──── HOOK: memory_stored ──▶ per accepted fact
+           ──── HOOK: run_complete   ──▶ subscribers
+```
 
-Minimal shape:
+### Lifecycle hooks (`plugins/hook_registry.py`)
+
+Subscribe to runtime events from any plugin:
+
+```python
+from plugins.hook_registry import hooks, HookEvent
+
+@hooks.on("memory_stored")
+async def log_fact(event: HookEvent) -> None:
+    print(f"Stored {event.data['subject']} {event.data['predicate']} {event.data['object']}")
+```
+
+| Event | Fires when | Payload keys |
+|---|---|---|
+| `session_started` | `session_manager.create()` returns | `agent_id, model, owner_id, [plane]` |
+| `plan_generated` | planner returns structured plan | `route, skill, tools, confidence, strategy` |
+| `tool_selected` | actor chose a tool | `tool_name, arguments_preview` |
+| `tool_completed` | tool execution finished | `tool_name, success, turn` |
+| `hard_failure` | tool returned HARD_FAILURE | `tool_name, turn, preview` |
+| `memory_stored` | fact accepted into semantic graph | `subject, predicate, object, turn, owner_id` |
+| `run_complete` | run finished | `run_id, route, tool_count, success` |
+
+Handlers run concurrently via `asyncio.gather`; exceptions are logged, never raised into the engine loop.
+
+---
+
+## Quick start
+
+```bash
+# One-shot install (idempotent — safe to re-run)
+./scripts/install.sh
+
+# Verify the install
+python3 scripts/doctor.py
+
+# Run Nova (operator workspace)
+npm run dev:nova
+# → http://localhost:5174
+
+# Run Consumer plane
+npm run dev:consumer
+
+# Backend only
+npm run dev:backend
+# → http://localhost:8000  ·  /docs for OpenAPI
+```
+
+`scripts/doctor.py` checks: Python ≥3.10, provider API keys, Ollama reachability, writable DB/chroma/logs paths, all 5 LLM adapters import, skill loader works (≥1 skill), unified context engine has its budget knobs.
+
+The full interactive setup (Docker services, embed model selection) is in [setup-linux-mac.sh](setup-linux-mac.sh) and [setup-windows.ps1](setup-windows.ps1).
+
+---
+
+## Configure providers
+
+Pick one (or several — the runtime supports per-agent provider selection):
+
+```env
+# Local (no API key required)
+LLM_PROVIDER=ollama
+OLLAMA_BASE_URL=http://localhost:11434
+DEFAULT_MODEL=llama3.2
+
+LLM_PROVIDER=lmstudio
+LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
+LMSTUDIO_API_KEY=lm-studio
+DEFAULT_MODEL=qwen2.5-coder-3b-instruct-mlx
+
+LLM_PROVIDER=llamacpp
+LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
+
+# Cloud
+OPENAI_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
+GROQ_API_KEY=gsk_...
+GEMINI_API_KEY=AIza...
+NVIDIA_API_KEY=nvapi-...
+```
+
+Embedding transport auto-detects `/api/embed` (current Ollama) and `/api/embeddings` (legacy); LM Studio / llama.cpp / OpenAI-compatible servers use `/v1/embeddings`.
+
+---
+
+## Repository map
+
+```
+agent/
+├── api/                    FastAPI routes  (main.py, consumer_routes.py, owner.py, ...)
+├── engine/                 Context, schema, compiler, governor, fact guard, side-effect guard
+│   ├── context_engine_v3.py    Unified convergent memory engine
+│   ├── context_engine_v2.py    Convergent ranking + resonance
+│   ├── context_engine.py       Linear bullet compression (V1, internal)
+│   ├── context_governor.py     Always returns V3 — single surface
+│   ├── context_schema.py       ContextItem, ContextKind, ContextPhase
+│   ├── context_compiler.py     compile_context_items() — phase-aware assembly
+│   ├── side_effect_guard.py    HARD_FAILURE / unsupported-claim detection
+│   ├── conversation_tension.py Cross-turn contradiction detection
+│   └── deterministic_facts.py  User-stated fact extraction
+│
+├── run_engine/             Managed runtime
+│   ├── engine.py               Main loop (planning → acting → observe → verify → commit)
+│   ├── context_packets.py      PacketBuildInputs → build_phase_packet()
+│   ├── memory_pipeline.py      Grounding, compression normalization, fact commit
+│   ├── skill_loader.py         SKILL.md discovery + loading
+│   ├── code_intent.py          Pre-planning code intent classifier
+│   └── tool_selection.py       Actor request shaping, tool-call parsing
+│
+├── orchestration/          Orchestrator, run store, session manager, agent profiles
+├── memory/                 Semantic graph (SQLite), vector engine (Chroma), session RAG
+├── plugins/                Tool registry + tools + hook registry
+│   ├── tool_registry.py        Tool dataclass, brace-counting tool-call detector
+│   ├── tools.py                Built-in tools (web_search, file_create, bash, query_memory, ...)
+│   ├── tools_web.py            Canonical web search/fetch
+│   ├── shovs_meta_gateway.py   External-agent gateway (memory palace tools)
+│   └── hook_registry.py        Lifecycle event pub/sub (7 events)
+│
+├── llm/                    Provider adapters (5: Ollama, OpenAI, Anthropic, Groq, Gemini)
+├── shovs_memory/           Installable memory wedge (uses orchestration + memory)
+├── frontend_nova/          Operator workspace (React + Vite)
+├── frontend_consumer/      Consumer plane
+├── .agent/skills/          9 platform skills (agent_platform_backend, debugging, frontend_design, ...)
+├── scripts/                install.sh, doctor.py
+└── documentation/public/   VISION, DEVELOPER_GUIDE, FEATURES_AND_ROADMAP, SETUP, SHOVS_MEMORY
+```
+
+---
+
+## What `shovs-memory` is
+
+The smallest adoptable surface of this repo. Use it when you want deterministic fact writes, correction-aware temporal memory, and inspectable memory state — without the full runtime loop.
 
 ```python
 from orchestration.session_manager import SessionManager
@@ -72,367 +333,106 @@ memory = ShovsMemory(session_id="user-123", owner_id="owner-123", session_manage
 memory.apply_user_message("My name is Shovon. I use Cursor.", turn=1)
 memory.apply_user_message("Actually, I moved to Berlin.", turn=2)
 
-print(memory.current_facts())
-print(memory.fact_timeline())
-print(memory.inspect())
+print(memory.current_facts())   # latest fact for each predicate
+print(memory.fact_timeline())   # history with voids
+print(memory.inspect())         # full memory state snapshot
 ```
 
-What makes it different:
-- explicit user facts harden deterministically instead of relying only on compression LLM output
-- newer facts supersede older ones through temporal invalidation
-- trusted facts are kept separate from candidate signals
-- the memory state is inspectable, not opaque
+Use the full runtime (`RunEngine`) when you also want loop orchestration, tool execution, traces, checkpoints, and artifacts.
 
-## Current Runtime Model
+---
 
-The backend supports two execution modes:
+## Skills
 
-- `single`
-  - direct actor loop
-  - lower overhead
-  - good for small local models and simple tasks
+Drop a `SKILL.md` under `.agent/skills/{name}/`:
 
-- `managed`
-  - explicit `plan -> act -> observe -> verify -> commit`
-  - still inside one run, not a swarm by default
-  - better for complex multi-step work
+```markdown
+---
+name: debugging
+description: Use when the user reports a bug, crash, traceback, or regression.
+triggers: bug, crash, traceback, regression, broken, exception, error, fix, debug
+eligibility: auto
+---
 
-- `auto`
-  - resolves between the two based on runtime conditions
-  - local OpenAI-compatible runners prefer `single` by default
+# Debugging skill
 
-Each turn can produce:
-- a first-class `run`
-- phase traces
-- loop checkpoints
-- tool results
-- run artifacts
-- run evals
-
-## What Is Implemented
-
-### Runtime Kernel
-- phase-aware context compilation
-- managed and single loop control
-- run identity with `run_id` and optional parent runs
-- persisted loop checkpoints
-- prompt minimization and context-overflow retry
-- model-aware execution profiles and prompt budgets for small local, local standard, and frontier-class models
-
-### State Integrity
-- verified facts are separated from candidate signals
-- assistant guesses are blocked from hardening into deterministic truth
-- failed turns are preserved for recovery
-- task bootstrap is guarded so `todo_write` does not repeat endlessly in the same run
-- post-tool follow-up context is sanitized to reduce bloat
-
-### Memory and Retrieval
-- semantic graph memory
-- vector memory
-- session RAG
-- task tracker
-- unified memory retrieval lane for semantic graph + deterministic session facts + vector anchors
-- `shovs-memory` facade for deterministic fact writes, semantic retrieval, and inspectable memory state
-- runtime embed-model propagation into memory tools
-- provider-aware embedding transport for Ollama, LM Studio, llama.cpp, and OpenAI-compatible runners
-- memory benchmark harness + owner-scoped benchmark snapshots (`/memory/benchmark/run`, `/memory/benchmark/latest`)
-- context-engine variants:
-  - V1 linear durable memory
-  - V2 convergent context
-  - V3 hybrid
-
-### Tooling
-- web search and fetch
-- file create/view/replace
-- bash execution
-- RAG search
-- task tools
-- memory tools
-- delegation hooks
-- MCP integration path
-
-### Providers
-- Ollama
-- LM Studio
-- llama.cpp
-- local OpenAI-compatible servers
-- OpenAI
-- Groq
-- Anthropic
-- Gemini
-- Nvidia
-
-### Frontends
-- `frontend_nova`
-  - operator workspace
-  - mobile-friendly navigation and monitor
-  - loop controls
-  - reasoning visibility
-  - agent builder with presets, bootstrap docs, and prompt contribution summary
-
-- `frontend_consumer`
-  - consumer-facing plane
-
-## Architecture
-
-```mermaid
-graph TB
-    subgraph UI["Frontend Planes"]
-        NOVA["Nova Workspace"]
-        CONS["Consumer Frontend"]
-    end
-
-    subgraph API["FastAPI API Layer"]
-        CHAT["/chat + /chat/stream"]
-        CONSAPI["/consumer/*"]
-        RAG["/rag/*"]
-        LOGS["/logs + trace routes"]
-    end
-
-    subgraph OS["Shovs Runtime Kernel"]
-        RUNENGINE["RunEngine (Managed Runtime)"]
-        LEGACY["AgentCore (Legacy Runtime)"]
-        ORCH["AgenticOrchestrator"]
-        SESS["SessionManager"]
-        RUNS["RunStore"]
-        TOOLS["ToolRegistry"]
-    end
-
-    subgraph LOOP["Execution Model"]
-        PLAN["Plan"]
-        ACT["Act"]
-        OBS["Observe"]
-        VER["Verify"]
-        COMMIT["Commit"]
-    end
-
-    subgraph STATE["State Lanes"]
-        FACTS["Deterministic Facts"]
-        CAND["Candidate Signals"]
-        TASKS["Task State"]
-        ART["Artifacts + Evals"]
-        TRACE["Trace Events"]
-    end
-
-    subgraph PROVIDERS["Model Runtimes"]
-        OLL["Ollama"]
-        LMS["LM Studio"]
-        LLCPP["llama.cpp"]
-        OAI["OpenAI / Compat"]
-        CLOUD["Groq / Anthropic / Gemini / Nvidia"]
-    end
-
-    UI --> API
-    API --> OS
-    OS --> LOOP
-    LOOP --> STATE
-    OS --> PROVIDERS
+Approach:
+1. Reproduce the failure deterministically.
+2. Bisect: change one thing at a time.
+3. ...
 ```
 
-## Connection Map (ASCII)
+The loader parses the simple frontmatter (single-line `triggers:` is comma-separated). Skills are surfaced into PLANNING and ACTING packets only — never RESPONSE or MEMORY_COMMIT — and carry `trace_id="skill_loader:{name}"` for full provenance.
 
-```text
-User/UI
-  --> FastAPI routes (`/chat/stream`, `/consumer/chat/stream`)
-    --> RunEngine (canonical runtime)
-      --> plan -> act -> observe -> verify -> commit
-      --> ToolRegistry {web_search|web_fetch|memory|delegate|...}
-      --> SessionManager + Semantic/Vector Memory
-      --> RunStore + TraceStore (checkpoints, artifacts, evals)
-      --> AdapterFactory (Ollama|LM Studio|OpenAI|Groq|...)
+Built-in skills: `agent_platform_backend`, `code_review`, `debugging`, `frontend_design`, `memory_palace`, `pdf`, `shell_workflow`, `testing`, `web_research`.
 
-Internal compatibility modules remain in the repo for test coverage and incremental migration,
-but user-facing chat routes run through `RunEngine`.
+---
+
+## Tool contract & side-effect honesty
+
+Every tool returns a JSON payload with `success`, `status`, and (when applicable) `verification`:
+
+```json
+{
+  "type": "bash_result",
+  "success": true,
+  "status": "SUCCESS",
+  "command": "...",
+  "output": "...",
+  "verification": {
+    "expected_paths": ["/sandbox/report.html"],
+    "missing_paths": []
+  }
+}
 ```
 
-## Repository Map
+When `bash` or `file_create` is called and the expected write target does not exist post-execution, the tool returns `status: "HARD_FAILURE"`. The `side_effect_guard` then blocks the response from claiming success, and the runtime emits the `hard_failure` lifecycle hook.
 
-- `/engine`
-  - runtime kernel, context compiler, fact guard, loop logic
-- `/orchestration`
-  - agent manager, profiles, run store, session management
-- `/memory`
-  - semantic graph, vector search, session RAG, task tracking
-- `/plugins`
-  - tool registry and concrete tools
-- `/llm`
-  - provider adapters and adapter factory
-- `/api`
-  - FastAPI routes and stream entrypoints
-- `/frontend_nova`
-  - primary operator UI and agent builder
-- `/frontend_consumer`
-  - consumer plane
-- `/documentation/public`
-  - public OSS docs
+Adding a tool:
 
-## Quick Start
+```python
+from plugins.tool_registry import Tool, registry
 
-### Prerequisites
+async def _my_tool(query: str) -> str:
+    return f"result: {query}"
 
-- Python 3.10+
-- Node.js 18+
-- npm 9+
-- optional: Docker
-- optional: a local model runner such as Ollama, LM Studio, or llama.cpp
-
-### Install
-
-```bash
-git clone https://github.com//shovsOS.git
-cd shovsOS
-
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-npm install
-cd frontend_nova && npm install && cd ..
+registry.register(Tool(
+    name="my_tool",
+    description="One sentence: what it does and when to use it.",
+    parameters={
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],
+    },
+    handler=_my_tool,
+    tags=["category"],
+))
 ```
 
-Optional consumer frontend setup:
+Add it to `ALL_TOOLS` in [plugins/tools.py](plugins/tools.py); registration runs at API startup.
 
-```bash
-cd frontend_consumer && npm install && cd ..
-```
+---
 
-### Configure
+## Why small models matter here
 
-```bash
-cp .env.example .env
-```
+Runtime discipline raises the floor for small local models — and the ceiling for frontier models. Phase-specific context, model-aware budget shaping (`small_local`, `tool_native_local`, `local_standard`, `frontier_native`, `frontier_standard`), candidate-vs-truth separation, and prompt sanitation after evidence gathering all reduce the noise that small models can't recover from.
 
-Pick one provider path:
+If a 3B model can stay coherent across multi-tool runs, an Opus / GPT-5 class model becomes nearly bulletproof.
 
-- `LLM_PROVIDER=ollama`
-- `LLM_PROVIDER=lmstudio`
-- `LLM_PROVIDER=llamacpp`
-- `LLM_PROVIDER=local_openai`
-- `LLM_PROVIDER=openai`
-- `LLM_PROVIDER=groq`
+---
 
-Examples:
+## Public docs
 
-```env
-LLM_PROVIDER=lmstudio
-LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
-LMSTUDIO_API_KEY=lm-studio
-DEFAULT_MODEL=qwen2.5-coder-3b-instruct-mlx
-```
+- [SETUP](documentation/public/SETUP.md) — environment, providers, troubleshooting
+- [DEVELOPER_GUIDE](documentation/public/DEVELOPER_GUIDE.md) — engineering reference
+- [VISION](documentation/public/VISION.md) — thesis, claims, what makes Shovs different
+- [FEATURES_AND_ROADMAP](documentation/public/FEATURES_AND_ROADMAP.md) — what ships, what's next
+- [SHOVS_MEMORY](documentation/public/SHOVS_MEMORY.md) — memory wedge reference
+- [ARCHITECTURE](ARCHITECTURE.md) — runtime + storage topology
+- [ROADMAP](ROADMAP.md) — convergence phases
+- [CONTRIBUTING](CONTRIBUTING.md) · [CODE_OF_CONDUCT](CODE_OF_CONDUCT.md) · [SECURITY](SECURITY.md) · [GOVERNANCE](GOVERNANCE.md) · [SUPPORT](SUPPORT.md)
 
-```env
-LLM_PROVIDER=ollama
-OLLAMA_BASE_URL=http://localhost:11434
-DEFAULT_MODEL=llama3.2
-EMBED_MODEL=ollama:nomic-embed-text
-```
-
-### Run Nova
-
-```bash
-npm run dev:nova
-```
-
-Key URLs:
-- Nova: [http://localhost:5174](http://localhost:5174) or the Vite port shown in terminal
-- Backend API: [http://localhost:8000](http://localhost:8000)
-- API docs: [http://localhost:8000/docs](http://localhost:8000/docs)
-
-### Run Consumer
-
-```bash
-npm run dev:consumer
-```
-
-## Recommended Local Setups
-
-### LM Studio
-
-Use when you want a strong local OpenAI-compatible server on macOS, especially on Apple Silicon.
-
-```env
-LLM_PROVIDER=lmstudio
-LMSTUDIO_BASE_URL=http://127.0.0.1:1234/v1
-LMSTUDIO_API_KEY=lm-studio
-```
-
-### Ollama
-
-Use when you want a very simple local path.
-
-```env
-LLM_PROVIDER=ollama
-OLLAMA_BASE_URL=http://localhost:11434
-```
-
-### llama.cpp
-
-Use when you want a lightweight local OpenAI-compatible runner.
-
-```env
-LLM_PROVIDER=llamacpp
-LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
-LLAMACPP_API_KEY=llama.cpp
-```
-
-## Why Small Models Matter Here
-
-One of the design goals of Shovs LLM OS is to make small local models more coherent through runtime discipline:
-- tighter phase-specific context
-- model-aware prompt budgets and evidence packet sizing
-- cleaner tool execution paths
-- truthful state transitions
-- candidate vs truth separation
-- prompt sanitation after evidence gathering
-
-If the runtime can make small models coherent, larger models benefit even more.
-
-## Public Docs
-
-- [Setup](documentation/public/SETUP.md)
-- [Vision](documentation/public/VISION.md)
-- [Developer Guide](documentation/public/DEVELOPER_GUIDE.md)
-- [Features and Roadmap](documentation/public/FEATURES_AND_ROADMAP.md)
-- [Memory](documentation/public/SHOVS_MEMORY.md)
-- [Contributing](CONTRIBUTING.md)
-- [Code of Conduct](CODE_OF_CONDUCT.md)
-- [Security](SECURITY.md)
-- [Support](SUPPORT.md)
-- [Architecture](ARCHITECTURE.md)
-- [Governance](GOVERNANCE.md)
-- [Roadmap](ROADMAP.md)
-- [Evaluation](EVALUATION.md)
-
-## Open Source Readiness
-
-This repository is being prepared for public scrutiny with:
-- explicit architecture and governance documents
-- contribution, conduct, support, and security policies at the repo root
-- issue and PR templates for reproducible collaboration
-- CI checks aligned to the real frontend/backend layout
-- a convergence roadmap that tracks runtime unification without rewriting history
-
-## Project Status
-
-This is now beyond "prompt app" stage.
-
-The kernel already has:
-- run identity
-- owner isolation
-- managed and single loop execution
-- phase-aware context
-- tool traces
-- checkpoints
-- artifacts and evals
-- agent builder controls with presets, bootstrap docs, and profile defaults
-- model-aware runtime shaping for local vs frontier execution
-- provider-aware memory plumbing across chat and embedding models
-
-The main remaining work is refinement:
-- tighter checkpoint-native prompt compilation
-- deeper external adapter parity in practice
-- more release-facing examples and docs
-- continued hardening for small local model tool obedience
+---
 
 ## License
 
