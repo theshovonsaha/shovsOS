@@ -13,6 +13,7 @@ PHASE_KIND_ORDER: dict[ContextPhase, tuple[ContextKind, ...]] = {
         ContextKind.OBJECTIVE,
         ContextKind.META,
         ContextKind.EVIDENCE,
+        ContextKind.WORKING,
         ContextKind.MEMORY,
         ContextKind.ENVIRONMENT,
     ),

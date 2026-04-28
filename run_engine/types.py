@@ -27,6 +27,11 @@ class RunEngineRequest:
     search_engine: Optional[str] = None
     agent_revision: Optional[int] = None
     forced_tools: tuple[str, ...] = field(default_factory=tuple)
+    workspace_path: Optional[str] = None
+    # None = let the adapter decide (default for the model). True/False explicitly
+    # overrides — mainly meaningful for Ollama thinking models, where False sets
+    # think:false in the API payload to suppress reasoning generation entirely.
+    reasoning_enabled: Optional[bool] = None
 
 
 @dataclass(frozen=True)

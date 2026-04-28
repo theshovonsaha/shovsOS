@@ -14,8 +14,12 @@ Priority order (first configured wins):
 Override with: LLM_PROVIDER=ollama|openai|local_openai|lmstudio|llamacpp|groq|gemini|anthropic
 """
 
+import logging
 import os
+import time
 from llm.base_adapter import BaseLLMAdapter
+
+log = logging.getLogger("shovs.adapter_factory")
 
 # ── Global Adapter Cache ──────────────────────────────────────────────────
 _ADAPTER_CACHE: dict[str, BaseLLMAdapter] = {}
@@ -32,6 +36,78 @@ _KNOWN_PROVIDERS = {
     "nvidia",
     "bridge",
 }
+
+# ── Failover tracking ─────────────────────────────────────────────────────
+# Maps provider → (failure_count, last_failure_ts)
+_PROVIDER_FAILURES: dict[str, tuple[int, float]] = {}
+_FAILOVER_COOLDOWN_SECS = int(os.getenv("SHOVS_PROVIDER_COOLDOWN", "120"))
+_FAILOVER_THRESHOLD = int(os.getenv("SHOVS_PROVIDER_FAIL_THRESHOLD", "3"))
+
+# Ordered fallback chain read from env: comma-separated provider names
+# e.g. SHOVS_PROVIDER_FALLBACK_CHAIN=anthropic,groq,openai,ollama
+_FALLBACK_CHAIN: list[str] = [
+    p.strip().lower()
+    for p in os.getenv("SHOVS_PROVIDER_FALLBACK_CHAIN", "").split(",")
+    if p.strip()
+]
+
+
+def record_provider_failure(provider: str) -> None:
+    """
+    Record a failure for a provider. After _FAILOVER_THRESHOLD consecutive
+    failures the provider is considered degraded and will be skipped in
+    get_failover_adapter() for _FAILOVER_COOLDOWN_SECS.
+    """
+    count, _ = _PROVIDER_FAILURES.get(provider, (0, 0.0))
+    _PROVIDER_FAILURES[provider] = (count + 1, time.monotonic())
+    if count + 1 >= _FAILOVER_THRESHOLD:
+        log.warning(
+            "Provider '%s' has failed %d times — marked degraded for %ds",
+            provider, count + 1, _FAILOVER_COOLDOWN_SECS,
+        )
+
+
+def record_provider_success(provider: str) -> None:
+    """Reset failure count for a provider after a successful call."""
+    if provider in _PROVIDER_FAILURES:
+        del _PROVIDER_FAILURES[provider]
+
+
+def _is_degraded(provider: str) -> bool:
+    count, last_ts = _PROVIDER_FAILURES.get(provider, (0, 0.0))
+    if count < _FAILOVER_THRESHOLD:
+        return False
+    return (time.monotonic() - last_ts) < _FAILOVER_COOLDOWN_SECS
+
+
+def get_failover_adapter(current_provider: str) -> BaseLLMAdapter | None:
+    """
+    Return the next healthy adapter in the fallback chain, skipping
+    `current_provider` and any degraded providers.
+
+    Returns None if no healthy fallback is available.
+    Configure the chain via SHOVS_PROVIDER_FALLBACK_CHAIN env var.
+    Example: SHOVS_PROVIDER_FALLBACK_CHAIN=anthropic,groq,openai,ollama
+    """
+    if not _FALLBACK_CHAIN:
+        return None
+
+    for candidate in _FALLBACK_CHAIN:
+        if candidate == current_provider:
+            continue
+        if _is_degraded(candidate):
+            log.debug("Failover candidate '%s' is degraded — skipping", candidate)
+            continue
+        try:
+            adapter = create_adapter(candidate)
+            log.warning("Failing over from '%s' to '%s'", current_provider, candidate)
+            return adapter
+        except Exception as exc:
+            log.warning("Failover candidate '%s' failed to instantiate: %s", candidate, exc)
+            continue
+
+    log.error("No healthy failover provider found after exhausting chain: %s", _FALLBACK_CHAIN)
+    return None
 
 
 def _build_openai_compat_adapter(provider: str):

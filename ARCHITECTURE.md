@@ -5,14 +5,17 @@ Shovs is organized as a human control center over an autonomous agent body.
 ## System Model
 
 1. Human control center:
-- `frontend_nova`: operator-facing workspace for visibility, control, and debugging.
+
+- `frontend_shovs`: operator-facing workspace for visibility, control, and debugging.
 - `frontend_consumer`: simplified user-facing interaction plane.
 
 2. Autonomous agent body:
+
 - runtime execution (`run_engine`)
 - orchestration, tools, memory, traces, checkpoints, and evals
 
 3. Shared substrate:
+
 - session state
 - run store
 - semantic/vector memory
@@ -22,9 +25,11 @@ Shovs is organized as a human control center over an autonomous agent body.
 ## Current Runtime Reality
 
 Canonical execution center:
+
 - managed runtime: `run_engine/engine.py`
 
 Convergence objective (active):
+
 - one canonical runtime contract
 - one pass ledger model
 - one tool-calling contract
@@ -35,7 +40,7 @@ Convergence objective (active):
 
 ```text
 {Human Control Center}
-  frontend_nova || frontend_consumer
+  frontend_shovs || frontend_consumer
     --> {/chat/stream || /consumer/chat/stream}
       --> {RunEngine}
         --> plan -> act -> observe -> verify -> commit
@@ -49,12 +54,14 @@ Convergence objective (active):
 ## Control Planes
 
 1. API entrypoints:
+
 - `/chat/stream`
 - `/consumer/chat/stream`
 - `/logs/*`
 - `/rag/*`
 
 2. Explainability surfaces:
+
 - trace events
 - run checkpoints
 - pass records

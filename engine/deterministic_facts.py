@@ -3,8 +3,14 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
+from engine.direct_fact_policy import normalize_memory_predicate
+
 
 _NAME_PATTERNS = [
+    re.compile(
+        r"\b(?:hi|hello|hey)[,! ]+\s*i(?:'m| am) (?P<value>[a-z][a-z' -]{0,40}?)(?:\s*$|[.!?,])",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"\bcall me (?P<value>[a-z][a-z' -]{0,40}?)(?:\s+from now on|\s+going forward|\s+please|\s*$|[.!?,])",
         re.IGNORECASE,
@@ -39,6 +45,7 @@ _EDITOR_VALUES = (
     "zed",
 )
 _EDITOR_PATTERNS = [
+    re.compile(r"\bi switched from (?:vs code|vscode|cursor|neovim|vim|emacs|zed) to (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
     re.compile(r"\bi use (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
     re.compile(r"\bi prefer (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
     re.compile(r"\bmy editor is (?P<value>vs code|vscode|cursor|neovim|vim|emacs|zed)\b", re.IGNORECASE),
@@ -95,6 +102,27 @@ _BUDGET_PATTERNS = [
     re.compile(r"\bkeep\s+(?:it|this|the work)\s+under\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
     re.compile(r"\blimit\s+(?:this|the work)\s+to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
 ]
+_EMPLOYER_PATTERNS = [
+    re.compile(r"\bi work as [^.!?\n]+ at (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi work at (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi(?:'m| am) at (?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_PROJECT_PATTERNS = [
+    re.compile(r"\bi(?:'m| am) building (?:an? )?(?:open source )?project called (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bmy project is called (?P<value>[^.!?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi(?:'m| am) building (?P<value>shovsos)\b", re.IGNORECASE),
+]
+_ROLE_PATTERNS = [
+    re.compile(r"\bi work as (?:an? )?(?P<value>[^.!?\n]+?)(?: at [^.!?\n]+)?(?:\s*$|[.!?,])", re.IGNORECASE),
+    re.compile(r"\bmy role is (?!now focused on)(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_FOCUS_PATTERNS = [
+    re.compile(r"\bmy role is now focused on (?P<value>[^,!.?\n]+)", re.IGNORECASE),
+    re.compile(r"\bi(?:'m| am) focused on (?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_EXPERIENCE_PATTERNS = [
+    re.compile(r"\bi have (?P<value>\d+\+?\s+years?(?:\s+of)?\s+experience[^.!?\n]*)", re.IGNORECASE),
+]
 _TASK_CONSTRAINT_PATTERNS = [
     re.compile(
         r"\b(?:do not|don't|never|avoid)\s+(?P<value>(?:use|edit|change|touch|rewrite|refactor|browse|search|fetch|install|delete)\b[^.!?\n]*)",
@@ -108,6 +136,20 @@ _TASK_CONSTRAINT_PATTERNS = [
 _FOLLOWUP_DIRECTIVE_PATTERNS = [
     re.compile(r"\b(?:follow up|check back|revisit)\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
     re.compile(r"\bremind me to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
+]
+_CLEAR_EDITOR_PATTERNS = [
+    re.compile(
+        r"\b(?:clear|remove|delete)\s+(?:my\s+)?(?:editor|editor preference|preferred editor)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bi(?:\s+have|'ve got| got)?\s+no\s+(?:strong\s+)?(?:editor|editor preference|preferred editor)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bi do not have an?\s+(?:editor|editor preference|preferred editor)\b",
+        re.IGNORECASE,
+    ),
 ]
 
 _SPLIT_TRAILING_RE = re.compile(r"\b(?:but|and|because|so|what|where|who|please)\b", re.IGNORECASE)
@@ -238,6 +280,32 @@ def _clean_environment_mode(raw: str) -> str:
     return _ENVIRONMENT_NORMALIZATION.get(value, "")
 
 
+def _clean_budget_value(raw: str) -> str:
+    text = _clean_generic_value(raw)
+    if not text:
+        return ""
+    money_match = re.search(r"[$€£]\s*\d+(?:[.,]\d+)?\s*[kKmM]?", text)
+    if money_match:
+        return money_match.group(0).replace(" ", "")
+    return text.split(",", 1)[0].strip()
+
+
+def _clean_title_case_value(raw: str) -> str:
+    text = _clean_generic_value(raw)
+    if not text:
+        return ""
+    parts = []
+    small_words = {"and", "or", "of", "at", "in", "on", "for", "to", "the"}
+    for index, token in enumerate(text.split()):
+        if token.isupper():
+            parts.append(token)
+        elif index > 0 and token.lower() in small_words:
+            parts.append(token.lower())
+        else:
+            parts.append(token[:1].upper() + token[1:])
+    return " ".join(parts)
+
+
 def _build_fact(subject: str, predicate: str, object_: str) -> dict:
     fact_text = f"{subject} {predicate} {object_}".strip()
     return {
@@ -248,6 +316,36 @@ def _build_fact(subject: str, predicate: str, object_: str) -> dict:
         "key": f"{subject} {predicate}".strip(),
         "source": "user_stated",
     }
+
+
+def _matches_any_pattern(text: str, patterns: Iterable[re.Pattern[str]]) -> bool:
+    return any(pattern.search(text or "") for pattern in patterns)
+
+
+def _collect_current_fact_index(
+    current_facts: Optional[Iterable[tuple[str, str, str]]],
+) -> dict[tuple[str, str], set[str]]:
+    current_index: dict[tuple[str, str], set[str]] = {}
+    for subject, predicate, object_ in current_facts or []:
+        canonical_predicate = normalize_memory_predicate(predicate)
+        key = (_normalize(subject).lower(), canonical_predicate.lower())
+        current_index.setdefault(key, set()).add(_normalize(object_).lower())
+    return current_index
+
+
+def _extract_explicit_revocations(
+    text: str,
+    *,
+    current_index: dict[tuple[str, str], set[str]],
+) -> list[dict]:
+    voids: list[dict] = []
+    if _matches_any_pattern(text, _CLEAR_EDITOR_PATTERNS) and current_index.get(("user", "preferred_editor")):
+        voids.append({
+            "subject": "User",
+            "predicate": "preferred_editor",
+            "source": "user_stated_revocation",
+        })
+    return voids
 
 
 def merge_fact_records(*groups: Iterable[dict]) -> list[dict]:
@@ -387,9 +485,49 @@ def extract_user_stated_fact_updates(
     for pattern in _BUDGET_PATTERNS:
         match = pattern.search(text)
         if match:
-            value = _clean_generic_value(match.group("value"))
+            value = _clean_budget_value(match.group("value"))
             if value:
                 extracted.append(_build_fact("Task", "budget_limit", value))
+            break
+
+    for pattern in _EMPLOYER_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_title_case_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "current_employer", value))
+            break
+
+    for pattern in _PROJECT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "current_project", value))
+            break
+
+    for pattern in _ROLE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_title_case_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "professional_role", value))
+            break
+
+    for pattern in _FOCUS_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "professional_focus", value))
+            break
+
+    for pattern in _EXPERIENCE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            value = _clean_generic_value(match.group("value"))
+            if value:
+                extracted.append(_build_fact("User", "years_experience", value))
             break
 
     for pattern in _TASK_CONSTRAINT_PATTERNS:
@@ -408,23 +546,24 @@ def extract_user_stated_fact_updates(
                 extracted.append(_build_fact("Task", "followup_directive", value))
             break
 
-    current_index: dict[tuple[str, str], set[str]] = {}
-    for subject, predicate, object_ in current_facts or []:
-        key = (_normalize(subject).lower(), _normalize(predicate).lower())
-        current_index.setdefault(key, set()).add(_normalize(object_).lower())
+    current_index = _collect_current_fact_index(current_facts)
+    voids: list[dict] = _extract_explicit_revocations(text, current_index=current_index)
 
     new_facts: list[dict] = []
-    voids: list[dict] = []
     for fact in merge_fact_records(extracted):
-        key = (fact["subject"].lower(), fact["predicate"].lower())
+        canonical_predicate = normalize_memory_predicate(fact["predicate"])
+        fact["predicate"] = canonical_predicate
+        fact["fact"] = f"{fact['subject']} {canonical_predicate} {fact.get('object', '')}".strip()
+        fact["key"] = f"{fact['subject']} {canonical_predicate}".strip()
+        key = (fact["subject"].lower(), canonical_predicate.lower())
         current_objects = current_index.get(key, set())
         new_object = _normalize(fact.get("object", "")).lower()
         if new_object and new_object in current_objects:
             continue
-        if current_objects and fact["predicate"] not in _MULTI_VALUE_PREDICATES:
+        if current_objects and canonical_predicate not in _MULTI_VALUE_PREDICATES:
             voids.append({
                 "subject": fact["subject"],
-                "predicate": fact["predicate"],
+                "predicate": canonical_predicate,
                 "source": "user_stated",
             })
         new_facts.append(fact)
@@ -445,32 +584,38 @@ def filter_redundant_user_alias_facts(
     known_name = ""
     known_location = ""
     known_timezone = ""
+    known_canonical_values: dict[str, str] = {}
 
     for item in deterministic_facts or []:
-        predicate = _normalize_predicate(str(item.get("predicate") or ""))
+        predicate = normalize_memory_predicate(str(item.get("predicate") or ""))
         object_ = _normalize(str(item.get("object") or "")).lower()
-        if predicate == "preferred name" and object_:
+        if predicate == "preferred_name" and object_:
             known_name = object_
         elif predicate == "location" and object_:
             known_location = object_
         elif predicate == "timezone" and object_:
             known_timezone = object_
+        if predicate and object_:
+            known_canonical_values[predicate] = object_
 
     for subject, predicate, object_ in current_facts or []:
-        pred = _normalize_predicate(predicate)
+        pred = normalize_memory_predicate(predicate)
         obj = _normalize(object_).lower()
-        if pred == "preferred name" and obj:
+        if pred == "preferred_name" and obj:
             known_name = known_name or obj
         elif pred == "location" and obj:
             known_location = known_location or obj
         elif pred == "timezone" and obj:
             known_timezone = known_timezone or obj
+        if pred and obj:
+            known_canonical_values[pred] = known_canonical_values.get(pred, obj) or obj
 
     allowed: list[dict] = []
     blocked: list[dict] = []
     for record in records or []:
         subject = _normalize(str(record.get("subject") or "")).lower()
-        predicate = _normalize_predicate(str(record.get("predicate") or ""))
+        raw_predicate = _normalize_predicate(str(record.get("predicate") or ""))
+        predicate = normalize_memory_predicate(str(record.get("predicate") or ""))
         object_ = _normalize(str(record.get("object") or "")).lower()
 
         alias_noise = False
@@ -498,6 +643,8 @@ def filter_redundant_user_alias_facts(
             "timezone",
             "is in timezone",
         }:
+            alias_noise = True
+        if predicate in known_canonical_values and known_canonical_values.get(predicate) == object_ and raw_predicate != predicate:
             alias_noise = True
 
         if alias_noise:

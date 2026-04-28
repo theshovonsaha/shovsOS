@@ -65,6 +65,10 @@ def test_trace_run_replay_assembles_run_state():
             ],
         },
         response_preview="Wiggle Budget focuses on future-balance planning.",
+        input_tokens=1200,
+        output_tokens=180,
+        total_tokens=1380,
+        estimated_cost_usd=0.0125,
     )
     run_store.save_artifact(
         run_id=run_id,
@@ -120,7 +124,11 @@ def test_trace_run_replay_assembles_run_state():
     assert payload["summary"]["artifact_count"] == 1
     assert payload["summary"]["eval_count"] == 1
     assert payload["summary"]["evidence_count"] >= 1
+    assert payload["summary"]["total_tokens"] == 1380
+    assert payload["summary"]["estimated_cost_usd"] == pytest.approx(0.0125)
     assert payload["latest_pass"]["objective"] == "Investigate wigglebudget.com."
+    assert payload["passes"][0]["input_tokens"] == 1200
+    assert payload["passes"][0]["cumulative_cost_usd"] == pytest.approx(0.0125)
     assert payload["evidence"][0]["item_id"] == "working_evidence"
     assert payload["evidence"][0]["provenance"]["selected_count"] == 1
     assert payload["artifacts"][0]["artifact_type"] == "assistant_response"

@@ -137,3 +137,94 @@ async def test_query_memory_uses_session_facts(monkeypatch):
     result = await _query_memory("blue", _session_id="session-1")
     assert "Unified memory results" in result
     assert "likes" in result
+
+
+@pytest.mark.asyncio
+async def test_query_memory_prefers_active_direct_fact_over_semantic_conflict(monkeypatch):
+    class FakeGraph:
+        async def traverse(self, topic, top_k=5, threshold=0.5, owner_id=None, locus_id=None):
+            return [
+                {
+                    "id": 1,
+                    "subject": "User",
+                    "predicate": "primary editor",
+                    "object": "Cursor",
+                    "similarity": 0.97,
+                    "created_at": "2026-01-01T00:00:00Z",
+                }
+            ]
+
+        def get_current_facts(self, session_id, owner_id=None):
+            return [("User", "preferred_editor", "VS Code")]
+
+        def list_loci(self, owner_id=None):
+            return []
+
+        def get_compiled_drawer(self, locus_id):
+            return None
+
+    class FakeVectorEngine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def query(self, text, limit=5):
+            return []
+
+    monkeypatch.setattr("memory.semantic_graph.SemanticGraph", FakeGraph)
+    monkeypatch.setattr("memory.retrieval.VectorEngine", FakeVectorEngine)
+
+    result = await _query_memory("What editor do I use now?", _session_id="session-1")
+    assert "preferred_editor" in result
+    assert "VS Code" in result
+    assert "Cursor" not in result
+
+
+@pytest.mark.asyncio
+async def test_query_memory_suppresses_stale_semantic_conflict_even_for_non_direct_summary_queries(monkeypatch):
+    class FakeGraph:
+        async def traverse(self, topic, top_k=5, threshold=0.5, owner_id=None, locus_id=None):
+            return [
+                {
+                    "id": 1,
+                    "subject": "User",
+                    "predicate": "preferred editor",
+                    "object": "Cursor",
+                    "similarity": 0.95,
+                    "created_at": "2026-01-01T00:00:00Z",
+                },
+                {
+                    "id": 2,
+                    "subject": "User",
+                    "predicate": "location",
+                    "object": "Toronto",
+                    "similarity": 0.83,
+                    "created_at": "2026-01-01T00:00:00Z",
+                },
+            ]
+
+        def get_current_facts(self, session_id, owner_id=None):
+            return [
+                ("User", "preferred_editor", "VS Code"),
+                ("User", "location", "Toronto"),
+            ]
+
+        def list_loci(self, owner_id=None):
+            return []
+
+        def get_compiled_drawer(self, locus_id):
+            return None
+
+    class FakeVectorEngine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def query(self, text, limit=5):
+            return []
+
+    monkeypatch.setattr("memory.semantic_graph.SemanticGraph", FakeGraph)
+    monkeypatch.setattr("memory.retrieval.VectorEngine", FakeVectorEngine)
+
+    result = await _query_memory("Summarize my current setup", _session_id="session-1")
+    assert "VS Code" in result
+    assert "Toronto" in result
+    assert "Cursor" not in result

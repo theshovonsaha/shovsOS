@@ -4,16 +4,93 @@ from typing import List, Dict, Any, Optional
 from llm.base_adapter import BaseLLMAdapter
 from config.logger import log
 
+
+_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-]{2,}")
+_VERIFIER_STOPWORDS = frozenset({
+    "the", "and", "for", "are", "was", "were", "but", "not", "you", "all",
+    "this", "that", "with", "from", "have", "will", "your", "their", "them",
+    "about", "into", "than", "then", "they", "what", "when", "where", "which",
+    "would", "could", "should", "there", "here", "been", "being", "does",
+    "doing", "done", "also", "more", "most", "such", "some", "other", "only",
+    "according",
+})
+
+
+def _claim_tokens(text: str) -> set[str]:
+    """Tokenize a piece of text into the set of content tokens used for
+    overlap-based span alignment in the verifier. Lowercased, length ≥ 3,
+    minus a small stopword list that otherwise matches every preview."""
+    return {
+        tok.lower()
+        for tok in _TOKEN_RE.findall(text or "")
+        if tok.lower() not in _VERIFIER_STOPWORDS
+    }
+
+
+def _align_spans_to_response(
+    content: str,
+    response_tokens: set[str],
+    *,
+    window: int = 280,
+    stride: int = 140,
+    max_spans: int = 2,
+    fallback_head: int = 200,
+) -> str:
+    """Pick the windows of ``content`` that overlap most with ``response_tokens``.
+
+    Replaces the legacy 300-char head-only preview: when the response cites
+    a fact buried 5KB into a fetched page, the head preview hides it from
+    the verifier. We score sliding windows by token overlap with the
+    response and surface the top ``max_spans`` so the verifier sees the
+    *grounding spans*, not arbitrary slices.
+
+    Total cost stays in the same ballpark as the old 300-char cap
+    (≤2 × 280 = 560 chars per result instead of 300), but every byte
+    inside the budget is now claim-relevant.
+    """
+    text = (content or "").strip()
+    if not text:
+        return ""
+    if not response_tokens or len(text) <= window:
+        return text[:fallback_head] + ("..." if len(text) > fallback_head else "")
+
+    candidates: list[tuple[int, int]] = []  # (score, start)
+    for start in range(0, max(1, len(text) - window + 1), stride):
+        window_text = text[start:start + window]
+        score = len(_claim_tokens(window_text) & response_tokens)
+        if score > 0:
+            candidates.append((score, start))
+    if not candidates:
+        # Response references nothing in this result. Fall back to the head
+        # (legacy behavior) so the verifier still sees *something*.
+        return text[:fallback_head] + ("..." if len(text) > fallback_head else "")
+
+    candidates.sort(key=lambda t: (-t[0], t[1]))
+    chosen: list[tuple[int, int]] = []
+    for _, start in candidates:
+        if len(chosen) >= max_spans:
+            break
+        # Avoid overlapping spans — they'd just repeat the same evidence.
+        if any(abs(start - prev_start) < window // 2 for _, prev_start in chosen):
+            continue
+        chosen.append((_, start))
+
+    chosen.sort(key=lambda t: t[1])
+    return " … ".join(text[s:s + window] for _, s in chosen) + " …"
+
 PLANNING_PROMPT = """\
 You are the [Shovs Orchestrator]. Choose the smallest reliable next-step plan for the SAME run.
 
 Available Tools:
 {tools_docs}
 
-Session Signals:
+{skills_block}{loci_block}Session Signals:
 - session_has_history: {session_has_history}
 - current_fact_count: {current_fact_count}
 - recently_failed_tools: {failed_tools}
+- code_intent: {code_intent_note}
+- execution_risk_tier: {risk_tier}
+- conversation_tension: {tension_summary}
 
 Phase Context:
 {compiled_context}
@@ -22,31 +99,45 @@ Rules:
 - Preserve exact user entities, domains, URLs, file names, tickers, and keywords unless the context clearly justifies normalization.
 - Prefer the minimum tool set needed for the next useful step, not every possible step.
 - Do not broaden or weaken the user's query with filler like "related to", "about", or "similar to" unless that expansion is clearly necessary.
+- If execution_risk_tier is "high" or "critical", prefer clarification or a single safe probe over broad multi-step execution. Do not pile on artifact tools (file_create, bash) without evidence the task is scoped.
+- If conversation_tension is non-empty, the planner must explicitly reflect the tension in its strategy string and avoid tools that would write artifacts based on the contradicted state.
 - If the phase context shows contradiction or drift between the user's current turn and earlier user-stated facts, preserve that tension. Do not silently smooth it over.
 - If answering depends on a contradicted user fact, prefer a plan that helps clarify or verify the conflict instead of pretending the tension does not exist.
 - For exact-domain product or company research, prefer first-party evidence before third-party commentary.
 - If the user asks what a product costs or what plans exist, prefer fetching the exact pricing page before concluding.
 - If the user asks whether a product is good, trustworthy, or recommendable, gather first-party feature/pricing evidence before finalizing.
+- If the task clearly matches an Available Skill, include "skill": "skill_name" in your response so the runtime can load specialized instructions.
+- MEMORY-FIRST: For any recall, research, or "do you remember" query — check memory before web_search. If a named locus exists for the topic, use shovs_memory_query with that locus_id.
 - Conversational queries ("hi", "how are you", opinions) → return []
 - Factual/current data → ["web_search"]
 - URL reading → ["web_fetch"]
 - File creation/editing → ["file_create"] or ["file_str_replace"]
 - Image lookup → ["image_search"]
 - Weather → ["weather_fetch"]
-- Memory recall → ["query_memory"]
+- Memory recall (general) → ["query_memory"]
+- Memory recall (spatial/locus) → ["shovs_memory_query"] with locus_id when a matching locus exists
+- Create a named research area / locus → ["shovs_create_locus"]
+- List all loci / memory rooms → ["shovs_list_loci"]
+- Store a new fact to a locus → ["shovs_memory_store"]
+- Correct / update an existing fact (user corrects something) → ["shovs_memory_update"] — voids old value and writes new one
+- Forget a fact with no replacement (user says "forget X") → ["shovs_memory_void"] — voids only, no new value
 - Delegation → ["delegate_to_agent"]
 - Use `todo_write` only when multi-step task tracking will materially help several later steps. Do not use task tools as a substitute for substantive work.
 - For direct commands like "web search X" or "research X", prefer the substantive research tool first. Add task tools only when they clearly help the run stay organized.
+- After todo_write is called, include todo_update steps for each major task so the list stays accurate.
+- Read current task state with todo_read before deciding to re-plan or skip tasks.
 - Do not include tools that already failed unless a changed query/source makes retrying reasonable.
 
 Return ONLY JSON (no markdown). Preferred format:
 {{
   "strategy": "one-line plan",
+  "skill": "skill_name or omit if none",
   "tools": [
     {{"name": "tool_name", "priority": "high|medium|low", "reason": "short reason", "target_argument_clue": "specific clue for the executor to use (e.g. exact URL or search terms)"}}
   ],
   "force_memory": true/false,
   "memory_topic": "topic or empty",
+  "locus_id": "locus_id if spatial memory is targeted or empty",
   "confidence": 0.0-1.0
 }}
 
@@ -414,22 +505,71 @@ class AgenticOrchestrator:
         current_fact_count: int = 0,
         failed_tools: Optional[List[str]] = None,
         compiled_context: Optional[str] = None,
+        skills_list: Optional[List[Dict[str, str]]] = None,
+        available_loci: Optional[List[Dict[str, str]]] = None,
+        code_intent_note: str = "none",
+        risk_tier: str = "standard",
+        tension_summary: str = "none",
+        tool_failure_rates: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """Analyze query and return structured execution guidance."""
         tools_docs = "\n".join([f"- {t['name']}: {t['description']}" for t in tools_list])
         known_tools = {t["name"] for t in tools_list if isinstance(t, dict) and t.get("name")}
         failed_set = set(failed_tools or [])
+        # Cross-run hint: tools that have failed ≥50% in the lookback window
+        # for this (owner, agent) get flagged so the planner deprioritizes
+        # them. Below 50% is normal noise — we don't want to blacklist on
+        # one bad day. Capped at 5 entries to keep the prompt tight.
+        unreliable_tools = sorted(
+            (
+                (name, rate)
+                for name, rate in (tool_failure_rates or {}).items()
+                if rate >= 0.5
+            ),
+            key=lambda pair: -pair[1],
+        )[:5]
+
+        skills_block = ""
+        if skills_list:
+            skill_lines = [f"- {s['name']}: {s.get('description', '')}" for s in skills_list if isinstance(s, dict) and s.get('name')]
+            if skill_lines:
+                skills_block = "Available Skills:\n" + "\n".join(skill_lines) + "\n\n"
+
+        loci_block = ""
+        if available_loci:
+            loci_lines = [
+                f"- {l.get('id', '')}: {l.get('name', '')} — {l.get('description', '') or 'no description'}"
+                for l in available_loci
+                if isinstance(l, dict) and l.get("id")
+            ]
+            if loci_lines:
+                loci_block = "Memory Palace Loci (named research rooms):\n" + "\n".join(loci_lines) + "\n\n"
+
         route_type = self.classify_route(
             query,
             session_has_history=session_has_history,
             current_fact_count=current_fact_count,
         )
 
+        # If a locus matches the query, prefer shovs_memory_query over flat
+        # query_memory for the memory_recall deterministic short-circuit path.
+        # Uses the same token-overlap detector as the retrieval lane so the
+        # planner and retrieval can never disagree about which locus a query
+        # targets — the previous substring check would miss "European Travel
+        # Plan" against a query like "what's my travel plan", causing facts
+        # to land in one locus and queries to find nothing.
+        _spatial_locus_id = ""
+        if available_loci:
+            from memory.retrieval import detect_locus_by_overlap
+            _spatial_locus_id = detect_locus_by_overlap(query, list(available_loci)) or ""
+
         deterministic_tools: list[dict[str, str]] = []
         if route_type == "trivial_chat":
             return {
                 "strategy": "No tools needed for a trivial conversational turn.",
                 "tools": [],
+                "skill": "",
+                "locus_id": "",
                 "force_memory": False,
                 "memory_topic": "",
                 "confidence": 0.98,
@@ -441,10 +581,11 @@ class AgenticOrchestrator:
         elif (
             route_type == "memory_recall"
             and _memory_recall_can_short_circuit(query)
-            and "query_memory" in known_tools
-            and "query_memory" not in failed_set
         ):
-            deterministic_tools.append({"name": "query_memory", "priority": "high", "reason": "Memory recall intent detected."})
+            if _spatial_locus_id and "shovs_memory_query" in known_tools and "shovs_memory_query" not in failed_set:
+                deterministic_tools.append({"name": "shovs_memory_query", "priority": "high", "reason": f"Spatial memory recall — locus '{_spatial_locus_id}' matches query."})
+            elif "query_memory" in known_tools and "query_memory" not in failed_set:
+                deterministic_tools.append({"name": "query_memory", "priority": "high", "reason": "Memory recall intent detected."})
         elif route_type == "direct_fact" and "web_search" in known_tools and "web_search" not in failed_set:
             deterministic_tools.append({"name": "web_search", "priority": "high", "reason": "Deterministic factual/current query route."})
 
@@ -452,6 +593,8 @@ class AgenticOrchestrator:
             return {
                 "strategy": "Use deterministic route-selected tools before final answer.",
                 "tools": deterministic_tools,
+                "skill": "",
+                "locus_id": _spatial_locus_id,
                 "force_memory": route_type == "memory_recall",
                 "memory_topic": query[:80],
                 "confidence": 0.9,
@@ -459,12 +602,33 @@ class AgenticOrchestrator:
                 "should_plan": False,
             }
 
+        # Compose failed_tools slot. The base value lists tools that failed
+        # in *this* turn. We append cross-run unreliable tools (≥50% fail
+        # rate over last 7 days) so the planner sees both signals in one
+        # place without needing a new template slot. Format keeps it parse-
+        # friendly for the planner LLM ("none" stays unambiguous).
+        failed_tools_str = ", ".join(sorted(failed_set)) if failed_set else "none"
+        if unreliable_tools:
+            unreliable_str = ", ".join(
+                f"{name} ({int(rate * 100)}% recent failure rate)"
+                for name, rate in unreliable_tools
+            )
+            if failed_tools_str == "none":
+                failed_tools_str = f"recently unreliable for this user: {unreliable_str}"
+            else:
+                failed_tools_str += f"; recently unreliable: {unreliable_str}"
+
         prompt = PLANNING_PROMPT.format(
             tools_docs=tools_docs,
+            skills_block=skills_block,
+            loci_block=loci_block,
             query=query,
             session_has_history=str(bool(session_has_history)).lower(),
             current_fact_count=current_fact_count,
-            failed_tools=", ".join(sorted(failed_set)) if failed_set else "none",
+            failed_tools=failed_tools_str,
+            code_intent_note=str(code_intent_note or "none").strip() or "none",
+            risk_tier=str(risk_tier or "standard").strip() or "standard",
+            tension_summary=str(tension_summary or "none").strip() or "none",
             compiled_context=(compiled_context.strip() if compiled_context else "none"),
         )
         
@@ -570,9 +734,14 @@ class AgenticOrchestrator:
                 failed_tools=failed_set,
             )
 
+            # If planner targeted a locus, use it; otherwise fall back to spatial scan result.
+            planned_locus_id = str(payload.get("locus_id", "")).strip() or _spatial_locus_id
+
             structured = {
                 "strategy": str(payload.get("strategy", "Use selected tools to gather evidence before final answer.")),
                 "tools": tools,
+                "skill": str(payload.get("skill", "")).strip(),
+                "locus_id": planned_locus_id,
                 "force_memory": bool(payload.get("force_memory", session_has_history or current_fact_count > 0)),
                 "memory_topic": str(payload.get("memory_topic", query[:80])).strip(),
                 "confidence": float(payload.get("confidence", 0.5)),
@@ -586,6 +755,8 @@ class AgenticOrchestrator:
             return {
                 "strategy": "Planner failed; continue with direct reasoning.",
                 "tools": [],
+                "skill": "",
+                "locus_id": "",
                 "force_memory": False,
                 "memory_topic": "",
                 "confidence": 0.0,
@@ -636,6 +807,47 @@ class AgenticOrchestrator:
                 "notes": "",
                 "confidence": 0.2,
             }
+
+        # ── Pre-LLM deterministic short-circuits ─────────────────────────────
+        # These avoid a full LLM observation call when the outcome is obvious.
+        _all_failed = len(failed_tools) == len(tool_results)
+        _all_succeeded = successful_count == len(tool_results)
+        _rich_single = (
+            len(tool_results) == 1
+            and successful_count == 1
+            and len(str(tool_results[0].get("content") or "")) > 150
+        )
+
+        # If every tool failed, nothing to continue with — finalize immediately.
+        if _all_failed:
+            return {
+                "status": "finalize",
+                "strategy": "All tools failed; actor will explain what is missing.",
+                "tools": [],
+                "notes": "All attempted tools failed. Do not retry; answer from available context.",
+                "confidence": 0.85,
+            }
+
+        # Single successful tool with substantial content → check gap actions
+        # heuristically first; skip LLM if no gap is detected.
+        if _rich_single:
+            heuristic_early = _infer_observation_gap_actions(
+                query=query,
+                tool_results=tool_results,
+                known_tools=known_tools,
+                failed_tools=failed_tools,
+            )
+            if heuristic_early:
+                return heuristic_early
+            # No gap detected — finalize without LLM call.
+            return {
+                "status": "finalize",
+                "strategy": "Single tool returned sufficient evidence.",
+                "tools": [],
+                "notes": "",
+                "confidence": 0.88,
+            }
+        # ── End pre-LLM short-circuits ────────────────────────────────────────
 
         prompt = OBSERVATION_PROMPT.format(
             query=query,
@@ -714,19 +926,64 @@ class AgenticOrchestrator:
         tool_results: List[Dict[str, Any]],
         model: str = "llama3.1:8b",
         compiled_context: Optional[str] = None,
+        route_type: str = "",
     ) -> Dict[str, Any]:
+        # Skip verification for routes where there is nothing to ground-check.
+        # trivial_chat: no factual claims made.
+        # memory_recall: actor is synthesizing from deterministic facts, not
+        #   inventing external claims — verification would be noise.
+        # url_fetch with no tool results: nothing was fetched.
+        _skip_routes = {"trivial_chat", "memory_recall"}
+        if route_type in _skip_routes:
+            return {"supported": True, "issues": [], "confidence": 1.0, "skipped": True}
+
+        # Claim-aligned previews: pull spans of each tool result that
+        # overlap most with the response under verification. Costs ~2x what
+        # the old 300-char head cap did per result, but each byte is now
+        # claim-relevant — and we cap total verifier preview budget so the
+        # prompt can't blow past the model's context window.
+        response_tokens = _claim_tokens(response or "")
         formatted_results = []
+        verifier_preview_budget = 3000  # total chars across all previews
+        spent_chars = 0
         for item in tool_results or []:
             name = str(item.get("tool_name") or item.get("tool") or "unknown")
             success = bool(item.get("success"))
-            preview = str(item.get("content") or "").strip()
-            if len(preview) > 300:
-                preview = preview[:297].rstrip() + "..."
+            raw = str(item.get("content") or "").strip()
+            if not raw:
+                preview = "[empty]"
+            else:
+                aligned = _align_spans_to_response(raw, response_tokens)
+                # Per-result hard cap — protects against pathologically long spans.
+                if len(aligned) > 600:
+                    aligned = aligned[:597].rstrip() + "..."
+                # Honor the global preview budget. Once spent, fall back to
+                # a short head so later results still appear in the verifier
+                # prompt at all.
+                if spent_chars + len(aligned) > verifier_preview_budget:
+                    remaining = max(0, verifier_preview_budget - spent_chars)
+                    aligned = aligned[:remaining].rstrip() + ("..." if remaining else "[budget-truncated]")
+                preview = aligned or "[budget-truncated]"
+                spent_chars += len(preview)
             formatted_results.append(
-                f"- {name} | success={str(success).lower()} | preview={preview or '[empty]'}"
+                f"- {name} | success={str(success).lower()} | preview={preview}"
             )
 
+        # Routes that ought to ground claims in tool output. If a response on
+        # one of these routes has *no* tool results to verify against, treat
+        # it as unsupported rather than silently waving it through.
+        _grounded_routes = {"direct_fact", "url_fetch", "web_research", "code_execution"}
         if not formatted_results:
+            if route_type in _grounded_routes:
+                return {
+                    "supported": False,
+                    "issues": [
+                        "No tool results were captured to ground the response on a "
+                        f"route ({route_type}) that requires external evidence."
+                    ],
+                    "confidence": 0.1,
+                    "fail_closed": True,
+                }
             return {"supported": True, "issues": [], "confidence": 0.3}
 
         prompt = VERIFICATION_PROMPT.format(
@@ -740,6 +997,7 @@ class AgenticOrchestrator:
         current_adapter = create_adapter(provider=model) if ":" in model else self.adapter
         clean_model = strip_provider_prefix(model)
 
+        parse_failed = False
         try:
             raw = await current_adapter.complete(
                 model=clean_model,
@@ -747,24 +1005,38 @@ class AgenticOrchestrator:
                 temperature=0.0,
             )
             obj_match = re.search(r'\{.*\}', raw, re.DOTALL)
-            payload = json.loads(obj_match.group(0)) if obj_match else {}
+            if obj_match:
+                payload = json.loads(obj_match.group(0))
+            else:
+                payload = {}
+                parse_failed = True
         except Exception as e:
             log("orch", "verify", f"Verification failed: {e}", level="warn")
             payload = {}
+            parse_failed = True
 
+        # Fail-closed defaults: when the verifier itself fails on a grounded
+        # route, do NOT auto-pass. Other routes get the legacy benefit of the
+        # doubt to avoid spurious redraft loops on chit-chat.
         supported = payload.get("supported")
         if not isinstance(supported, bool):
-            supported = True
+            supported = False if (parse_failed and route_type in _grounded_routes) else True
         issues = payload.get("issues", [])
         if not isinstance(issues, list):
             issues = []
+        if parse_failed and route_type in _grounded_routes and not issues:
+            issues = ["Verifier returned an unparseable response on a grounded route."]
         confidence = payload.get("confidence", 0.5)
         try:
             confidence = float(confidence)
         except Exception:
             confidence = 0.5
+        if parse_failed:
+            confidence = min(confidence, 0.3)
         return {
             "supported": supported,
             "issues": [str(item) for item in issues[:5] if str(item).strip()],
             "confidence": confidence,
+            "parse_failed": parse_failed,
+            "route_type": route_type,
         }

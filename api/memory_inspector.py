@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from config.trace_store import TraceStore, get_trace_store
-from engine.candidate_signals import parse_candidate_context
+from engine.candidate_signals import parse_candidate_context, render_candidate_signals
 from memory.semantic_graph import SemanticGraph
 
 
@@ -96,9 +96,12 @@ def build_session_memory_payload(
     current_facts = [item for item in timeline if item.get("status") == "current"]
     superseded_facts = [item for item in timeline if item.get("status") == "superseded"]
     candidate_signals = list(getattr(session, "candidate_signals", []) or [])
+    candidate_signal_source = "structured"
     if not candidate_signals:
         candidate_signals = parse_candidate_context(getattr(session, "candidate_context", "") or "")
+        candidate_signal_source = "legacy_text"
     stance_signals = [item for item in candidate_signals if str(item.get("signal_type") or "") == "stance"]
+    candidate_context_preview = render_candidate_signals(candidate_signals) if candidate_signals else ""
 
     recent_events = trace_store.list_events(
         limit=160,
@@ -130,17 +133,20 @@ def build_session_memory_payload(
             "stance_signal_count": len(stance_signals),
             "context_line_count": len(compressed_preview),
             "memory_signal_count": len(memory_signals),
+            "candidate_signal_source": candidate_signal_source,
         },
         "deterministic_facts": current_facts,
         "superseded_facts": superseded_facts,
         "candidate_signals": candidate_signals,
         "stance_signals": stance_signals,
+        "candidate_context_preview": candidate_context_preview,
         "context_preview": compressed_preview,
         "recent_memory_signals": memory_signals,
         "explanation": [
             "Trusted facts are treated as true and override older memory.",
             "Superseded facts stay visible for audit, but they are no longer active.",
             "Candidate signals are stored separately until the system has stronger grounding.",
+            "Candidate text is generated from structured candidate signals; legacy text parsing is compatibility-only.",
             "Stance signals track durable user positions and can trigger drift checks without becoming hard facts automatically.",
         ],
     }

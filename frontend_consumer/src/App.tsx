@@ -27,6 +27,7 @@ type StreamEvent =
   | { type: 'error'; message: string }
   | { type: 'plan'; strategy: string; tools: string[]; confidence: number }
   | { type: 'verification_warning'; issues: string[]; confidence: number }
+  | { type: 'redraft'; reason: string; issues: string[]; side_effect_guard: boolean }
   | { type: 'tension'; summary: string; challenge_level: string };
 
 type StorageStatus = {
@@ -93,6 +94,45 @@ const fmtBytes = (b: number) => {
   }
   return `${v.toFixed(v >= 100 ? 0 : 1)} ${u[i]}`;
 };
+
+// Strip <THOUGHT>...</THOUGHT> spans from the streaming token feed.
+// The adapter wraps thinking-model reasoning in these markers so it doesn't
+// pollute the visible chat. State (`inThought`) carries across token events
+// because a span can begin and end in different chunks.
+function partitionThought(
+  token: string,
+  inThought: boolean,
+): { visible: string; thought: string; inThought: boolean } {
+  const OPEN = '<THOUGHT>';
+  const CLOSE = '</THOUGHT>';
+  let visible = '';
+  let thought = '';
+  let i = 0;
+  while (i < token.length) {
+    if (inThought) {
+      const idx = token.indexOf(CLOSE, i);
+      if (idx === -1) {
+        thought += token.slice(i);
+        i = token.length;
+      } else {
+        thought += token.slice(i, idx);
+        i = idx + CLOSE.length;
+        inThought = false;
+      }
+    } else {
+      const idx = token.indexOf(OPEN, i);
+      if (idx === -1) {
+        visible += token.slice(i);
+        i = token.length;
+      } else {
+        visible += token.slice(i, idx);
+        i = idx + OPEN.length;
+        inThought = true;
+      }
+    }
+  }
+  return { visible, thought, inThought };
+}
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 
@@ -247,6 +287,8 @@ export default function App() {
         const dec = new TextDecoder();
         let buf = '';
         let acc = '';
+        let thoughtAcc = '';
+        let inThought = false;
 
         while (true) {
           const { done, value } = await reader.read();
@@ -290,8 +332,13 @@ export default function App() {
               );
             }
             if (ev.type === 'token') {
-              acc += ev.content;
-              setStreaming(acc);
+              const part = partitionThought(ev.content, inThought);
+              inThought = part.inThought;
+              if (part.thought) thoughtAcc += part.thought;
+              if (part.visible) {
+                acc += part.visible;
+                setStreaming(acc);
+              }
             }
             if (ev.type === 'plan') {
               setStrategy(ev.strategy);
@@ -301,6 +348,23 @@ export default function App() {
                     id: uid(),
                     label: `Strategy: ${ev.strategy}`,
                     detail: ev.tools.join(', '),
+                    expanded: false,
+                  },
+                  ...prev,
+                ].slice(0, 20),
+              );
+            }
+            if (ev.type === 'redraft') {
+              acc = '';
+              thoughtAcc = '';
+              inThought = false;
+              setStreaming('');
+              setActivities((prev) =>
+                [
+                  {
+                    id: uid(),
+                    label: '↻ Redrafting (verification failed)',
+                    detail: (ev.issues || []).join('\n'),
                     expanded: false,
                   },
                   ...prev,
@@ -347,6 +411,22 @@ export default function App() {
                   { id: uid(), role: 'assistant', content: acc },
                 ]);
                 setStreaming('');
+              }
+              if (thoughtAcc.trim()) {
+                // Surface reasoning in the activity panel rather than the chat
+                // bubble — keeps the conversation clean while preserving
+                // observability of the model's internal channel.
+                setActivities((prev) =>
+                  [
+                    {
+                      id: uid(),
+                      label: 'Reasoning',
+                      detail: thoughtAcc,
+                      expanded: false,
+                    },
+                    ...prev,
+                  ].slice(0, 20),
+                );
               }
               setIsRunning(false);
               setPhase('idle');

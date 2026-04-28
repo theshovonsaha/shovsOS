@@ -63,8 +63,8 @@ interface AgentSettingsProfile {
     system_prompt?: string;
     tools?: string[];
     default_use_planner?: boolean;
-    default_loop_mode?: 'auto' | 'single' | 'managed';
     default_context_mode?: 'v1' | 'v2' | 'v3';
+    unified_model_mode?: boolean;
 }
 
 interface SessionMemoryState {
@@ -75,6 +75,7 @@ interface SessionMemoryState {
         stance_signal_count: number;
         context_line_count: number;
         memory_signal_count: number;
+        candidate_signal_source?: string;
     };
     deterministic_facts: Array<{
         subject: string;
@@ -106,6 +107,7 @@ interface SessionMemoryState {
         confidence?: string;
         superseded?: boolean;
     }>;
+    candidate_context_preview?: string;
     recent_memory_signals: Array<{
         event_type: string;
         label: string;
@@ -135,6 +137,10 @@ export interface Message {
     content: string;
     files?: Attachment[];
     blocks: MessageBlock[];
+    historyIndex?: number;
+    createdAt?: string | null;
+    edited?: boolean;
+    editedAt?: string | null;
     _pendingStructured?: string;
 }
 
@@ -148,6 +154,44 @@ interface SessionTraceEvent {
 const STREAM_SENTINEL_RE = /(?:^\s*\[Tool Execution Turn\]\s*$|^\s*confirmation_timeout\s*$)/gim;
 
 const sanitizeVisibleText = (value: string): string => value.replace(STREAM_SENTINEL_RE, '').replace(/\n{3,}/g, '\n\n');
+
+// Split a streamed chunk into (visible, thought) pieces using adapter-emitted
+// <THOUGHT>...</THOUGHT> markers. The inThought flag carries across chunks
+// because a span often straddles multiple SSE events.
+function partitionThought(
+    token: string,
+    inThought: boolean,
+): { visible: string; thought: string; inThought: boolean } {
+    const OPEN = '<THOUGHT>';
+    const CLOSE = '</THOUGHT>';
+    let visible = '';
+    let thought = '';
+    let i = 0;
+    while (i < token.length) {
+        if (inThought) {
+            const idx = token.indexOf(CLOSE, i);
+            if (idx === -1) {
+                thought += token.slice(i);
+                i = token.length;
+            } else {
+                thought += token.slice(i, idx);
+                i = idx + CLOSE.length;
+                inThought = false;
+            }
+        } else {
+            const idx = token.indexOf(OPEN, i);
+            if (idx === -1) {
+                visible += token.slice(i);
+                i = token.length;
+            } else {
+                visible += token.slice(i, idx);
+                i = idx + OPEN.length;
+                inThought = true;
+            }
+        }
+    }
+    return { visible, thought, inThought };
+}
 
 const looksLikeStructuredLeak = (value: string): boolean => {
     const trimmed = sanitizeVisibleText(value).trim();
@@ -285,21 +329,21 @@ export function useAgent() {
     const [currentSearchEngine, setCurrentSearchEngine] = useState<string>(localStorage.getItem('shovs_search_engine') || 'auto');
     const [messages, setMessages] = useState<Message[]>([]);
     const [contextLines, setContextLines] = useState(0);
-    const [contextMode, setContextMode] = useState<'v1' | 'v2' | 'v3'>('v1');
+    const [contextMode, setContextMode] = useState<'v1' | 'v2' | 'v3'>('v3');
     const [sessionMemoryState, setSessionMemoryState] = useState<SessionMemoryState | null>(null);
     const [isStreaming, setIsStreaming] = useState(false);
     const [pendingFiles, setPendingFiles] = useState<Attachment[]>([]);
     const [forcedTools, setForcedTools] = useState<string[]>([]);
-    // V10 Layer Controls
+    // Runtime controls
     const [usePlanner, setUsePlanner] = useState<boolean>(localStorage.getItem('shovs_use_planner') !== 'false');
-    const [loopMode, setLoopMode] = useState<'auto' | 'single' | 'managed'>(
-        (localStorage.getItem('shovs_loop_mode') as 'auto' | 'single' | 'managed') || 'auto'
-    );
     const [maxToolCalls, setMaxToolCalls] = useState<string>(localStorage.getItem('shovs_max_tool_calls') || '');
     const [maxTurns, setMaxTurns] = useState<string>(localStorage.getItem('shovs_max_turns') || '');
     const [plannerModel, setPlannerModel] = useState<string>(localStorage.getItem('shovs_planner_model') || '');
     const [contextModel, setContextModel] = useState<string>(localStorage.getItem('shovs_context_model') || '');
     const [embedModel, setEmbedModel] = useState<string>(localStorage.getItem('shovs_embed_model') || 'ollama:nomic-embed-text');
+    // Mirrors the active agent's unified_model_mode flag. When true the Options panel
+    // hides per-slot model overrides because the backend will ignore them anyway.
+    const [unifiedModelMode, setUnifiedModelMode] = useState<boolean>(true);
 
     // Voice / Jarvis States
     const [isListening, setIsListening] = useState(false);
@@ -339,8 +383,8 @@ export function useAgent() {
                 if (profile.model) setCurrentModel(profile.model);
                 if (profile.embed_model) setEmbedModel(profile.embed_model);
                 setUsePlanner(profile.default_use_planner ?? true);
-                setLoopMode(profile.default_loop_mode || 'auto');
-                setContextMode(profile.default_context_mode || 'v2');
+                setContextMode(profile.default_context_mode || 'v3');
+                setUnifiedModelMode(profile.unified_model_mode ?? true);
             } catch (e) {
                 console.error('Failed to load agent defaults', e);
             }
@@ -367,10 +411,6 @@ export function useAgent() {
     useEffect(() => {
         localStorage.setItem('shovs_use_planner', usePlanner.toString());
     }, [usePlanner]);
-
-    useEffect(() => {
-        localStorage.setItem('shovs_loop_mode', loopMode);
-    }, [loopMode]);
 
     useEffect(() => {
         if (maxToolCalls) localStorage.setItem('shovs_max_tool_calls', maxToolCalls);
@@ -610,15 +650,19 @@ export function useAgent() {
                 }
 
                 return {
-                    id: `hist-${i}`,
+                    id: m.id || `hist-${i}`,
                     role: m.role,
                     content,
                     blocks,
+                    historyIndex: i,
+                    createdAt: m.created_at || null,
+                    edited: Boolean(m.edited),
+                    editedAt: m.edited_at || null,
                 };
             });
             setMessages(loaded);
             setContextLines(data.context_lines || 0);
-            setContextMode(data.context_mode === 'v2' ? 'v2' : data.context_mode === 'v3' ? 'v3' : 'v1');
+            setContextMode(data.context_mode === 'v1' ? 'v1' : data.context_mode === 'v2' ? 'v2' : 'v3');
             refreshSessionMemoryState(id);
             fetchSessions();
         } catch (e) { console.error(e); }
@@ -645,7 +689,7 @@ export function useAgent() {
                 }
                 sessionId = createData.id;
                 setCurrentSessionId(sessionId);
-                setContextMode(createData.context_mode === 'v2' ? 'v2' : createData.context_mode === 'v3' ? 'v3' : 'v1');
+                setContextMode(createData.context_mode === 'v1' ? 'v1' : createData.context_mode === 'v2' ? 'v2' : 'v3');
                 await fetchSessions();
                 return;
             }
@@ -659,7 +703,7 @@ export function useAgent() {
             if (!res.ok) {
                 throw new Error(data?.detail || `HTTP ${res.status}`);
             }
-            setContextMode(data.context_mode === 'v2' ? 'v2' : data.context_mode === 'v3' ? 'v3' : 'v1');
+            setContextMode(data.context_mode === 'v1' ? 'v1' : data.context_mode === 'v2' ? 'v2' : 'v3');
             await fetchSessions();
         } catch (e) {
             console.error('Failed to set context mode', e);
@@ -692,6 +736,22 @@ export function useAgent() {
         } catch { }
     };
 
+    const editSessionMessage = async (messageIndex: number, content: string) => {
+        if (!currentSessionId) return;
+        const res = await fetch(`/api/sessions/${currentSessionId}/messages/${messageIndex}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(withOwnerPayload({ content })),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            throw new Error(data?.detail || `HTTP ${res.status}`);
+        }
+        await loadSession(currentSessionId);
+        await refreshSessionMemoryState(currentSessionId);
+        await fetchSessions();
+    };
+
     const addFiles = (filesList: File[]) => {
         const newAttachments = filesList.map(file => {
             const id = Math.random().toString(36).slice(2);
@@ -722,11 +782,33 @@ export function useAgent() {
         const userMsgId = Date.now().toString();
         const assistantMsgId = (Date.now() + 1).toString();
 
-        setMessages(prev => [
-            ...prev,
-            { id: userMsgId, role: 'user', content: text, files: filesToSend, blocks: [] },
-            { id: assistantMsgId, role: 'assistant', content: '', blocks: [] },
-        ]);
+        setMessages(prev => {
+            const nextIndex = prev.length;
+            return [
+                ...prev,
+                {
+                    id: userMsgId,
+                    role: 'user',
+                    content: text,
+                    files: filesToSend,
+                    blocks: [],
+                    historyIndex: nextIndex,
+                    createdAt: new Date().toISOString(),
+                    edited: false,
+                    editedAt: null,
+                },
+                {
+                    id: assistantMsgId,
+                    role: 'assistant',
+                    content: '',
+                    blocks: [],
+                    historyIndex: nextIndex + 1,
+                    createdAt: new Date().toISOString(),
+                    edited: false,
+                    editedAt: null,
+                },
+            ];
+        });
 
         try {
             const fd = appendOwnerId(new FormData());
@@ -741,7 +823,10 @@ export function useAgent() {
             fd.append('context_mode', contextMode);
             fd.append('embed_model', embedModel);
             fd.append('use_planner', usePlanner.toString());
-            fd.append('loop_mode', loopMode);
+            // When the user turns reasoning off in the UI, tell the backend to
+            // suppress generation (think:false on Ollama) — otherwise the model
+            // keeps thinking and we just hide the output, which wastes tokens.
+            fd.append('reasoning_enabled', showActorThought ? 'true' : 'false');
             if (maxToolCalls.trim()) fd.append('max_tool_calls', maxToolCalls.trim());
             if (maxTurns.trim()) fd.append('max_turns', maxTurns.trim());
 
@@ -755,6 +840,9 @@ export function useAgent() {
 
             const decoder = new TextDecoder();
             let buf = '';
+            // Thought-span partitioning is stream-scoped: a <THOUGHT> span can
+            // straddle SSE events, so we carry inThought across reads.
+            let inThought = false;
 
             while (true) {
                 const { done, value } = await reader.read();
@@ -778,8 +866,6 @@ export function useAgent() {
                         const addBlock = (block: Omit<MessageBlock, 'id'>) => {
                             msg.blocks = [...msg.blocks, { ...block, id: mkId() }];
                         };
-
-                        const lastBlock = msg.blocks[msg.blocks.length - 1];
 
                         const appendToVisibleBlock = (type: 'text' | 'thought', content: string) => {
                             const safeContent = sanitizeVisibleText(content);
@@ -856,30 +942,36 @@ export function useAgent() {
                                 const token = String(ev.content || '');
                                 if (!token) break;
 
-                                // Thinking Tag Detection Logic
-                                if (token.includes('<think>')) {
-                                    const parts = token.split('<think>');
-                                    if (parts[0]) {
-                                        appendToVisibleBlock('text', parts[0]);
+                                // Adapter emits <THOUGHT>...</THOUGHT> markers around reasoning.
+                                // Spans can straddle SSE events, so we use a stream-scoped
+                                // partitioner and fold pieces into a single growing thought block
+                                // instead of one block per token.
+                                const part = partitionThought(token, inThought);
+                                inThought = part.inThought;
+
+                                if (part.thought) {
+                                    const safeThought = sanitizeVisibleText(part.thought);
+                                    if (safeThought) {
+                                        const tailBlock = msg.blocks[msg.blocks.length - 1];
+                                        if (tailBlock?.type === 'thought') {
+                                            tailBlock.content = sanitizeVisibleText(`${tailBlock.content}${safeThought}`);
+                                        } else {
+                                            addBlock({ type: 'thought', content: safeThought });
+                                        }
                                     }
-                                    addBlock({ type: 'thought', content: sanitizeVisibleText(parts[1] || '') });
-                                } else if (token.includes('</think>')) {
-                                    const parts = token.split('</think>');
-                                    if (lastBlock?.type === 'thought') {
-                                        lastBlock.content = sanitizeVisibleText(`${lastBlock.content}${parts[0]}`);
-                                    }
-                                    appendToVisibleBlock('text', parts[1] || '');
-                                } else if (msg._pendingStructured || isLikelyToolJsonStart(token)) {
-                                    msg._pendingStructured = `${msg._pendingStructured || ''}${token}`;
+                                }
+
+                                if (!part.visible) break;
+
+                                if (msg._pendingStructured || isLikelyToolJsonStart(part.visible)) {
+                                    msg._pendingStructured = `${msg._pendingStructured || ''}${part.visible}`;
                                 } else {
                                     const activeTextBlock = msg.blocks[msg.blocks.length - 1];
-                                    if (activeTextBlock?.type === 'text' || activeTextBlock?.type === 'thought') {
-                                        activeTextBlock.content = sanitizeVisibleText(`${activeTextBlock.content}${token}`);
-                                        if (activeTextBlock.type === 'text') {
-                                            msg.content = sanitizeVisibleText(`${msg.content}${token}`);
-                                        }
+                                    if (activeTextBlock?.type === 'text') {
+                                        activeTextBlock.content = sanitizeVisibleText(`${activeTextBlock.content}${part.visible}`);
+                                        msg.content = sanitizeVisibleText(`${msg.content}${part.visible}`);
                                     } else {
-                                        appendToVisibleBlock('text', token);
+                                        appendToVisibleBlock('text', part.visible);
                                     }
                                 }
                                 break;
@@ -1208,12 +1300,12 @@ export function useAgent() {
         lastUserText, currentToken, lastAgentResponse,
         startRecording, stopRecording, stopSpeaking,
         usePlanner, setUsePlanner,
-        loopMode, setLoopMode,
         maxToolCalls, setMaxToolCalls,
         maxTurns, setMaxTurns,
         plannerModel, setPlannerModel,
         contextModel, setContextModel,
         embedModel, setEmbedModel, embedModels,
+        unifiedModelMode,
         voiceSensitivity, setVoiceSensitivity,
         voiceModel,
         setVoiceModel,
@@ -1225,6 +1317,7 @@ export function useAgent() {
         setShowObserverActivity,
         clearSessionContext,
         refreshSessionMemoryState,
+        editSessionMessage,
         loadSession, newSession, deleteSession,
         addFiles, removeFile, sendMessage, stopExecution, bottomRef, conversationRef,
         pendingConfirmation, approveConfirmation, denyConfirmation,

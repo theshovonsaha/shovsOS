@@ -5,11 +5,12 @@ Thanks for contributing. This project is an active system build, not a static li
 ## Scope
 
 Shovs is a human control center over an autonomous agent runtime. Contributions are especially valuable in:
+
 - runtime convergence (`run_engine` and legacy path parity)
 - tool-calling reliability and safety
 - trace/log explainability
 - memory correctness and state integrity
-- Nova and consumer UX clarity
+- Shovs Platform and consumer UX clarity
 - test and evaluation coverage
 
 ## Ground Rules
@@ -24,7 +25,7 @@ Shovs is a human control center over an autonomous agent runtime. Contributions 
 
 1. Follow [Setup](documentation/public/SETUP.md).
 2. Backend dev: `npm run dev:backend`
-3. Nova dev: `npm run dev:frontend:nova`
+3. Shovs Platform dev: `npm run dev:frontend:shovs`
 4. Consumer dev: `npm run dev:frontend:consumer`
 
 ## Test Expectations
@@ -43,7 +44,7 @@ pytest tests/test_context_compiler.py \
 If you change frontends, run build checks:
 
 ```bash
-cd frontend_nova && npm run build
+cd frontend_shovs && npm run build
 cd ../frontend_consumer && npm run build
 ```
 

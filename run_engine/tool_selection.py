@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from engine.tool_contract import format_tool_result_line, summarize_arguments
 from plugins.tool_registry import ToolCall, ToolRegistry
@@ -17,6 +17,7 @@ def build_actor_request_content(
     tool_results: list[dict[str, Any]],
     context_block: str,
     clip_text,
+    argument_clues: Optional[dict[str, str]] = None,
 ) -> str:
     recent_results = "\n".join(
         format_tool_result_line(item, preview_chars=200)
@@ -29,10 +30,27 @@ def build_actor_request_content(
             f"{effective_objective}\n\n"
             "If the current user turn is brief confirmation or retry language, treat the resolved working objective as the operative instruction.\n\n"
         )
+
+    # Planner argument clues — exact hints for what each tool should target.
+    # Using these avoids the actor having to re-derive URLs, search terms, etc.
+    clues_block = ""
+    if argument_clues:
+        relevant = {name: clue for name, clue in argument_clues.items() if name in allowed_tools and clue}
+        if relevant:
+            clue_lines = "\n".join(f"- {name}: {clue}" for name, clue in relevant.items())
+            clues_block = f"Planner argument hints (use these as starting arguments for each tool):\n{clue_lines}\n\n"
+
     return (
         f"{objective_block}"
+        "Decision policy:\n"
+        "- Use the smallest sufficient next step.\n"
+        "- If deterministic facts in context already answer the user, answer directly and do not call tools.\n"
+        "- If one exact probe can close the gap, prefer that over broad multi-step exploration.\n"
+        "- Do not repeat stale context or speculative candidate signals as if they were facts.\n"
+        "- If planner argument hints are provided, use them as the exact argument values for those tools.\n\n"
         "The allowed tools below are available in this runtime right now. If a current-information request can be answered with an allowed tool, use that tool instead of claiming you lack access.\n\n"
         f"Allowed tools: {', '.join(allowed_tools)}\n\n"
+        f"{clues_block}"
         f"Recent tool results:\n{recent_results}\n\n"
         f"Session first message: {session_first_message or 'none'}\n\n"
         f"Context block:\n{context_block or 'none'}"

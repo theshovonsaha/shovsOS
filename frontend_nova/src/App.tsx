@@ -8,6 +8,12 @@ import { MemoryWorkspaceView } from './components/MemoryWorkspaceView';
 import { OptionsPanel } from './components/OptionsPanel';
 import { PremiumSelect } from './components/PremiumSelect';
 import { RichContentViewer } from './components/RichContentViewer';
+import {
+  FileViewerModal,
+  MessageFileTile,
+  PendingFileChip,
+} from './components/FilePreview';
+import type { Attachment } from './useAgent';
 import { ShovsView } from './components/ShovsView';
 import { TraceMonitor } from './components/TraceMonitor';
 import { VoiceControl } from './components/VoiceControl';
@@ -117,23 +123,23 @@ const ToolEvent = ({
   const friendlyName = TOOL_LABELS[tool] || tool.replace(/_/g, ' ');
 
   return (
-    <div className={`nova-tool-event ${type} ${expanded ? 'expanded' : ''}`}>
+    <div className={`shovs-tool-event ${type} ${expanded ? 'expanded' : ''}`}>
       <div
-        className='nova-tool-event-head'
+        className='shovs-tool-event-head'
         onClick={() => canExpand && setExpanded((prev) => !prev)}
       >
-        <span className='nova-tool-event-icon'>{icon}</span>
-        <span className='nova-tool-event-title'>
-          <span className='nova-tool-event-label'>{label}</span>
-          <span className='nova-tool-event-name'>{friendlyName}</span>
+        <span className='shovs-tool-event-icon'>{icon}</span>
+        <span className='shovs-tool-event-title'>
+          <span className='shovs-tool-event-label'>{label}</span>
+          <span className='shovs-tool-event-name'>{friendlyName}</span>
           {summary ? (
-            <span className='nova-tool-event-summary'>{summary}</span>
+            <span className='shovs-tool-event-summary'>{summary}</span>
           ) : null}
         </span>
-        <span className={`nova-tool-event-state ${type}`}>{statusText}</span>
+        <span className={`shovs-tool-event-state ${type}`}>{statusText}</span>
       </div>
       {expanded && canExpand ? (
-        <div className='nova-tool-event-body'>
+        <div className='shovs-tool-event-body'>
           <RichContentViewer content={content || ''} />
         </div>
       ) : null}
@@ -144,16 +150,16 @@ const ToolEvent = ({
 const ThoughtBlock = ({ content }: { content: string }) => {
   const [expanded, setExpanded] = useState(false);
   return (
-    <div className={`nova-thought ${expanded ? 'expanded' : ''}`}>
+    <div className={`shovs-thought ${expanded ? 'expanded' : ''}`}>
       <button
-        className='nova-thought-head'
+        className='shovs-thought-head'
         onClick={() => setExpanded((prev) => !prev)}
       >
         <span>Reasoning</span>
         <span>{expanded ? '▴' : '▾'}</span>
       </button>
       {expanded ? (
-        <div className='nova-thought-body'>
+        <div className='shovs-thought-body'>
           <RichContentViewer content={content} />
         </div>
       ) : null}
@@ -164,16 +170,16 @@ const ThoughtBlock = ({ content }: { content: string }) => {
 const PlanBlock = ({ content }: { content: string }) => {
   const [expanded, setExpanded] = useState(true);
   return (
-    <div className={`nova-plan ${expanded ? 'expanded' : ''}`}>
+    <div className={`shovs-plan ${expanded ? 'expanded' : ''}`}>
       <button
-        className='nova-plan-head'
+        className='shovs-plan-head'
         onClick={() => setExpanded((prev) => !prev)}
       >
         <span>Strategy</span>
         <span>{expanded ? '▴' : '▾'}</span>
       </button>
       {expanded ? (
-        <div className='nova-plan-body'>
+        <div className='shovs-plan-body'>
           <RichContentViewer content={content} />
         </div>
       ) : null}
@@ -184,16 +190,16 @@ const PlanBlock = ({ content }: { content: string }) => {
 const TensionBlock = ({ content }: { content: string }) => {
   const [expanded, setExpanded] = useState(true);
   return (
-    <div className={`nova-plan expanded tension`}>
+    <div className={`shovs-plan expanded tension`}>
       <button
-        className='nova-plan-head'
+        className='shovs-plan-head'
         onClick={() => setExpanded((prev) => !prev)}
       >
         <span>Contradiction / Tension</span>
         <span>{expanded ? '▴' : '▾'}</span>
       </button>
       {expanded ? (
-        <div className='nova-plan-body'>
+        <div className='shovs-plan-body'>
           <RichContentViewer content={content} />
         </div>
       ) : null}
@@ -215,7 +221,7 @@ function App() {
   const [workspaceView, setWorkspaceView] = useState<
     'chat' | 'capabilities' | 'monitor' | 'memory'
   >(() => {
-    const saved = localStorage.getItem('nova_workspace_view');
+    const saved = localStorage.getItem('shovs_workspace_view');
     return saved === 'capabilities' || saved === 'monitor' || saved === 'memory'
       ? saved
       : 'chat';
@@ -225,12 +231,18 @@ function App() {
   const [sidebarTab, setSidebarTab] = useState<'sessions' | 'options'>(
     'sessions',
   );
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingMessageText, setEditingMessageText] = useState('');
+  const [editingBusy, setEditingBusy] = useState(false);
+  const [previewAttachment, setPreviewAttachment] = useState<Attachment | null>(
+    null,
+  );
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const toolMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    localStorage.setItem('nova_workspace_view', workspaceView);
+    localStorage.setItem('shovs_workspace_view', workspaceView);
   }, [workspaceView]);
 
   useEffect(() => {
@@ -280,14 +292,41 @@ function App() {
     }
   };
 
+  const startEditingMessage = (messageId: string, content: string) => {
+    setEditingMessageId(messageId);
+    setEditingMessageText(content);
+  };
+
+  const cancelEditingMessage = () => {
+    setEditingMessageId(null);
+    setEditingMessageText('');
+  };
+
+  const saveEditedMessage = async (historyIndex?: number) => {
+    if (historyIndex == null) return;
+    setEditingBusy(true);
+    try {
+      await agent.editSessionMessage(historyIndex, editingMessageText);
+      cancelEditingMessage();
+    } catch (error) {
+      console.error('Failed to edit message', error);
+    } finally {
+      setEditingBusy(false);
+    }
+  };
+
   const connectionLabel = agent.isStreaming
     ? 'answering'
     : agent.health.status === 'ok'
       ? 'connected'
       : 'connecting';
   const allowedToolNames = new Set(agent.activeAgentProfile?.tools || []);
-  const allowedTools = agent.tools.filter((tool) => allowedToolNames.has(tool.name));
-  const globalOnlyTools = agent.tools.filter((tool) => !allowedToolNames.has(tool.name));
+  const allowedTools = agent.tools.filter((tool) =>
+    allowedToolNames.has(tool.name),
+  );
+  const globalOnlyTools = agent.tools.filter(
+    (tool) => !allowedToolNames.has(tool.name),
+  );
 
   if (!agent.activeAgentId) {
     return (
@@ -300,7 +339,7 @@ function App() {
 
   const sessionSidebar = (
     <>
-      <div className='nova-sidebar-head'>
+      <div className='shovs-sidebar-head'>
         <span>Conversation Threads</span>
         <button
           onClick={() => {
@@ -311,30 +350,30 @@ function App() {
           New
         </button>
       </div>
-      <div className='nova-session-list'>
+      <div className='shovs-session-list'>
         {agent.sessions.length === 0 ? (
-          <div className='nova-empty-card'>No sessions yet.</div>
+          <div className='shovs-empty-card'>No sessions yet.</div>
         ) : (
           agent.sessions.map((session) => (
             <button
               key={session.id}
-              className={`nova-session-item ${session.id === agent.currentSessionId ? 'active' : ''}`}
+              className={`shovs-session-item ${session.id === agent.currentSessionId ? 'active' : ''}`}
               onClick={() => {
                 agent.loadSession(session.id);
                 if (isMobile) setMobilePanel('none');
               }}
             >
-              <div className='nova-session-item-main'>
-                <span className='nova-session-title'>
+              <div className='shovs-session-item-main'>
+                <span className='shovs-session-title'>
                   {session.title || 'New Chat'}
                 </span>
-                <span className='nova-session-meta'>
+                <span className='shovs-session-meta'>
                   {session.message_count} msg ·{' '}
                   {(session.model || '').split(':')[0]}
                 </span>
               </div>
               <span
-                className='nova-session-delete'
+                className='shovs-session-delete'
                 onClick={(e) => {
                   e.stopPropagation();
                   agent.deleteSession(session.id);
@@ -348,18 +387,18 @@ function App() {
       </div>
 
       {!isMobile ? (
-        <div className='nova-stats-card'>
-          <div className='nova-stats-row'>
+        <div className='shovs-stats-card'>
+          <div className='shovs-stats-row'>
             <span>Context</span>
             <span>
               {agent.contextLines > 0 ? `${agent.contextLines} items` : 'cold'}
             </span>
           </div>
-          <div className='nova-stats-row'>
+          <div className='shovs-stats-row'>
             <span>Tools</span>
             <span>{agent.tools.length}</span>
           </div>
-          <div className='nova-tools-cloud'>
+          <div className='shovs-tools-cloud'>
             {agent.tools.slice(0, 10).map((tool) => (
               <span key={tool.name}>{tool.name}</span>
             ))}
@@ -378,8 +417,6 @@ function App() {
       models={agent.models}
       usePlanner={agent.usePlanner}
       setUsePlanner={agent.setUsePlanner}
-      loopMode={agent.loopMode}
-      setLoopMode={agent.setLoopMode}
       maxToolCalls={agent.maxToolCalls}
       setMaxToolCalls={agent.setMaxToolCalls}
       maxTurns={agent.maxTurns}
@@ -391,6 +428,7 @@ function App() {
       embedModel={agent.embedModel}
       setEmbedModel={agent.setEmbedModel}
       embedModels={agent.embedModels}
+      unifiedModelMode={agent.unifiedModelMode}
       contextMode={agent.contextMode}
       setSessionContextMode={agent.setSessionContextMode}
       clearSessionContext={agent.clearSessionContext}
@@ -404,22 +442,22 @@ function App() {
   );
 
   return (
-    <div className={`nova-shell ${logOpen ? 'nova-log-open' : ''}`}>
-      <header className='nova-topbar'>
-        <div className='nova-topbar-left'>
+    <div className={`shovs-shell ${logOpen ? 'shovs-log-open' : ''}`}>
+      <header className='shovs-topbar'>
+        <div className='shovs-topbar-left'>
           <button
-            className='nova-back-btn'
+            className='shovs-back-btn'
             onClick={() => agent.setActiveAgentId(null)}
           >
             Agents
           </button>
-          <div className='nova-brand'>
-            <span className='nova-brand-main'>NOVA</span>
-            <span className='nova-brand-sub'>agent workspace</span>
+          <div className='shovs-brand'>
+            <span className='shovs-brand-main'>SHOVS PLATFORM</span>
+            <span className='shovs-brand-sub'>agent workspace</span>
           </div>
         </div>
 
-        <div className='nova-workspace-switch'>
+        <div className='shovs-workspace-switch'>
           <button
             className={workspaceView === 'chat' ? 'active' : ''}
             onClick={() => setWorkspaceView('chat')}
@@ -446,15 +484,15 @@ function App() {
           </button>
         </div>
 
-        <div className='nova-topbar-right'>
+        <div className='shovs-topbar-right'>
           <span
-            className={`nova-connection ${agent.health.status === 'ok' ? 'ok' : 'cold'}`}
+            className={`shovs-connection ${agent.health.status === 'ok' ? 'ok' : 'cold'}`}
           >
             {connectionLabel}
           </span>
           {isMobile ? (
             <button
-              className={`nova-ghost-btn ${mobileUtilitiesOpen ? 'active' : ''}`}
+              className={`shovs-ghost-btn ${mobileUtilitiesOpen ? 'active' : ''}`}
               onClick={() => setMobileUtilitiesOpen((prev) => !prev)}
             >
               {mobileUtilitiesOpen ? 'Hide' : 'Quick'}
@@ -468,7 +506,7 @@ function App() {
                 placeholder='Select model'
               />
               <button
-                className={`nova-ghost-btn ${agent.showActorThought ? 'active' : ''}`}
+                className={`shovs-ghost-btn ${agent.showActorThought ? 'active' : ''}`}
                 onClick={() =>
                   agent.setShowActorThought(!agent.showActorThought)
                 }
@@ -476,13 +514,13 @@ function App() {
                 {agent.showActorThought ? 'Reasoning On' : 'Reasoning Off'}
               </button>
               <button
-                className='nova-ghost-btn'
+                className='shovs-ghost-btn'
                 onClick={() => setLogOpen((prev) => !prev)}
               >
                 {logOpen ? 'Hide Logs' : 'Logs'}
               </button>
               <button
-                className='nova-ghost-btn'
+                className='shovs-ghost-btn'
                 onClick={() => setShovsMode((prev) => !prev)}
               >
                 {shovsMode ? 'Close Voice' : 'Voice HUD'}
@@ -495,7 +533,7 @@ function App() {
       {isMobile ? (
         <>
           <div
-            className={`nova-mobile-tray ${mobileUtilitiesOpen ? 'open' : ''}`}
+            className={`shovs-mobile-tray ${mobileUtilitiesOpen ? 'open' : ''}`}
           >
             <PremiumSelect
               value={agent.currentModel}
@@ -503,9 +541,9 @@ function App() {
               onChange={(m) => agent.setCurrentModel(m)}
               placeholder='Select model'
             />
-            <div className='nova-mobile-tray-actions'>
+            <div className='shovs-mobile-tray-actions'>
               <button
-                className={`nova-ghost-btn ${agent.showActorThought ? 'active' : ''}`}
+                className={`shovs-ghost-btn ${agent.showActorThought ? 'active' : ''}`}
                 onClick={() =>
                   agent.setShowActorThought(!agent.showActorThought)
                 }
@@ -513,20 +551,20 @@ function App() {
                 {agent.showActorThought ? 'Reasoning On' : 'Reasoning Off'}
               </button>
               <button
-                className='nova-ghost-btn'
+                className='shovs-ghost-btn'
                 onClick={() => setLogOpen((prev) => !prev)}
               >
                 {logOpen ? 'Hide Logs' : 'Logs'}
               </button>
               <button
-                className='nova-ghost-btn'
+                className='shovs-ghost-btn'
                 onClick={() => setShovsMode((prev) => !prev)}
               >
                 {shovsMode ? 'Close Voice' : 'Voice HUD'}
               </button>
             </div>
           </div>
-          <div className='nova-mobile-rail'>
+          <div className='shovs-mobile-rail'>
             <button
               className={mobilePanel === 'sessions' ? 'active' : ''}
               onClick={() => {
@@ -557,10 +595,10 @@ function App() {
         </>
       ) : null}
 
-      <div className='nova-body'>
+      <div className='shovs-body'>
         {!isMobile ? (
-          <aside className='nova-sidebar'>
-            <div className='nova-sidebar-tabs'>
+          <aside className='shovs-sidebar'>
+            <div className='shovs-sidebar-tabs'>
               <button
                 className={sidebarTab === 'sessions' ? 'active' : ''}
                 onClick={() => setSidebarTab('sessions')}
@@ -579,7 +617,7 @@ function App() {
           </aside>
         ) : null}
 
-        <main className='nova-main'>
+        <main className='shovs-main'>
           {workspaceView === 'monitor' ? (
             <TraceMonitor
               sessionId={agent.currentSessionId}
@@ -609,144 +647,188 @@ function App() {
           ) : (
             <>
               <section
-                className='nova-conversation'
+                className='shovs-conversation'
                 ref={agent.conversationRef}
               >
                 {agent.messages.length === 0 ? (
-                  <div className='nova-conversation-empty'>
+                  <div className='shovs-conversation-empty'>
                     <h2>Talk to the agent and shape how it behaves.</h2>
                     <p>
                       Capabilities and memory stay visible in dedicated views.
-                      You do not need to pick a rigid mode first to steer the work.
+                      You do not need to pick a rigid mode first to steer the
+                      work.
                     </p>
                   </div>
                 ) : (
                   agent.messages.map((message, idx) => (
                     <article
                       key={message.id || idx}
-                      className={`nova-message ${message.role}`}
+                      className={`shovs-message ${message.role}`}
                     >
-                      <div className='nova-message-role'>
-                        {message.role === 'user' ? 'You' : 'Agent'}
+                      <div className='shovs-message-role'>
+                        <span>{message.role === 'user' ? 'You' : 'Agent'}</span>
+                        {message.edited ? (
+                          <span className='shovs-inline-badge subtle'>
+                            edited
+                          </span>
+                        ) : null}
+                        {message.role === 'user' &&
+                        typeof message.historyIndex === 'number' &&
+                        !agent.isStreaming ? (
+                          <button
+                            className='shovs-inline-action'
+                            onClick={() =>
+                              startEditingMessage(message.id, message.content)
+                            }
+                          >
+                            Edit
+                          </button>
+                        ) : null}
                       </div>
-                      <div className='nova-message-body'>
-                        {message.files?.filter((f) => f.dataURL).length ? (
-                          <div className='nova-image-row'>
-                            {message
-                              .files!.filter((f) => f.dataURL)
-                              .map((f) => (
-                                <img
-                                  key={f.id}
-                                  className='nova-image-chip'
-                                  src={f.dataURL!}
-                                  title={f.file.name}
-                                  alt='attachment'
-                                />
-                              ))}
+                      <div className='shovs-message-body'>
+                        {editingMessageId === message.id ? (
+                          <div className='shovs-message-edit'>
+                            <textarea
+                              value={editingMessageText}
+                              onChange={(e) =>
+                                setEditingMessageText(e.target.value)
+                              }
+                              rows={4}
+                            />
+                            <div className='shovs-message-edit-actions'>
+                              <button
+                                className='shovs-ghost-btn'
+                                onClick={cancelEditingMessage}
+                                disabled={editingBusy}
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                className='shovs-send-btn'
+                                onClick={() =>
+                                  saveEditedMessage(message.historyIndex)
+                                }
+                                disabled={
+                                  editingBusy || !editingMessageText.trim()
+                                }
+                              >
+                                {editingBusy ? 'Saving...' : 'Save'}
+                              </button>
+                            </div>
+                            <div className='shovs-inline-badge subtle'>
+                              Editing resets derived context and memory for this
+                              session so the next turn rebuilds from the
+                              corrected transcript.
+                            </div>
                           </div>
                         ) : null}
 
-                        {message.files?.filter((f) => !f.dataURL).length ? (
-                          <div className='nova-file-row'>
-                            {message
-                              .files!.filter((f) => !f.dataURL)
-                              .map((f) => (
-                                <span key={f.id} className='nova-file-chip'>
-                                  {f.file.name}
-                                </span>
-                              ))}
-                          </div>
-                        ) : null}
+                        {editingMessageId === message.id ? null : (
+                          <>
+                            {message.files?.length ? (
+                              <div className='shovs-msg-file-row'>
+                                {message.files.map((f) => (
+                                  <MessageFileTile
+                                    key={f.id}
+                                    attachment={f}
+                                    onOpen={() => setPreviewAttachment(f)}
+                                  />
+                                ))}
+                              </div>
+                            ) : null}
 
-                        {message.role === 'user' && !message.blocks?.length ? (
-                          <RichContentViewer content={message.content} />
-                        ) : null}
+                            {message.role === 'user' &&
+                            !message.blocks?.length ? (
+                              <RichContentViewer content={message.content} />
+                            ) : null}
 
-                        {message.blocks?.map((block) => {
-                          switch (block.type) {
-                            case 'text':
-                              return (
-                                <RichContentViewer
-                                  key={block.id}
-                                  content={block.content}
-                                />
-                              );
-                            case 'thought':
-                              return agent.showActorThought ? (
-                                <ThoughtBlock
-                                  key={block.id}
-                                  content={block.content}
-                                />
-                              ) : null;
-                            case 'plan':
-                              return agent.showPlannerLog ? (
-                                <PlanBlock
-                                  key={block.id}
-                                  content={block.content}
-                                />
-                              ) : null;
-                            case 'tension_hint':
-                              return agent.showObserverActivity ? (
-                                <TensionBlock
-                                  key={block.id}
-                                  content={block.content}
-                                />
-                              ) : null;
-                            case 'tool_call':
-                              return (
-                                <ToolEvent
-                                  key={block.id}
-                                  type='call'
-                                  tool={block.tool || 'unknown'}
-                                  content={block.content || ''}
-                                />
-                              );
-                            case 'tool_result':
-                              return (
-                                <ToolEvent
-                                  key={block.id}
-                                  type='result'
-                                  tool={block.tool || 'unknown'}
-                                  content={block.content || ''}
-                                />
-                              );
-                            case 'tool_error':
-                              return (
-                                <ToolEvent
-                                  key={block.id}
-                                  type='error'
-                                  tool={block.tool || 'unknown'}
-                                  content={block.content || ''}
-                                />
-                              );
-                            case 'attachment_badge':
-                              return (
-                                <div
-                                  key={block.id}
-                                  className='nova-inline-badge'
-                                >
-                                  {block.content}
-                                </div>
-                              );
-                            case 'compressing':
-                              return (
-                                <div
-                                  key={block.id}
-                                  className='nova-inline-badge subtle'
-                                >
-                                  compressing context...
-                                </div>
-                              );
-                            default:
-                              return null;
-                          }
-                        })}
+                            {message.blocks?.map((block) => {
+                              switch (block.type) {
+                                case 'text':
+                                  return (
+                                    <RichContentViewer
+                                      key={block.id}
+                                      content={block.content}
+                                    />
+                                  );
+                                case 'thought':
+                                  return agent.showActorThought ? (
+                                    <ThoughtBlock
+                                      key={block.id}
+                                      content={block.content}
+                                    />
+                                  ) : null;
+                                case 'plan':
+                                  return agent.showPlannerLog ? (
+                                    <PlanBlock
+                                      key={block.id}
+                                      content={block.content}
+                                    />
+                                  ) : null;
+                                case 'tension_hint':
+                                  return agent.showObserverActivity ? (
+                                    <TensionBlock
+                                      key={block.id}
+                                      content={block.content}
+                                    />
+                                  ) : null;
+                                case 'tool_call':
+                                  return (
+                                    <ToolEvent
+                                      key={block.id}
+                                      type='call'
+                                      tool={block.tool || 'unknown'}
+                                      content={block.content || ''}
+                                    />
+                                  );
+                                case 'tool_result':
+                                  return (
+                                    <ToolEvent
+                                      key={block.id}
+                                      type='result'
+                                      tool={block.tool || 'unknown'}
+                                      content={block.content || ''}
+                                    />
+                                  );
+                                case 'tool_error':
+                                  return (
+                                    <ToolEvent
+                                      key={block.id}
+                                      type='error'
+                                      tool={block.tool || 'unknown'}
+                                      content={block.content || ''}
+                                    />
+                                  );
+                                case 'attachment_badge':
+                                  return (
+                                    <div
+                                      key={block.id}
+                                      className='shovs-inline-badge'
+                                    >
+                                      {block.content}
+                                    </div>
+                                  );
+                                case 'compressing':
+                                  return (
+                                    <div
+                                      key={block.id}
+                                      className='shovs-inline-badge subtle'
+                                    >
+                                      compressing context...
+                                    </div>
+                                  );
+                                default:
+                                  return null;
+                              }
+                            })}
 
-                        {agent.isStreaming &&
-                        message.role === 'assistant' &&
-                        idx === agent.messages.length - 1 ? (
-                          <span className='nova-cursor' />
-                        ) : null}
+                            {agent.isStreaming &&
+                            message.role === 'assistant' &&
+                            idx === agent.messages.length - 1 ? (
+                              <span className='shovs-cursor' />
+                            ) : null}
+                          </>
+                        )}
                       </div>
                     </article>
                   ))
@@ -755,7 +837,7 @@ function App() {
               </section>
 
               <section
-                className='nova-composer'
+                className='shovs-composer'
                 onDragOver={(e) => e.preventDefault()}
                 onDrop={(e) => {
                   e.preventDefault();
@@ -764,9 +846,12 @@ function App() {
                   }
                 }}
               >
-                <div className='nova-chip-row'>
+                <div className='shovs-chip-row'>
                   {agent.forcedTools.map((toolName) => (
-                    <span key={`forced-${toolName}`} className='nova-chip tool'>
+                    <span
+                      key={`forced-${toolName}`}
+                      className='shovs-chip tool'
+                    >
                       <span>{toolName}</span>
                       <button
                         onClick={() =>
@@ -781,16 +866,16 @@ function App() {
                   ))}
 
                   {agent.pendingFiles.map((file) => (
-                    <span key={file.id} className='nova-chip'>
-                      <span>{file.file.name}</span>
-                      <button onClick={() => agent.removeFile(file.id)}>
-                        ✕
-                      </button>
-                    </span>
+                    <PendingFileChip
+                      key={file.id}
+                      attachment={file}
+                      onRemove={() => agent.removeFile(file.id)}
+                      onOpen={() => setPreviewAttachment(file)}
+                    />
                   ))}
                 </div>
 
-                <div className='nova-composer-row'>
+                <div className='shovs-composer-row'>
                   <VoiceControl
                     isRecording={agent.isListening}
                     status={agent.voiceStatus}
@@ -810,44 +895,46 @@ function App() {
                     placeholder='Ask, build, inspect, orchestrate...'
                   />
 
-                  <div className='nova-tool-menu-wrap' ref={toolMenuRef}>
+                  <div className='shovs-tool-menu-wrap' ref={toolMenuRef}>
                     <button
-                      className={`nova-menu-btn ${toolMenuOpen ? 'active' : ''}`}
+                      className={`shovs-menu-btn ${toolMenuOpen ? 'active' : ''}`}
                       onClick={() => setToolMenuOpen((prev) => !prev)}
                     >
                       Tools
                     </button>
 
                     {toolMenuOpen ? (
-                      <div className='nova-tool-menu'>
-                        <div className='nova-tool-menu-section'>
-                          <div className='nova-tool-menu-label'>
+                      <div className='shovs-tool-menu'>
+                        <div className='shovs-tool-menu-section'>
+                          <div className='shovs-tool-menu-label'>
                             Enabled for this agent
                           </div>
                           {allowedTools.map((tool) => {
-                          const isSelected = agent.forcedTools.includes(
-                            tool.name,
-                          );
-                          return (
-                            <button
-                              key={tool.name}
-                              className={isSelected ? 'selected' : ''}
-                              onClick={() => {
-                                agent.setForcedTools((prev) =>
-                                  prev.includes(tool.name)
-                                    ? prev.filter((name) => name !== tool.name)
-                                    : [...prev, tool.name],
-                                );
-                              }}
-                            >
-                              <span>{tool.name}</span>
-                              <small>{tool.description.split('.')[0]}</small>
-                            </button>
-                          );
-                        })}
+                            const isSelected = agent.forcedTools.includes(
+                              tool.name,
+                            );
+                            return (
+                              <button
+                                key={tool.name}
+                                className={isSelected ? 'selected' : ''}
+                                onClick={() => {
+                                  agent.setForcedTools((prev) =>
+                                    prev.includes(tool.name)
+                                      ? prev.filter(
+                                          (name) => name !== tool.name,
+                                        )
+                                      : [...prev, tool.name],
+                                  );
+                                }}
+                              >
+                                <span>{tool.name}</span>
+                                <small>{tool.description.split('.')[0]}</small>
+                              </button>
+                            );
+                          })}
                         </div>
-                        <div className='nova-tool-menu-section muted'>
-                          <div className='nova-tool-menu-label'>
+                        <div className='shovs-tool-menu-section muted'>
+                          <div className='shovs-tool-menu-label'>
                             Available globally
                           </div>
                           {globalOnlyTools.map((tool) => (
@@ -859,7 +946,8 @@ function App() {
                             >
                               <span>{tool.name}</span>
                               <small>
-                                {tool.description.split('.')[0]} · not enabled here
+                                {tool.description.split('.')[0]} · not enabled
+                                here
                               </small>
                             </button>
                           ))}
@@ -868,7 +956,7 @@ function App() {
                     ) : null}
                   </div>
 
-                  <label className='nova-menu-btn file'>
+                  <label className='shovs-menu-btn file'>
                     Attach
                     <input
                       type='file'
@@ -883,7 +971,7 @@ function App() {
                   </label>
 
                   <button
-                    className={`nova-send-btn ${agent.isStreaming ? 'nova-stop-btn' : ''}`}
+                    className={`shovs-send-btn ${agent.isStreaming ? 'shovs-stop-btn' : ''}`}
                     onClick={
                       agent.isStreaming ? agent.stopExecution : handleSend
                     }
@@ -897,7 +985,7 @@ function App() {
                   </button>
                 </div>
 
-                <div className='nova-composer-foot'>
+                <div className='shovs-composer-foot'>
                   <span>Enter to send · Shift+Enter for new line</span>
                   <span>
                     Context{' '}
@@ -914,18 +1002,18 @@ function App() {
 
       {isMobile && mobilePanel !== 'none' ? (
         <div
-          className='nova-mobile-panel'
+          className='shovs-mobile-panel'
           onClick={() => setMobilePanel('none')}
         >
           <div
-            className='nova-mobile-panel-sheet'
+            className='shovs-mobile-panel-sheet'
             onClick={(e) => e.stopPropagation()}
           >
-            <div className='nova-mobile-panel-head'>
+            <div className='shovs-mobile-panel-head'>
               <span>{mobilePanel === 'sessions' ? 'Threads' : 'Controls'}</span>
               <button onClick={() => setMobilePanel('none')}>Close</button>
             </div>
-            <div className='nova-mobile-panel-body'>
+            <div className='shovs-mobile-panel-body'>
               {mobilePanel === 'sessions' ? sessionSidebar : controlsSidebar}
             </div>
           </div>
@@ -975,6 +1063,11 @@ function App() {
           onDeny={agent.denyConfirmation}
         />
       ) : null}
+
+      <FileViewerModal
+        attachment={previewAttachment}
+        onClose={() => setPreviewAttachment(null)}
+      />
     </div>
   );
 }

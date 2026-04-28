@@ -1,33 +1,65 @@
 # shovs-memory
 
-`shovs-memory` is the smallest adoptable surface of the Shovs runtime.
+`shovs-memory` is the deterministic fact + correction layer extracted from the
+Shovs runtime, packaged for use inside other agent loops.
 
-It is not a separate memory engine. It wraps the same primitives the runtime
-already uses:
+It is not a general-purpose agent memory system. It is a narrow guarantee:
+explicit user statements get extracted by rule (not by LLM judgment), older
+facts get voided when new ones supersede them, and unverified guesses are
+quarantined as "candidates" instead of graduating into trusted state.
 
-- deterministic user-stated fact extraction
-- deterministic task-state extraction for constraints and directives
-- temporal fact storage with invalidation
-- semantic retrieval
-- inspectable memory state
+## Honest positioning vs mempalace
 
-## Why This Exists
+Before anything else: if you are looking for a broad, associative,
+LLM-driven memory layer with rich narrative recall and a spatial/loci
+metaphor — **use mempalace**. It is broader, more mature, and not tied to a
+specific runtime. `shovs-memory` is not a replacement for it.
 
-The full Shovs runtime is powerful, but it is a large first ask.
+`shovs-memory` makes a different trade. It is narrower, more opinionated, and
+exposes only what the Shovs runtime needs to keep facts honest:
 
-`shovs-memory` is the wedge:
+| | mempalace | shovs-memory |
+|---|---|---|
+| Scope | broad agent memory model | narrow fact + correction layer |
+| Recall | LLM-driven, associative | deterministic + semantic graph |
+| Fact extraction | LLM judgment | rule-based, predicate-typed |
+| Corrections | newer notes coexist with older | older facts voided as state transitions |
+| Candidate vs trusted | not a primitive | first-class lane |
+| Portability | agent-framework agnostic | wraps Shovs `SessionManager` + `SemanticGraph` |
 
-- use it inside an existing agent loop
-- keep your own orchestration
-- gain deterministic fact writes, task/directive capture, correction handling, and inspectable memory
+If you want a memory system that *guesses well*, mempalace is the better
+choice. If you want a memory system that *refuses to guess*, this is that.
 
-## Current Shape
+## What it actually gives you
 
-Install directly from PyPI:
+Three things that are not common in markdown-log or vector-only memory layers:
+
+1. **Deterministic fact extraction.** A fixed set of predicates
+   (`preferred_name`, `location`, `timezone`, `preferred_editor`,
+   `package_manager`, `primary_language`, `environment_mode`,
+   `scope_boundary`, `budget_limit`, `task_constraint`,
+   `followup_directive`) are extracted by rule from explicit user statements.
+   No LLM is asked to "decide what to remember." If the user did not say it
+   plainly, it does not become a fact.
+
+2. **Temporal invalidation.** Corrections are state transitions, not new
+   notes appended next to old ones. "Actually, I moved to Berlin" voids the
+   previous `location` fact and writes the new one. The timeline preserves
+   both for audit, but `current_facts()` returns only the live one.
+
+3. **Candidate-signal lane.** Compression-side paraphrases, model
+   inferences, and other not-yet-verified claims are routed into a
+   *candidate* lane instead of being committed as trusted facts. The
+   inspector view surfaces both lanes separately so you can see what the
+   system *believes* vs what it has merely *heard*.
+
+## Install
 
 ```bash
 pip install shovs-memory
 ```
+
+## Use
 
 ```python
 from orchestration.session_manager import SessionManager
@@ -43,80 +75,56 @@ memory = ShovsMemory(
 memory.apply_user_message("My name is Shovon and I live in Toronto.", turn=1)
 memory.apply_user_message("Actually, I moved to Berlin.", turn=2)
 
-facts = memory.current_facts()
-timeline = memory.fact_timeline()
-inspection = memory.inspect()
+facts = memory.current_facts()       # [(User, preferred_name, Shovon), (User, location, Berlin)]
+timeline = memory.fact_timeline()    # current + superseded, ordered by turn
+inspection = memory.inspect()        # trusted + candidates + decision signals
 ```
 
-## What It Gives You
+## API surface
 
-- `apply_user_message(...)`
-  - deterministic extraction for explicit user-stated facts:
-    - preferred name
-    - location
-    - timezone
-    - preferred editor
-    - package manager
-    - primary language
-    - environment mode
-    - scope boundary
-    - budget limit
-    - task constraint
-    - follow-up directive
-  - correction handling through temporal voiding
+- `apply_user_message(message, turn)` — runs the deterministic extractors
+  against a user turn, writes new facts, voids superseded ones, and routes
+  any speculative paraphrases into the candidate lane.
+- `store_fact(subject, predicate, object, *, supersede=False)` — direct
+  insertion when you already know the fact (useful for migrating an existing
+  profile into the graph).
+- `retrieve(query, *, top_k=5)` — semantic retrieval over the memory graph
+  (deterministic facts + candidates + indexed compressed history).
+- `current_facts()` — only live, non-superseded facts.
+- `fact_timeline()` — full lineage including superseded entries.
+- `inspect()` — structured view: trusted facts, superseded facts, candidate
+  signals, context preview, and recent memory decision signals when running
+  inside the full Shovs runtime.
 
-- `store_fact(...)`
-  - direct fact insertion with optional superseding behavior
+## Honest limits
 
-- `retrieve(...)`
-  - semantic retrieval over stored memory
+- **Tied to Shovs runtime primitives.** `ShovsMemory` wraps
+  `orchestration.session_manager.SessionManager` and
+  `memory.semantic_graph.SemanticGraph`. You inherit those data models
+  whether you want them or not. If you have your own session/graph layer,
+  this package will not slot in cleanly.
+- **Predicate set is fixed.** The deterministic extractors only cover the
+  predicates listed above. Domain-specific predicates require either
+  `store_fact(...)` (you classify, the layer stores) or extending the
+  extractor module.
+- **No narrative summarization.** This package will not produce a "what
+  happened in this session" paragraph. That is a separate concern —
+  intentionally outside its scope.
+- **English-language extractor patterns.** Other languages will fall through
+  to the candidate lane rather than producing structured facts.
 
-- `inspect()`
-  - trusted current facts
-  - superseded facts
-  - candidate signals
-  - context preview
-  - recent memory decision signals when using the full runtime inspector
+## When to pick this
 
-## What It Really Is
+Pick `shovs-memory` when you want:
 
-`shovs-memory` is a typed, inspectable memory layer for agents.
+- hard guarantees about what counts as "remembered"
+- corrections that actually invalidate, not just shadow
+- a clear separation between trusted state and unverified guesses
+- an inspectable view you can show a user or auditor
 
-It is not:
+Pick something else when you want:
 
-- a generic vector database wrapper
-- a markdown log with fuzzy recall
-- a second runtime separate from Shovs
-
-It is:
-
-- deterministic fact extraction for explicit user statements
-- temporal invalidation when newer facts supersede older ones
-- semantic retrieval over the memory graph
-- an inspectable state view that separates trusted facts from candidates
-
-## Why It Is Different
-
-Compared with a typical agent memory add-on:
-
-- explicit user facts do not depend on an LLM deciding to emit the right marker
-- corrected facts void earlier facts instead of silently coexisting
-- compression-side paraphrases can be blocked from hardening into truth
-- the memory state is visible: current facts, superseded facts, candidates, and recent decisions
-
-Compared with Markdown-only memory:
-
-- retrieval is not limited to raw file scanning
-- memory is typed instead of one undifferentiated text layer
-- corrections are first-class state transitions, not just later notes in a log
-- the inspectable view is backed by runtime state, not only by narrative summaries
-
-## Positioning
-
-The public story is:
-
-- OpenClaw-style inspectability
-- but with typed state, correction handling, and temporal invalidation
-
-That is the difference between “agent remembers text files” and “agent has a
-memory model you can inspect and trust.”
+- broad associative recall without strict typing → mempalace
+- runtime-agnostic memory you can drop into any framework → mempalace, mem0,
+  or a vector store with your own schema
+- pure narrative summaries of past sessions → a markdown log

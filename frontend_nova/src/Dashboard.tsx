@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { PremiumSelect } from './components/PremiumSelect';
+import { WhyPlatformModal } from './components/WhyPlatformModal';
 import { withOwnerPayload, withOwnerQuery } from './owner';
 
 interface AgentProfile {
@@ -14,8 +15,8 @@ interface AgentProfile {
     bootstrap_files?: string[];
     bootstrap_max_chars?: number;
     default_use_planner?: boolean;
-    default_loop_mode?: 'auto' | 'single' | 'managed';
     default_context_mode?: 'v1' | 'v2' | 'v3';
+    unified_model_mode?: boolean;
 }
 
 interface DashboardProps {
@@ -41,7 +42,7 @@ const AGENT_PRESETS: Record<AgentPresetId, {
         systemPrompt: 'Act as a rigorous researcher. Preserve exact domains and names, gather evidence before conclusions, prefer first-party sources when evaluating a product, and surface what remains unverified clearly.',
         tools: ['web_search', 'web_fetch', 'query_memory', 'store_memory'],
         defaultLoopMode: 'managed',
-        defaultContextMode: 'v2',
+        defaultContextMode: 'v3',
         defaultUsePlanner: true,
         bootstrapFiles: ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md'],
     },
@@ -51,7 +52,7 @@ const AGENT_PRESETS: Record<AgentPresetId, {
         systemPrompt: 'Act as a disciplined coding operator. Work from the local workspace first, preserve project conventions, keep edits precise, and avoid speculative changes.',
         tools: ['file_view', 'file_create', 'file_str_replace', 'bash', 'query_memory', 'store_memory'],
         defaultLoopMode: 'managed',
-        defaultContextMode: 'v2',
+        defaultContextMode: 'v3',
         defaultUsePlanner: true,
         bootstrapFiles: ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md'],
     },
@@ -61,7 +62,7 @@ const AGENT_PRESETS: Record<AgentPresetId, {
         systemPrompt: 'Act as an operations-focused runtime operator. Minimize chatter, prioritize exact diagnostics, explain failure modes clearly, and prefer decisive next steps over broad exploration.',
         tools: ['bash', 'file_view', 'web_search', 'query_memory', 'store_memory'],
         defaultLoopMode: 'single',
-        defaultContextMode: 'v2',
+        defaultContextMode: 'v3',
         defaultUsePlanner: true,
         bootstrapFiles: ['IDENTITY.md', 'SOUL.md', 'TOOLS.md'],
     },
@@ -71,7 +72,7 @@ const AGENT_PRESETS: Record<AgentPresetId, {
         systemPrompt: 'Act as a clear, calm assistant. Prefer plain text, avoid internal execution chatter, and only use tools when they materially improve accuracy or complete the task.',
         tools: ['web_search', 'web_fetch', 'query_memory'],
         defaultLoopMode: 'auto',
-        defaultContextMode: 'v2',
+        defaultContextMode: 'v3',
         defaultUsePlanner: false,
         bootstrapFiles: ['IDENTITY.md', 'SOUL.md'],
     },
@@ -87,6 +88,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
     const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
     const [savingModel, setSavingModel] = useState<string | null>(null);
     const [agentSessions, setAgentSessions] = useState<Record<string, any[]>>({});
+    const [showWhyModal, setShowWhyModal] = useState(false);
 
     useEffect(() => {
         fetchDashboardData();
@@ -173,12 +175,21 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
                     <h1>Agent Workspace</h1>
                     <p>SHOVS // PLATFORM</p>
                 </div>
-                <button
-                    className="btn-create-agent"
-                    onClick={() => setShowCreateModal(true)}
-                >
-                    <span>+</span> INITIALIZE AGENT
-                </button>
+                <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
+                    <button
+                        className="btn-secondary"
+                        onClick={() => setShowWhyModal(true)}
+                        style={{ fontSize: '12px', letterSpacing: '0.18em' }}
+                    >
+                        WHY THIS PLATFORM
+                    </button>
+                    <button
+                        className="btn-create-agent"
+                        onClick={() => setShowCreateModal(true)}
+                    >
+                        <span>+</span> INITIALIZE AGENT
+                    </button>
+                </div>
             </header>
 
             <div className="agent-grid">
@@ -244,6 +255,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
                     onCreated={() => { setShowCreateModal(false); fetchDashboardData(); }}
                 />
             )}
+            {showWhyModal && (
+                <WhyPlatformModal onClose={() => setShowWhyModal(false)} />
+            )}
             {agentToEdit && (
                 <CreateAgentModal
                     initialAgent={agentToEdit}
@@ -276,8 +290,8 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
     const [bootstrapFilesText, setBootstrapFilesText] = useState((initialAgent?.bootstrap_files || ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md']).join(', '));
     const [bootstrapMaxChars, setBootstrapMaxChars] = useState(String(initialAgent?.bootstrap_max_chars || 8000));
     const [defaultUsePlanner, setDefaultUsePlanner] = useState(initialAgent?.default_use_planner ?? true);
-    const [defaultLoopMode, setDefaultLoopMode] = useState<'auto' | 'single' | 'managed'>(initialAgent?.default_loop_mode || 'auto');
-    const [defaultContextMode, setDefaultContextMode] = useState<'v1' | 'v2' | 'v3'>(initialAgent?.default_context_mode || 'v2');
+    const [defaultContextMode, setDefaultContextMode] = useState<'v1' | 'v2' | 'v3'>(initialAgent?.default_context_mode || 'v3');
+    const [unifiedModelMode, setUnifiedModelMode] = useState<boolean>(initialAgent?.unified_model_mode ?? true);
     const [selectedTools, setSelectedTools] = useState<string[]>(initialAgent?.tools || ['web_search', 'web_fetch', 'query_memory', 'store_memory']);
     const [availableTools, setAvailableTools] = useState<any[]>([]);
     const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({ 'ollama': ['llama3.2'] });
@@ -307,7 +321,6 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
         if (!description.trim() || !isEdit) setDescription(preset.description);
         if (!systemPrompt.trim() || !isEdit) setSystemPrompt(preset.systemPrompt);
         setSelectedTools(preset.tools);
-        setDefaultLoopMode(preset.defaultLoopMode);
         setDefaultContextMode(preset.defaultContextMode);
         setDefaultUsePlanner(preset.defaultUsePlanner);
         setBootstrapFilesText(preset.bootstrapFiles.join(', '));
@@ -321,11 +334,10 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
         if (!name.trim()) return;
         setCreating(true);
         try {
-            const payload = withOwnerPayload({
+            const basePayload: Record<string, unknown> = {
                 name: name.trim(),
                 description,
                 model,
-                embed_model: embedModel,
                 system_prompt: systemPrompt,
                 tools: selectedTools,
                 workspace_path: workspacePath.trim() || null,
@@ -335,9 +347,14 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                     .filter(Boolean),
                 bootstrap_max_chars: Number(bootstrapMaxChars) || 8000,
                 default_use_planner: defaultUsePlanner,
-                default_loop_mode: defaultLoopMode,
                 default_context_mode: defaultContextMode,
-            });
+                unified_model_mode: unifiedModelMode,
+            };
+            // embed_model is only sent on CREATE — it is immutable post-creation.
+            if (!isEdit) {
+                basePayload.embed_model = embedModel;
+            }
+            const payload = withOwnerPayload(basePayload);
             await fetch(isEdit ? withOwnerQuery(`/api/agents/${initialAgent!.id}`) : '/api/agents', {
                 method: isEdit ? 'PATCH' : 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -406,11 +423,31 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
 
                         <div className="input-group">
                             <PremiumSelect
-                                label="Embedding Model"
+                                label={isEdit ? 'Embedding Model (locked)' : 'Embedding Model'}
                                 value={embedModel}
                                 options={embedModels}
-                                onChange={setEmbedModel}
+                                onChange={isEdit ? () => {} : setEmbedModel}
+                                disabled={isEdit}
                             />
+                            {isEdit && (
+                                <div className="agent-builder-note" style={{ marginTop: '6px', fontSize: '11px', opacity: 0.75 }}>
+                                    Embedder is fixed at creation. Existing memory rows are bound to it — switching mid-life would corrupt retrieval. Create a new agent to use a different embedder.
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                    <div className="input-group">
+                        <label style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                            <input
+                                type="checkbox"
+                                checked={unifiedModelMode}
+                                onChange={e => setUnifiedModelMode(e.target.checked)}
+                            />
+                            Unified Model Mode
+                        </label>
+                        <div className="agent-builder-note" style={{ marginTop: '6px', fontSize: '11px', opacity: 0.75 }}>
+                            When on, the Execution Model drives chat, planning, and context compression — per-slot overrides in the chat panel are ignored. Turn off only if you want granular control over each slot.
                         </div>
                     </div>
 
@@ -442,24 +479,24 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                         </div>
                     </div>
 
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
-                        <div className="input-group">
-                            <label>Default Loop</label>
-                            <PremiumSelect
-                                label="Execution Loop"
-                                value={defaultLoopMode}
-                                options={{ runtime: ['auto', 'single', 'managed'] }}
-                                onChange={(value) => setDefaultLoopMode(value as 'auto' | 'single' | 'managed')}
-                            />
-                        </div>
-                        <div className="input-group">
-                            <label>Default Context Mode</label>
-                            <PremiumSelect
-                                label="Context Engine"
-                                value={defaultContextMode}
-                                options={{ context: ['v1', 'v2', 'v3'] }}
-                                onChange={(value) => setDefaultContextMode(value as 'v1' | 'v2' | 'v3')}
-                            />
+                    <div className="input-group">
+                        <div
+                            style={{
+                                background: 'linear-gradient(135deg, rgba(99,102,241,0.08), rgba(168,85,247,0.06))',
+                                border: '1px solid rgba(99,102,241,0.25)',
+                                borderRadius: '10px',
+                                padding: '14px 16px',
+                                display: 'flex',
+                                flexDirection: 'column',
+                                gap: '6px',
+                            }}
+                        >
+                            <div style={{ fontWeight: 600, fontSize: '13px', letterSpacing: '0.02em' }}>
+                                Unified Convergent Memory
+                            </div>
+                            <div style={{ fontSize: '12px', opacity: 0.78, lineHeight: 1.45 }}>
+                                Linear recent turns, durable bullet compression, convergent goal-aware ranking, and a small resonance lift — composed into one engine. No mode picker; sessions auto-migrate from older formats on first compress.
+                            </div>
                         </div>
                     </div>
 
@@ -532,13 +569,13 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                                 <div><span>Bootstrap Docs</span><strong>{parsedBootstrapFiles.length}</strong></div>
                                 <div><span>Bootstrap Budget</span><strong>{effectiveBootstrapBudget} chars</strong></div>
                                 <div><span>Per Doc Budget</span><strong>{estimatedPerDocBudget} chars</strong></div>
-                                <div><span>Loop Mode</span><strong>{defaultLoopMode}</strong></div>
+                                <div><span>Runtime</span><strong>managed</strong></div>
                                 <div><span>Context Mode</span><strong>{defaultContextMode}</strong></div>
                                 <div><span>Planner</span><strong>{defaultUsePlanner ? 'on' : 'off'}</strong></div>
                                 <div><span>Selected Tools</span><strong>{selectedTools.length}</strong></div>
                             </div>
                             <div className="agent-builder-note">
-                                Runtime shape: platform core prompt + agent prompt + selected bootstrap docs + tool registry + loop/context defaults.
+                                Runtime shape: platform core prompt + agent prompt + selected bootstrap docs + tool registry + managed runtime context defaults.
                             </div>
                         </div>
                     </div>

@@ -120,6 +120,16 @@ MAX_MODULES = 40          # Hard cap before pruning
 TARGET_MODULES = 15       # Target after pruning
 MAX_CONTEXT_CHARS = 3000  # Max chars injected into prompt
 TOP_N_BY_CONVERGENCE = 12 # How many modules to inject per turn
+MAX_ACTIVE_GOALS = 6
+GOAL_RETIRE_AFTER_TURNS = 5
+GOAL_MIN_ACTIVATION_WEIGHT = 0.2
+
+# Resonance: modules sharing active goals with already-high-ranking modules
+# get a small lift, so the packet emerges as a coherent theme rather than a
+# list of independently-relevant facts. 0.0 = pure convergence; higher = more
+# theme-clustering. 0.15 is "noticeable but does not override convergence."
+DEFAULT_RESONANCE_WEIGHT = 0.15
+RESONANCE_SEED_THRESHOLD = 0.3  # Only confidently-relevant modules seed resonance.
 
 TRIVIAL_PATTERN = re.compile(
     r"^(ok|okay|thanks|thank you|great|sure|yes|no|got it|understood|"
@@ -148,16 +158,20 @@ class ContextEngineV2:
         adapter: BaseLLMAdapter,
         semantic_graph=None,           # Pass your SemanticGraph instance
         compression_model: Optional[str] = None,
+        resonance_weight: float = DEFAULT_RESONANCE_WEIGHT,
+        convergent_top_n: int = TOP_N_BY_CONVERGENCE,
     ):
         self.adapter           = adapter
         self.compression_model = compression_model or cfg.DEFAULT_MODEL
         self.graph             = semantic_graph  # Optional — used for cross-session persistence
+        self.resonance_weight  = float(resonance_weight)
+        self.convergent_top_n  = int(convergent_top_n)
 
         # In-memory state (rebuilt from SemanticGraph on restore if needed)
         # module_key → {content, goals: set, hit_count, created_turn}
         self._modules: dict[str, dict] = {}
-        # goal_label → turn it was first detected
-        self._active_goals: dict[str, int] = {}
+        # goal_label → lifecycle metadata
+        self._active_goals: dict[str, dict[str, int]] = {}
         self._turn: int = 0
 
     def set_adapter(self, adapter: BaseLLMAdapter):
@@ -210,10 +224,8 @@ class ContextEngineV2:
             user_message, assistant_response, use_model
         )
 
-        # Register new goals
-        for goal in goals:
-            if goal not in self._active_goals:
-                self._active_goals[goal] = self._turn
+        self._touch_goals(goals)
+        self._retire_inactive_goals()
 
         # Register/update modules
         keyed_facts = []
@@ -247,6 +259,7 @@ class ContextEngineV2:
                 self._modules[key]["protected"] = True
             # Associate this module with all current active goals
             self._modules[key]["goals"].update(goals)
+            self._modules[key]["last_seen_turn"] = self._turn
             self._modules[key]["hit_count"] += 1
 
             keyed_facts.append(candidate)
@@ -272,6 +285,7 @@ class ContextEngineV2:
                 "goals":        set(goals) if goals else {"session"},
                 "hit_count":    1,
                 "created_turn": self._turn,
+                "last_seen_turn": self._turn,
                 "protected":    False,
             }
             keyed_facts.append({
@@ -308,11 +322,11 @@ class ContextEngineV2:
 
         lines = []
         total_chars = 0
-        goal_summary = ", ".join(list(self._active_goals.keys())[:5]) or "none detected"
+        goal_summary = ", ".join(self._ordered_active_goal_labels()[:5]) or "none detected"
 
         lines.append(f"Active Goals: {goal_summary}")
 
-        for key, module, score in ranked[:TOP_N_BY_CONVERGENCE]:
+        for key, module, score in ranked[:self.convergent_top_n]:
             content = module["content"]
             if len(content) > 200:
                 content = content[:180] + "..."
@@ -370,24 +384,128 @@ class ContextEngineV2:
 
     def _convergence_score(self, module_key: str) -> float:
         """
-        Score = (# active goals this module serves) / (total active goals)
-        Range: 0.0 → 1.0. Higher = more cross-goal utility.
+        Score = weighted shared active-goal utility / total active-goal utility.
+        Newer goals retain more activation weight than older goals so stale
+        context can remain recoverable without dominating the prompt.
         """
         if not self._active_goals or module_key not in self._modules:
             return 0.0
-        module_goals   = self._modules[module_key]["goals"]
-        active_set     = set(self._active_goals.keys())
-        shared         = module_goals & active_set
-        return len(shared) / max(len(active_set), 1)
+        module_goals = self._modules[module_key]["goals"]
+        total_weight = 0.0
+        shared_weight = 0.0
+        for goal, meta in self._active_goals.items():
+            weight = self._goal_activation_weight(meta)
+            total_weight += weight
+            if goal in module_goals:
+                shared_weight += weight
+        if total_weight <= 0:
+            return 0.0
+        return shared_weight / total_weight
+
+    def _goal_activation_weight(self, meta: dict[str, int]) -> float:
+        last_seen_turn = int(meta.get("last_seen_turn", meta.get("first_seen_turn", self._turn)))
+        age = max(0, self._turn - last_seen_turn)
+        return max(GOAL_MIN_ACTIVATION_WEIGHT, 1.0 - (0.2 * age))
+
+    def _ordered_active_goal_labels(self) -> list[str]:
+        ranked = sorted(
+            self._active_goals.items(),
+            key=lambda item: (
+                self._goal_activation_weight(item[1]),
+                int(item[1].get("last_seen_turn", 0)),
+                int(item[1].get("first_seen_turn", 0)),
+            ),
+            reverse=True,
+        )
+        return [goal for goal, _meta in ranked]
 
     def _rank_by_convergence(self) -> list[tuple[str, dict, float]]:
-        """Return modules sorted: convergence score DESC, hit_count DESC."""
-        scored = []
+        """Return modules sorted by active-goal relevance, with a resonance lift.
+
+        Two-pass ranking:
+          1. Score each module by convergence (active-goal overlap, weighted by recency).
+          2. Walk the convergence-sorted list and lift modules whose goal set overlaps
+             with already-seeded high-confidence modules' goal sets. This produces a
+             coherent theme in the injected packet instead of a list of independently
+             ranked facts.
+        """
+        scored: list[tuple[str, dict, float, float]] = []
         for key, mod in self._modules.items():
             score = self._convergence_score(key)
-            scored.append((key, mod, score))
-        scored.sort(key=lambda x: (x[2], x[1]["hit_count"]), reverse=True)
-        return scored
+            shared_weight = sum(
+                self._goal_activation_weight(self._active_goals[goal])
+                for goal in mod.get("goals", set())
+                if goal in self._active_goals
+            )
+            scored.append((key, mod, score, shared_weight))
+
+        scored.sort(
+            key=lambda x: (
+                x[2],
+                x[3],
+                1 if x[1].get("protected") else 0,
+                x[1]["hit_count"],
+                x[1].get("last_seen_turn", x[1].get("created_turn", 0)),
+            ),
+            reverse=True,
+        )
+
+        if self.resonance_weight <= 0 or not scored:
+            return [(key, mod, score) for key, mod, score, _ in scored]
+
+        # Resonance pass: seed from confidently-relevant modules; lift their
+        # goal-sharing neighbors so coherent themes cluster at the top.
+        seed_goals: set[str] = set()
+        with_resonance: list[tuple[str, dict, float]] = []
+        for key, mod, score, _shared in scored:
+            module_goals = mod.get("goals", set()) or set()
+            overlap_count = len(module_goals & seed_goals)
+            denom = max(len(seed_goals), 1)
+            resonance_bonus = (overlap_count / denom) * self.resonance_weight
+            with_resonance.append((key, mod, score + resonance_bonus))
+            if score >= RESONANCE_SEED_THRESHOLD:
+                seed_goals.update(module_goals)
+
+        # Stable resort by lifted score, preserving original tiebreakers via
+        # a secondary sort that mirrors the first pass.
+        with_resonance.sort(
+            key=lambda x: (
+                x[2],
+                1 if x[1].get("protected") else 0,
+                x[1]["hit_count"],
+                x[1].get("last_seen_turn", x[1].get("created_turn", 0)),
+            ),
+            reverse=True,
+        )
+        return with_resonance
+
+    def _touch_goals(self, goals: list[str]) -> None:
+        for goal in goals:
+            if goal not in self._active_goals:
+                self._active_goals[goal] = {
+                    "first_seen_turn": self._turn,
+                    "last_seen_turn": self._turn,
+                }
+            else:
+                self._active_goals[goal]["last_seen_turn"] = self._turn
+
+    def _retire_inactive_goals(self) -> None:
+        survivors: dict[str, dict[str, int]] = {}
+        for goal, meta in self._active_goals.items():
+            last_seen_turn = int(meta.get("last_seen_turn", meta.get("first_seen_turn", 0)))
+            if self._turn - last_seen_turn <= GOAL_RETIRE_AFTER_TURNS:
+                survivors[goal] = meta
+        if len(survivors) > MAX_ACTIVE_GOALS:
+            ranked = sorted(
+                survivors.items(),
+                key=lambda item: (
+                    int(item[1].get("last_seen_turn", 0)),
+                    int(item[1].get("first_seen_turn", 0)),
+                ),
+                reverse=True,
+            )
+            survivors = dict(ranked[:MAX_ACTIVE_GOALS])
+        self._active_goals = survivors
 
     # ── Extraction ─────────────────────────────────────────────────────────────
 
@@ -541,6 +659,7 @@ class ContextEngineV2:
                 "goals":        list(v["goals"]),
                 "hit_count":    v["hit_count"],
                 "created_turn": v.get("created_turn", 0),
+                "last_seen_turn": v.get("last_seen_turn", v.get("created_turn", 0)),
                 "protected":    bool(v.get("protected", False)),
             }
         payload = {
@@ -562,14 +681,30 @@ class ContextEngineV2:
                 self._bootstrap_from_v1(context)
                 return
             self._turn         = payload.get("turn", 0)
-            self._active_goals = payload.get("active_goals", {})
+            raw_goals = payload.get("active_goals", {})
             raw_modules        = payload.get("modules", {})
+            normalized_goals: dict[str, dict[str, int]] = {}
+            if isinstance(raw_goals, dict):
+                for key, value in raw_goals.items():
+                    if isinstance(value, dict):
+                        normalized_goals[str(key)] = {
+                            "first_seen_turn": int(value.get("first_seen_turn", 0) or 0),
+                            "last_seen_turn": int(value.get("last_seen_turn", value.get("first_seen_turn", 0)) or 0),
+                        }
+                    else:
+                        turn = int(value or 0)
+                        normalized_goals[str(key)] = {
+                            "first_seen_turn": turn,
+                            "last_seen_turn": turn,
+                        }
+            self._active_goals = normalized_goals
             self._modules = {
                 k: {
                     "content":      v["content"],
                     "goals":        set(v.get("goals", [])),
                     "hit_count":    v.get("hit_count", 1),
                     "created_turn": v.get("created_turn", 0),
+                    "last_seen_turn": v.get("last_seen_turn", v.get("created_turn", 0)),
                     "protected":    bool(v.get("protected", False)),
                 }
                 for k, v in raw_modules.items()
@@ -593,6 +728,7 @@ class ContextEngineV2:
                 "goals":        {"legacy"},
                 "hit_count":    1,
                 "created_turn": 0,
+                "last_seen_turn": 0,
                 "protected":    False,
             }
         print(f"[ContextEngineV2] Bootstrapped {len(self._modules)} modules from V1 context.")

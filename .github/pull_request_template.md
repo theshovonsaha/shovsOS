@@ -9,7 +9,7 @@
 - [ ] Tools
 - [ ] Memory
 - [ ] API
-- [ ] Nova UI
+- [ ] Shovs Platform UI
 - [ ] Consumer UI
 - [ ] Docs
 - [ ] CI

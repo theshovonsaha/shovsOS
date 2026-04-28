@@ -7,6 +7,7 @@ This guide is for engineers extending the Shovs runtime, not just prompting it.
 Shovs is a runtime with explicit execution semantics.
 
 The core structure is:
+
 - session
 - run
 - phase
@@ -16,8 +17,8 @@ The core structure is:
 - eval
 
 The runtime already supports:
-- `single` loop execution
-- `managed` execution with `plan -> act -> observe -> verify -> commit`
+
+- managed-first execution with `plan -> act -> observe -> verify -> commit`
 - phase-aware context compilation
 - model-aware execution profiles and prompt budgets
 - truth-vs-candidate memory lanes
@@ -40,6 +41,7 @@ The runtime already supports:
   - model execution profile shaping
 
 Current state:
+
 - managed runtime is canonical and default (`runtime_kind=managed`)
 - legacy/native code remains only as low-level compatibility/test coverage, not as a live route selection path
 - publish-direction is one canonical runtime contract with observable state, evidence, and memory policies converged on the managed runtime
@@ -49,6 +51,9 @@ Current state:
 
 - [engine/context_compiler.py](../../engine/context_compiler.py)
   - phase-specific context compilation
+
+- [engine/context_governor.py](../../engine/context_governor.py)
+  - canonical selector for `v1` / `v2` / `v3` context policy modes across managed and compatibility runtimes
 
 - [engine/fact_guard.py](../../engine/fact_guard.py)
   - grounded fact filtering
@@ -93,38 +98,101 @@ Current state:
 
 ## Execution Model
 
-### Single Loop
-
-Use when:
-- model is small or local
-- task is bounded
-- you want minimal orchestration overhead
-
-Characteristics:
-- direct actor loop
-- fewer passes
-- better default for local OpenAI-compatible servers in `auto`
-- more aggressive prompt compression for smaller local profiles
-
 ### Managed Loop
 
-Use when:
-- task is multi-step
-- tool strategy matters
-- you want explicit controller behavior
-
 Characteristics:
+
 - planner phase
 - actor execution
 - observation over tool results
 - verification before memory commit
 - persisted loop checkpoints
 
+Current public reality:
+
+- `run_engine/engine.py` is the canonical runtime spine
+- `engine/core.py` remains for compatibility and test coverage
+- if you see `single` / `auto` in older surfaces, treat them as compatibility-oriented language, not the main product contract
+
+## Context Modes
+
+`context_mode` is about memory/context shaping, not route selection.
+
+### `v1`
+
+What it does:
+
+- linear durable summary
+- appends new memory bullets to older bullets
+- reinjects the stored summary directly
+
+Strength:
+
+- strongest conversational continuity
+- easiest to inspect and debug
+
+Weakness:
+
+- least selective
+- can carry too much old context forward
+
+### `v2`
+
+What it does:
+
+- extracts active goals
+- extracts reusable modules
+- ranks modules by convergence against the active-goal set
+- injects only the top-ranked subset
+
+Strength:
+
+- best attempt at relevance-first memory
+- better prompt efficiency than raw durable summary
+
+Weakness:
+
+- still less transparent than V1
+- older goals are retained for recoverability, so bad extraction can still influence the packet until retirement
+
+Current implementation detail:
+
+- active goals now decay by recency instead of contributing equally forever
+- module ranking favors overlap with newer active goals, then protected/durable modules
+
+### `v3`
+
+What it does:
+
+- runs V1 durable compression and V2 convergent ranking together
+- injects convergent memory plus a trimmed durable slice
+
+Strength:
+
+- best intended long-term direction
+- combines continuity with selective relevance
+
+Weakness:
+
+- still inherits some V2 extraction opacity
+- durable and convergent memory are still composed from separate internal stores rather than one fully unified governor-owned state
+
+Current implementation detail:
+
+- durable memory is now selected with a scored anchor heuristic
+- first-message anchors, corrections, preferences, constraints, and recent durable lines are favored over arbitrary earliest lines
+
+Architectural direction:
+
+- the runtime now already uses one shared `ContextGovernor` to select policy modes
+- the remaining convergence work is to move more commit, activation, and assembly policy behind that governor so the three modes become presets over one memory system rather than parallel architectures
+
 ## Model Execution Profiles
 
 The runtime now classifies the active adapter/model into a prompt-shaping profile before building the acting surface.
 
 Current profiles include:
+
 - `small_local`
 - `tool_native_local`
 - `local_standard`
@@ -132,6 +200,7 @@ Current profiles include:
 - `frontier_standard`
 
 These profiles change:
+
 - system/context budget
 - history budget per message
 - follow-up evidence packet size
@@ -148,6 +217,7 @@ These are central to the project.
 Only verified facts should harden into deterministic memory.
 
 Do not write code that allows:
+
 - assistant guesses
 - inferred ticker swaps
 - imagined file creation
@@ -156,12 +226,20 @@ Do not write code that allows:
 to become hard truth without grounding.
 
 Current deterministic coverage includes explicit user statements for:
+
 - preferred name
 - location
 - timezone
 - preferred editor
 - package manager
 - primary language
+- operating system
+- pronouns
+- environment mode
+- scope boundary
+- budget limit
+- task constraint
+- follow-up directive
 
 Direct-fact queries over these fields can now answer from trusted memory without unnecessary tool use when the fact is already present.
 
@@ -170,11 +248,13 @@ Direct-fact queries over these fields can now answer from trusted memory without
 Weak or unverified signals should be downgraded, not promoted.
 
 That means:
+
 - use candidate context
 - keep it visible for planning or verification
 - do not treat it as truth
 
 Compression-side alias noise should also be blocked. Example:
+
 - keep `User location = Vancouver`
 - block `Shovon lives in Vancouver` from becoming a second hard fact when it is only a paraphrase of the trusted user lane
 
@@ -183,11 +263,13 @@ Compression-side alias noise should also be blocked. Example:
 Memory tools should use the active runtime embedding model, not an unrelated default.
 
 Current behavior:
+
 - runtime embed model is propagated into memory tools
 - Ollama embedding transport supports both `/api/embed` and legacy `/api/embeddings`
 - LM Studio, llama.cpp, and other OpenAI-compatible servers use `/v1/embeddings`
 
 When debugging memory failures, check:
+
 - selected provider
 - selected `EMBED_MODEL`
 - actual embedding endpoint exposed by the local runner
@@ -197,6 +279,7 @@ When debugging memory failures, check:
 `todo_write` should initialize the workflow, not dominate it.
 
 Current runtime behavior:
+
 - bootstrap tasks once
 - prefer `todo_update` after that
 - sanitize follow-up prompts so task admin does not crowd out evidence or synthesis
@@ -228,6 +311,7 @@ MY_TOOL = Tool(
 ```
 
 Guidelines:
+
 - keep arguments explicit
 - keep results structured when possible
 - make failure paths deterministic
@@ -238,6 +322,7 @@ Guidelines:
 Profiles live in [orchestration/agent_profiles.py](../../orchestration/agent_profiles.py).
 
 Keep them narrow:
+
 - model
 - tools
 - system prompt
@@ -250,10 +335,12 @@ Do not overload profiles with runtime logic that belongs in the kernel.
 ## Adding a Provider
 
 Provider wiring should go through:
+
 - [llm/adapter_factory.py](../../llm/adapter_factory.py)
 - the specific adapter in `/llm`
 
 Expectations:
+
 - list models if possible
 - support health checks
 - stream tokens consistently
@@ -263,11 +350,12 @@ If the provider is OpenAI-compatible, prefer using the shared adapter path unles
 
 ## Frontend Expectations
 
-### Nova
+### Shovs Platform
 
-Nova is the main operator workspace.
+Shovs Platform is the main operator workspace.
 
 It should expose:
+
 - provider/model selection
 - loop controls
 - planner toggle
@@ -285,6 +373,7 @@ Consumer should stay narrower and product-facing. Kernel complexity should not a
 ## Testing Guidance
 
 Useful test areas:
+
 - tool call parsing
 - forced-tool retry
 - context overflow retry
@@ -299,6 +388,7 @@ Useful test areas:
 - memory provider and embedding transport compatibility
 
 Representative test files:
+
 - [tests/test_tool_loop_guards.py](../../tests/test_tool_loop_guards.py)
 - [tests/test_layer_data_flow.py](../../tests/test_layer_data_flow.py)
 - [tests/test_state_integrity.py](../../tests/test_state_integrity.py)
@@ -328,6 +418,7 @@ Prefer one explicit managed loop over many loosely coordinated pseudo-agents unl
 The kernel is real, but still evolving.
 
 Likely next refinement areas:
+
 - tighter checkpoint-native prompt compilation
 - stronger external adapter parity in production use
 - more first-class phase objects outside the large `engine/core.py`

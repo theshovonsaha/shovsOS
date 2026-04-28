@@ -79,6 +79,7 @@ def _build_run_replay_payload(*, run_id: str, owner_id: str, trace_limit: int = 
 
     checkpoints = run_store.list_checkpoints(run_id)
     passes = run_store.list_passes(run_id)
+    usage = run_store.summarize_usage(run_id)
     artifacts = run_store.list_artifacts(run_id)
     evals = run_store.list_evals(run_id)
     trace_events = trace_store.list_events(
@@ -137,6 +138,10 @@ def _build_run_replay_payload(*, run_id: str, owner_id: str, trace_limit: int = 
             "eval_count": len(evals),
             "trace_event_count": len(trace_events),
             "evidence_count": len(deduped_evidence),
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "total_tokens": usage["total_tokens"],
+            "estimated_cost_usd": usage["estimated_cost_usd"],
         },
         "latest_checkpoint": asdict(checkpoints[-1]) if checkpoints else None,
         "latest_pass": asdict(passes[-1]) if passes else None,

@@ -282,6 +282,24 @@ class SessionRAG:
         except Exception:
             return 0
 
+    async def clear(self) -> None:
+        if not self._is_available():
+            return
+        try:
+            import asyncio
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._clear_sync)
+        except Exception:
+            pass
+
+    def _clear_sync(self) -> None:
+        try:
+            client = _get_chroma_client()
+            client.delete_collection(self.collection_name)
+        except Exception:
+            pass
+        self._collection = None
+
     def format_results_for_llm(self, results: list[dict], query: str) -> str:
         """Format RAG results into a clean string for LLM injection."""
         if not results:
@@ -317,6 +335,13 @@ def get_session_rag(session_id: str, owner_id: Optional[str] = None) -> SessionR
 def cleanup_session_rag(session_id: str, owner_id: Optional[str] = None):
     """Remove a session's RAG instance from memory (data persists on disk)."""
     _session_rag_registry.pop((owner_id or "", session_id), None)
+
+
+async def clear_session_rag(session_id: str, owner_id: Optional[str] = None):
+    """Delete a session's persisted RAG collection and drop its cached instance."""
+    rag = get_session_rag(session_id, owner_id=owner_id)
+    await rag.clear()
+    cleanup_session_rag(session_id, owner_id=owner_id)
 
 
 def reset_session_rag_storage(storage_dir: Optional[Path] = None):

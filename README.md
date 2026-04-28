@@ -16,13 +16,13 @@ Most "agent platforms" hand the LLM a chat transcript and a tool list, then hope
 
 Five things make this different from a prompt wrapper:
 
-| | What it means |
-|---|---|
-| **Voids & Updates** | Corrections write a void over the stale claim. "Actually, I moved to Berlin" invalidates the prior location — the engine doesn't keep both. |
+|                         | What it means                                                                                                                                                                                                                           |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Voids & Updates**     | Corrections write a void over the stale claim. "Actually, I moved to Berlin" invalidates the prior location — the engine doesn't keep both.                                                                                             |
 | **Side-Effect Honesty** | Tool results carry structured contracts. `bash` and `file_create` emit mandatory verification metadata; the runtime returns `HARD_FAILURE` if expected paths don't exist post-execution. The planner sees real consequences, not prose. |
-| **Sticky Skills** | Skills declare triggers in `SKILL.md` frontmatter. The loader keeps a registry; activation is per-turn, scoped to PLANNING + ACTING phases only — never bleeding into RESPONSE. |
-| **Phase-Aware Context** | `ContextItem`s declare `phase_visibility`. Skill instructions appear in PLANNING/ACTING, never in RESPONSE or MEMORY_COMMIT. Working evidence is acting-time. Deterministic facts are visible everywhere. |
-| **Resonance** | A second-pass scoring step lifts modules that share goals with confidently-relevant ones. The packet emerges as a **coherent theme**, not a top-N grab bag. |
+| **Sticky Skills**       | Skills declare triggers in `SKILL.md` frontmatter. The loader keeps a registry; activation is per-turn, scoped to PLANNING + ACTING phases only — never bleeding into RESPONSE.                                                         |
+| **Phase-Aware Context** | `ContextItem`s declare `phase_visibility`. Skill instructions appear in PLANNING/ACTING, never in RESPONSE or MEMORY_COMMIT. Working evidence is acting-time. Deterministic facts are visible everywhere.                               |
+| **Resonance**           | A second-pass scoring step lifts modules that share goals with confidently-relevant ones. The packet emerges as a **coherent theme**, not a top-N grab bag.                                                                             |
 
 ---
 
@@ -32,7 +32,7 @@ Five things make this different from a prompt wrapper:
 ┌───────────────────────────────────────────────────────────────────────────────┐
 │                               FRONTEND PLANES                                 │
 │  ┌─────────────────────────────────┐    ┌────────────────────────────────┐    │
-│  │  frontend_nova                  │    │  frontend_consumer             │    │
+│  │  frontend_shovs                  │    │  frontend_consumer             │    │
 │  │  operator workspace, agent      │    │  end-user chat surface         │    │
 │  │  builder, monitor, options      │    │  (managed runtime, narrowed)   │    │
 │  └────────────────┬────────────────┘    └───────────────┬────────────────┘    │
@@ -204,15 +204,15 @@ async def log_fact(event: HookEvent) -> None:
     print(f"Stored {event.data['subject']} {event.data['predicate']} {event.data['object']}")
 ```
 
-| Event | Fires when | Payload keys |
-|---|---|---|
-| `session_started` | `session_manager.create()` returns | `agent_id, model, owner_id, [plane]` |
-| `plan_generated` | planner returns structured plan | `route, skill, tools, confidence, strategy` |
-| `tool_selected` | actor chose a tool | `tool_name, arguments_preview` |
-| `tool_completed` | tool execution finished | `tool_name, success, turn` |
-| `hard_failure` | tool returned HARD_FAILURE | `tool_name, turn, preview` |
-| `memory_stored` | fact accepted into semantic graph | `subject, predicate, object, turn, owner_id` |
-| `run_complete` | run finished | `run_id, route, tool_count, success` |
+| Event             | Fires when                         | Payload keys                                 |
+| ----------------- | ---------------------------------- | -------------------------------------------- |
+| `session_started` | `session_manager.create()` returns | `agent_id, model, owner_id, [plane]`         |
+| `plan_generated`  | planner returns structured plan    | `route, skill, tools, confidence, strategy`  |
+| `tool_selected`   | actor chose a tool                 | `tool_name, arguments_preview`               |
+| `tool_completed`  | tool execution finished            | `tool_name, success, turn`                   |
+| `hard_failure`    | tool returned HARD_FAILURE         | `tool_name, turn, preview`                   |
+| `memory_stored`   | fact accepted into semantic graph  | `subject, predicate, object, turn, owner_id` |
+| `run_complete`    | run finished                       | `run_id, route, tool_count, success`         |
 
 Handlers run concurrently via `asyncio.gather`; exceptions are logged, never raised into the engine loop.
 
@@ -227,8 +227,8 @@ Handlers run concurrently via `asyncio.gather`; exceptions are logged, never rai
 # Verify the install
 python3 scripts/doctor.py
 
-# Run Nova (operator workspace)
-npm run dev:nova
+# Run Shovs Platform (operator workspace)
+npm run dev:shovs
 # → http://localhost:5174
 
 # Run Consumer plane
@@ -310,7 +310,7 @@ agent/
 │
 ├── llm/                    Provider adapters (5: Ollama, OpenAI, Anthropic, Groq, Gemini)
 ├── shovs_memory/           Installable memory wedge (uses orchestration + memory)
-├── frontend_nova/          Operator workspace (React + Vite)
+├── frontend_shovs/          Operator workspace (React + Vite)
 ├── frontend_consumer/      Consumer plane
 ├── .agent/skills/          9 platform skills (agent_platform_backend, debugging, frontend_design, ...)
 ├── scripts/                install.sh, doctor.py
@@ -357,6 +357,7 @@ eligibility: auto
 # Debugging skill
 
 Approach:
+
 1. Reproduce the failure deterministically.
 2. Bisect: change one thing at a time.
 3. ...

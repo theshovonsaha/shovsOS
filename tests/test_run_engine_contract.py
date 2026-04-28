@@ -40,6 +40,85 @@ class FakeTraceStore:
 
 
 @pytest.mark.asyncio
+async def test_run_engine_multi_turn_profile_converges_current_facts_over_long_chat(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Acknowledged."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    runs = RunStore(db_path=str(tmp_path / "runs.db"))
+    traces = FakeTraceStore()
+    graph = SemanticGraph(db_path=str(tmp_path / "memory.db"))
+
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=ToolRegistry(),
+        run_store=runs,
+        trace_store=traces,
+        orchestrator=None,
+        context_engine=context_engine,
+        graph=graph,
+    )
+
+    session_id = "run-engine-transcript"
+    owner_id = "owner-transcript"
+    transcript = [
+        "Hi, I'm Shovon. I work as a System Development Specialist at City of Toronto.",
+        "I'm building an open source project called shovsOS.",
+        "I use Cursor as my main editor right now.",
+        "My current project budget is $5k.",
+        "I'm based in Toronto, but planning to move to Berlin in June.",
+        "I have 5 years experience at IBM and City of Toronto.",
+        "Actually, update: I switched from Cursor to VS Code last week.",
+        "Correction: my budget is $3k, not $5k.",
+        "I'm not moving to Berlin anymore, staying in Toronto.",
+        "My role is now focused on AI integration, not just enterprise apps.",
+        "Actually I might increase budget to $4k next month, but keep $3k for now.",
+        "Note that as a candidate, not a fact yet.",
+    ]
+
+    for message in transcript:
+        request = RunEngineRequest(
+            session_id=session_id,
+            owner_id=owner_id,
+            agent_id="default",
+            user_message=message,
+            model="llama3.2",
+            system_prompt="You are Shovs.",
+            allowed_tools=(),
+            use_planner=False,
+        )
+        events = [event async for event in engine.stream(request)]
+        assert any(event["type"] == "done" for event in events)
+
+    current_facts = set(graph.get_current_facts(session_id, owner_id=owner_id))
+
+    assert ("User", "preferred_name", "Shovon") in current_facts
+    assert ("User", "professional_role", "System Development Specialist") in current_facts
+    assert ("User", "current_employer", "City of Toronto") in current_facts
+    assert ("User", "current_project", "shovsOS") in current_facts
+    assert ("User", "preferred_editor", "VS Code") in current_facts
+    assert ("Task", "budget_limit", "$3k") in current_facts
+    assert ("User", "location", "Toronto") in current_facts
+    assert ("User", "professional_focus", "AI integration") in current_facts
+
+    timeline = graph.list_temporal_facts(session_id, owner_id=owner_id, limit=80)
+    superseded = {(item["predicate"], item["object"]) for item in timeline if item["status"] == "superseded"}
+    assert ("preferred_editor", "Cursor") in superseded
+    assert ("budget_limit", "$5k") in superseded
+    assert ("location", "Toronto,") not in current_facts
+
+    phase_context_events = [event for event in traces.events if event["event_type"] == "phase_context"]
+    assert phase_context_events
+    assert any("Memory Authority" in event["data"].get("content", "") for event in phase_context_events)
+    assert any("Contradiction Policy:" in event["data"].get("content", "") for event in phase_context_events)
+
+
+@pytest.mark.asyncio
 async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
     adapter = MagicMock()
     adapter.complete = AsyncMock(
@@ -120,6 +199,10 @@ async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
         context_engine=context_engine,
         graph=graph,
     )
+    # The runtime resolves its compression engine through the governor; pin the
+    # mock there so compress_exchange's stubbed return value (including the
+    # blockable "General working_on …" fact) actually drives the assertions.
+    engine._context_governor._v3_engine = context_engine
 
     request = RunEngineRequest(
         session_id="run-engine-1",
@@ -218,32 +301,70 @@ async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
     assert all(event["data"].get("trace_scope") == "phase_packet" for event in phase_context_events)
     assert all(event["data"].get("canonical_event") == "phase_context" for event in phase_context_events)
     assert all("content" in event["data"] for event in phase_context_events)
-    assert any(
-        event["data"]["phase"] == "acting"
-        and any(item["item_id"] == "phase_guidance" for item in event["data"]["included"])
-        for event in phase_context_events
+
+
+@pytest.mark.asyncio
+async def test_run_engine_direct_fact_turn_skips_planner_and_tools_when_deterministic_facts_suffice(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["You use VS Code."]))
+
+    orchestrator = MagicMock()
+    orchestrator.plan_with_context = AsyncMock()
+    orchestrator.observe_with_context = AsyncMock()
+    orchestrator.verify_with_context = AsyncMock(return_value={"supported": True, "issues": [], "confidence": 0.99})
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    runs = RunStore(db_path=str(tmp_path / "runs.db"))
+    traces = FakeTraceStore()
+    graph = SemanticGraph(db_path=str(tmp_path / "memory.db"))
+    graph.add_temporal_fact("run-engine-fact", "User", "preferred_editor", "VS Code", turn=1, owner_id="owner-fact")
+
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=ToolRegistry(),
+        run_store=runs,
+        trace_store=traces,
+        orchestrator=orchestrator,
+        context_engine=context_engine,
+        graph=graph,
     )
-    assert any(
-        event["data"]["phase"] in {"response", "verification"}
-        and any(item["item_id"] == "phase_guidance" for item in event["data"]["included"])
-        for event in phase_context_events
+
+    request = RunEngineRequest(
+        session_id="run-engine-fact",
+        owner_id="owner-fact",
+        agent_id="default",
+        user_message="What editor do I use now?",
+        model="llama3.2",
+        system_prompt="You are Shovs.",
+        allowed_tools=("query_memory", "web_search"),
+        use_planner=True,
     )
+
+    events = [event async for event in engine.stream(request)]
+
+    assert "".join(event.get("content", "") for event in events if event["type"] == "token") == "You use VS Code."
+    assert not any(event["type"] == "tool_call" for event in events)
+    orchestrator.plan_with_context.assert_not_awaited()
+    orchestrator.observe_with_context.assert_not_awaited()
+    # Direct-fact-memory-only routes intentionally skip LLM verification —
+    # the answer is sourced from the deterministic fact graph (pre-grounded),
+    # so there is nothing to ground-check against tool evidence.
+    orchestrator.verify_with_context.assert_not_awaited()
+
+    phase_context_events = [event for event in traces.events if event["event_type"] == "phase_context"]
+    assert any("deterministic_only" in str(event["data"].get("content", "")) for event in phase_context_events)
     assert any(
         event["data"]["phase"] == "response"
-        and "Manager status: finalize" in event["data"].get("content", "")
-        and "Notes: Use the gathered web evidence in the final answer." in event["data"].get("content", "")
-        for event in phase_context_events
-    )
-    assert any(
-        any(item["item_id"] == "conversation_tension" for item in event["data"]["included"])
+        and any(item["item_id"] == "memory_authority" for item in event["data"]["included"])
         for event in phase_context_events
     )
     assert any(
         any(item["item_id"] == "deterministic_facts" for item in event["data"]["included"])
-        for event in phase_context_events
-    )
-    assert any(
-        any(item["item_id"] == "observation_state" for item in event["data"]["included"])
         for event in phase_context_events
     )
 

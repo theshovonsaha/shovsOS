@@ -1,25 +1,53 @@
 """
-ContextEngineV3 — Hybrid Durable + Convergent Context
------------------------------------------------------
-Experimental context engine that combines:
-- V1 durable linear memory for stable facts/corrections
-- V2 convergent module ranking for active-goal relevance
+ContextEngineV3 — The Unified Convergent Memory engine.
+-------------------------------------------------------
+This is THE context engine for the platform. The v1/v2/v3 numeric labels are
+historical: V3 is the unified engine that composes the four concerns of a real
+context layer into one pipeline.
 
-Storage format remains a single string in SessionManager.compressed_context.
-Existing V1/V2 sessions are bootstrapped on first use.
+Four-stage pipeline:
+  1. LINEAR LANE        — recent turns kept verbatim (handled upstream by
+                          SessionManager.sliding_window).
+  2. COMPRESSION        — older exchanges compressed into durable bullets via
+                          the V1 compressor (proven, stable).
+  3. CONVERGENT RANKING — active goals + module registry surface the
+                          right-context-at-the-right-time (V2 mechanics).
+  4. RESONANCE          — modules sharing goals with high-converging modules
+                          get a small lift, so the packet emerges as a
+                          coherent theme rather than a list of facts.
+
+Tunable knobs (constructor kwargs, not modes):
+  - linear_window_size:  recent turns kept verbatim (advisory; sessions own
+                          the actual sliding window).
+  - durable_cap:         max durable lines surfaced per turn.
+  - convergent_top_n:    max convergent modules surfaced per turn.
+  - resonance_weight:    0 disables resonance; ~0.15 is "noticeable theme
+                          clustering"; >0.3 starts overriding convergence.
+
+Storage format is a single JSON string in SessionManager.compressed_context.
+Sessions whose blob is in v1 (plain bullets) or v2 (legacy JSON) are migrated
+on first compress — no data loss, one-way transition.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 from llm.base_adapter import BaseLLMAdapter
 from engine.context_engine import ContextEngine
-from engine.context_engine_v2 import ContextEngineV2
+from engine.context_engine_v2 import ContextEngineV2, DEFAULT_RESONANCE_WEIGHT
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
+
+
+# Defaults chosen for an interactive multi-turn agent on a typical 32k-128k context.
+# Override per agent-profile via ContextGovernor if a workload needs different policy.
+DEFAULT_DURABLE_CAP = 8
+DEFAULT_CONVERGENT_TOP_N = 12
+DEFAULT_LINEAR_WINDOW_SIZE = 6  # advisory; the session manager owns the actual window
 
 
 class ContextEngineV3:
@@ -28,15 +56,34 @@ class ContextEngineV3:
         adapter: BaseLLMAdapter,
         semantic_graph=None,
         compression_model: Optional[str] = None,
+        *,
+        linear_window_size: int = DEFAULT_LINEAR_WINDOW_SIZE,
+        durable_cap: int = DEFAULT_DURABLE_CAP,
+        convergent_top_n: int = DEFAULT_CONVERGENT_TOP_N,
+        resonance_weight: float = DEFAULT_RESONANCE_WEIGHT,
     ):
         self.adapter = adapter
         self.compression_model = compression_model or cfg.DEFAULT_MODEL
+        self.linear_window_size = int(linear_window_size)
+        self.durable_cap = int(durable_cap)
+        self.convergent_top_n = int(convergent_top_n)
+        self.resonance_weight = float(resonance_weight)
+
         self._v1 = ContextEngine(adapter=adapter, compression_model=compression_model)
         self._v2 = ContextEngineV2(
             adapter=adapter,
             semantic_graph=semantic_graph,
             compression_model=compression_model,
+            resonance_weight=self.resonance_weight,
+            convergent_top_n=self.convergent_top_n,
         )
+
+    def set_resonance_weight(self, weight: float) -> None:
+        self.resonance_weight = float(weight)
+        self._v2.resonance_weight = self.resonance_weight
+
+    def set_durable_cap(self, cap: int) -> None:
+        self.durable_cap = int(cap)
 
     def set_adapter(self, adapter: BaseLLMAdapter):
         self.adapter = adapter
@@ -48,17 +95,30 @@ class ContextEngineV3:
         return self.compression_model
 
     def _split_context(self, current_context: str) -> tuple[str, str]:
-        if not current_context:
+        """
+        Returns (durable_context, convergent_context).
+
+        Migration rules:
+          - Native v3 JSON  → unpack both streams directly.
+          - v2 JSON (__v2__) → treat entire blob as convergent; durable starts empty.
+          - Plain text (v1 bullets) → treat as durable; convergent starts empty.
+          - Empty / unparseable → both empty (fresh session).
+        """
+        if not current_context or not current_context.strip():
             return "", ""
         try:
             payload = json.loads(current_context)
             if payload.get("__v3__"):
                 return payload.get("durable_context", ""), payload.get("convergent_context", "")
             if payload.get("__v2__"):
+                # Migrate v2: the entire JSON blob becomes the convergent stream.
+                # Durable stream starts fresh — v1 will accumulate from next exchange.
                 return "", current_context
-        except Exception:
-            pass
-        return current_context, ""
+            # Unknown JSON shape — treat as durable plain-text fallback.
+            return current_context, ""
+        except (json.JSONDecodeError, ValueError):
+            # Plain-text v1 bullets — migrate to durable stream.
+            return current_context, ""
 
     def _serialize_context(self, durable_context: str, convergent_context: str) -> str:
         payload = {
@@ -82,6 +142,54 @@ class ContextEngineV3:
             seen.add(key)
             deduped.append(record)
         return deduped
+
+    def _durable_line_score(self, line: str, index: int, total: int) -> float:
+        normalized = line.strip().lower()
+        score = 0.0
+
+        if "first message:" in normalized:
+            score += 5.0
+        if re.search(r"\b(actually|correction|updated?|moved|changed|instead)\b", normalized):
+            score += 4.0
+        if re.search(r"\b(prefer|preferred|timezone|pronouns|editor|language|package manager)\b", normalized):
+            score += 3.0
+        if re.search(r"\b(do not|don't|must|constraint|scope|budget|deadline|follow up)\b", normalized):
+            score += 3.0
+        if re.search(r"\b(name|location|os|operating system|environment|task)\b", normalized):
+            score += 1.5
+
+        # Favor newer durable lines without letting recency override stronger anchors.
+        recency = (index + 1) / max(total, 1)
+        score += recency * 1.5
+        return score
+
+    def _select_durable_lines(self, durable_lines: list[str], max_items: int = 8) -> list[str]:
+        if len(durable_lines) <= max_items:
+            return durable_lines
+
+        chosen_indices: set[int] = {
+            idx for idx, line in enumerate(durable_lines) if "first message:" in line.lower()
+        }
+        if len(chosen_indices) > max_items:
+            chosen_indices = set(sorted(chosen_indices)[:max_items])
+
+        scored = sorted(
+            (
+                (self._durable_line_score(line, idx, len(durable_lines)), idx, line)
+                for idx, line in enumerate(durable_lines)
+            ),
+            reverse=True,
+        )
+
+        for _score, idx, line in scored:
+            if len(chosen_indices) >= max_items:
+                break
+            chosen_indices.add(idx)
+
+        if len(chosen_indices) < max_items and durable_lines:
+            chosen_indices.add(len(durable_lines) - 1)
+
+        return [durable_lines[idx] for idx in sorted(chosen_indices)[:max_items]]
 
     async def compress_exchange(
         self,
@@ -129,8 +237,7 @@ class ContextEngineV3:
         if durable_context:
             durable_lines = [line for line in durable_context.split("\n") if line.strip()]
             if durable_lines:
-                # Keep durable memory concise: preserve only the strongest anchors.
-                chosen = durable_lines[:8]
+                chosen = self._select_durable_lines(durable_lines, max_items=self.durable_cap)
                 parts.append(
                     "--- Durable Memory (V3) ---\n"
                     + "\n".join(chosen)
@@ -170,7 +277,7 @@ class ContextEngineV3:
         if durable_context:
             durable_lines = [line for line in durable_context.split("\n") if line.strip()]
             if durable_lines:
-                chosen = durable_lines[:8]
+                chosen = self._select_durable_lines(durable_lines, max_items=self.durable_cap)
                 durable_block = (
                     "--- Durable Memory (V3) ---\n"
                     + "\n".join(chosen)

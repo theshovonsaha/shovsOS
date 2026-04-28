@@ -9,7 +9,7 @@ from engine.core import (
     _normalize_forced_tools_for_task_state,
     _tool_turn_budget,
 )
-from engine.tool_loop_guard import ToolLoopGuard, is_null_bash_result
+from engine.tool_loop_guard import ToolLoopGuard, is_empty_query_memory_result, is_null_bash_result
 from plugins.tool_registry import Tool, ToolCall, ToolRegistry
 
 
@@ -251,3 +251,31 @@ def test_null_bash_result_ignores_verified_write_commands():
     payload = '{"type":"bash_result","success":true,"status":"SUCCESS","verification":{"mode":"filesystem_check","existing_paths":["demo.txt"],"missing_paths":[],"exists_after":true,"bytes_written":10},"output":""}'
 
     assert is_null_bash_result("bash", True, payload) is False
+
+
+def test_empty_query_memory_result_detects_no_memory_payload():
+    assert is_empty_query_memory_result("query_memory", True, "No memories found related to 'hobbies'.") is True
+    assert is_empty_query_memory_result("query_memory", True, "Unified memory results for 'hobbies' (1):") is False
+
+
+def test_tool_loop_guard_flags_same_empty_query_memory_twice():
+    guard = ToolLoopGuard()
+
+    first = guard.observe_result(
+        tool_name="query_memory",
+        arguments={"topic": "interests or hobbies"},
+        success=True,
+        content="No memories found related to 'interests or hobbies'.",
+    )
+    second = guard.observe_result(
+        tool_name="query_memory",
+        arguments={"topic": "interests or hobbies"},
+        success=True,
+        content="No memories found related to 'interests or hobbies'.",
+    )
+
+    assert first is None
+    assert second is not None
+    assert second["type"] == "logical_stall_alert"
+    assert second["tool_name"] == "query_memory"
+    assert second["command"] == "interests or hobbies"
