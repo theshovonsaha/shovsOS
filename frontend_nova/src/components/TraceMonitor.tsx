@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  buildMonitorOverview as buildNovaMonitorOverview,
-  buildTimelineEntries as buildNovaTimelineEntries,
-  describeTraceEvent as describeNovaTraceEvent,
-  humanizeTraceEvent as humanizeNovaTraceEvent,
-  parsePacketSections as parseNovaPacketSections,
+  buildMonitorOverview as buildShovsMonitorOverview,
+  buildTimelineEntries as buildShovsTimelineEntries,
+  describeTraceEvent as describeShovsTraceEvent,
+  humanizeTraceEvent as humanizeShovsTraceEvent,
+  parsePacketSections as parseShovsPacketSections,
 } from '../monitor/presentation';
 import { getOwnerId } from '../owner';
 import { OperatorInterventions } from './OperatorInterventions';
@@ -244,21 +244,21 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   onDenyConfirmation,
   onStopExecution,
 }) => {
-  const [focusMode, setFocusMode] = useState<'story' | 'passes' | 'inspect'>(() => {
-    const stored = localStorage.getItem(TRACE_FOCUS_KEY);
-    if (stored === 'inspect' || stored === 'passes') return stored;
-    return 'story';
-  });
+  const [focusMode, setFocusMode] = useState<'story' | 'passes' | 'inspect'>(
+    () => {
+      const stored = localStorage.getItem(TRACE_FOCUS_KEY);
+      if (stored === 'inspect' || stored === 'passes') return stored;
+      return 'story';
+    },
+  );
   const [scope, setScope] = useState<'session' | 'all'>(() => {
     const stored = localStorage.getItem(VIEW_SCOPE_KEY);
     return stored === 'all' ? 'all' : 'session';
   });
-  const [eventType, setEventType] = useState<string>(
-    () => {
-      const stored = localStorage.getItem(EVENT_FILTER_KEY) || 'all';
-      return stored === 'story' ? 'all' : stored;
-    },
-  );
+  const [eventType, setEventType] = useState<string>(() => {
+    const stored = localStorage.getItem(EVENT_FILTER_KEY) || 'all';
+    return stored === 'story' ? 'all' : stored;
+  });
   const [autoRefresh, setAutoRefresh] = useState<boolean>(
     () => localStorage.getItem(AUTO_REFRESH_KEY) !== 'false',
   );
@@ -301,7 +301,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         event.session_id,
         event.agent_id,
         event.preview || '',
-        describeNovaTraceEvent(event),
+        describeShovsTraceEvent(event),
       ]
         .join(' ')
         .toLowerCase();
@@ -312,7 +312,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   const oldestTs = events.length ? events[events.length - 1].ts : undefined;
   const overview = useMemo(
     () =>
-      buildNovaMonitorOverview({
+      buildShovsMonitorOverview({
         events,
         runReplay,
         pendingConfirmation,
@@ -320,7 +320,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     [events, pendingConfirmation, runReplay],
   );
   const recentTimelineEntries = useMemo(
-    () => buildNovaTimelineEntries(events, 6),
+    () => buildShovsTimelineEntries(events, 6),
     [events],
   );
   const recentReplayPasses = useMemo(
@@ -379,8 +379,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
       params.set('limit', String(TRACE_PAGE_SIZE));
       params.set('owner_id', getOwnerId());
       if (scopedSessionId) params.set('session_id', scopedSessionId);
-      if (eventType && eventType !== 'all')
-        params.set('event_type', eventType);
+      if (eventType && eventType !== 'all') params.set('event_type', eventType);
       if (opts?.beforeTs) params.set('before_ts', String(opts.beforeTs));
 
       const res = await fetch(`/api/logs/traces/recent?${params.toString()}`);
@@ -574,7 +573,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     return JSON.stringify(selectedEvent.data ?? {}, null, 2);
   }, [selectedEvent]);
   const selectedSummary = useMemo(
-    () => (selectedEvent ? describeNovaTraceEvent(selectedEvent) : ''),
+    () => (selectedEvent ? describeShovsTraceEvent(selectedEvent) : ''),
     [selectedEvent],
   );
   const selectedPacketSections = useMemo(() => {
@@ -589,10 +588,11 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
       selectedEvent.data && typeof selectedEvent.data === 'object'
         ? (selectedEvent.data as Record<string, unknown>)
         : null;
-    return parseNovaPacketSections(String(data?.content || ''));
+    return parseShovsPacketSections(String(data?.content || ''));
   }, [selectedEvent]);
   const selectedIncludedItems = useMemo(() => {
-    if (!selectedEvent?.data || typeof selectedEvent.data !== 'object') return [];
+    if (!selectedEvent?.data || typeof selectedEvent.data !== 'object')
+      return [];
     const included = (selectedEvent.data as Record<string, unknown>).included;
     if (!Array.isArray(included)) return [];
     return included.filter(
@@ -657,7 +657,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             >
               {eventTypeOptions.map((type) => (
                 <option key={type} value={type}>
-                  {humanizeNovaTraceEvent(type)}
+                  {humanizeShovsTraceEvent(type)}
                 </option>
               ))}
             </select>
@@ -713,11 +713,15 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         </div>
         <div className='trace-stat-card'>
           <span className='k'>run tokens</span>
-          <span className='v'>{formatTokens(runReplay?.summary?.total_tokens ?? 0)}</span>
+          <span className='v'>
+            {formatTokens(runReplay?.summary?.total_tokens ?? 0)}
+          </span>
         </div>
         <div className='trace-stat-card'>
           <span className='k'>run cost</span>
-          <span className='v'>{formatCurrency(runReplay?.summary?.estimated_cost_usd ?? 0)}</span>
+          <span className='v'>
+            {formatCurrency(runReplay?.summary?.estimated_cost_usd ?? 0)}
+          </span>
         </div>
       </div>
 
@@ -733,8 +737,13 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             </div>
             <div className='trace-overview-grid primary'>
               {overview.primary.map((card) => (
-                <div key={card.id} className={`trace-overview-card tone-${card.tone}`}>
-                  <div className='trace-overview-eyebrow'>{card.eyebrow || card.title}</div>
+                <div
+                  key={card.id}
+                  className={`trace-overview-card tone-${card.tone}`}
+                >
+                  <div className='trace-overview-eyebrow'>
+                    {card.eyebrow || card.title}
+                  </div>
                   <div className='trace-overview-title'>{card.title}</div>
                   <div className='trace-overview-summary'>{card.summary}</div>
                   {card.detail ? (
@@ -746,8 +755,13 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             {overview.secondary.length > 0 ? (
               <div className='trace-overview-grid secondary'>
                 {overview.secondary.map((card) => (
-                  <div key={card.id} className={`trace-overview-card tone-${card.tone}`}>
-                    <div className='trace-overview-eyebrow'>{card.eyebrow || card.title}</div>
+                  <div
+                    key={card.id}
+                    className={`trace-overview-card tone-${card.tone}`}
+                  >
+                    <div className='trace-overview-eyebrow'>
+                      {card.eyebrow || card.title}
+                    </div>
                     <div className='trace-overview-title'>{card.title}</div>
                     <div className='trace-overview-summary'>{card.summary}</div>
                   </div>
@@ -769,15 +783,21 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
               ) : (
                 runStoryCards.map((card) => (
                   <div key={card.id} className='trace-replay-panel'>
-                    <div className='trace-replay-panel-title'>{card.eyebrow}</div>
+                    <div className='trace-replay-panel-title'>
+                      {card.eyebrow}
+                    </div>
                     <div className='trace-replay-panel-list'>
                       <div className='trace-replay-card tone-neutral'>
                         <div className='trace-replay-card-top'>
                           <span>{card.title}</span>
                         </div>
-                        <div className='trace-replay-card-summary'>{card.summary}</div>
+                        <div className='trace-replay-card-summary'>
+                          {card.summary}
+                        </div>
                         {card.detail ? (
-                          <div className='trace-replay-card-detail'>{card.detail}</div>
+                          <div className='trace-replay-card-detail'>
+                            {card.detail}
+                          </div>
                         ) : null}
                       </div>
                     </div>
@@ -804,17 +824,32 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                       <span>
                         {pass.phase || 'phase'} · {pass.status || '--'}
                       </span>
-                      <span>{formatTime(pass.created_at ? Date.parse(pass.created_at) / 1000 : undefined)}</span>
+                      <span>
+                        {formatTime(
+                          pass.created_at
+                            ? Date.parse(pass.created_at) / 1000
+                            : undefined,
+                        )}
+                      </span>
                     </div>
                     <div className='trace-run-card-copy'>
-                      {(pass.objective || pass.strategy || pass.response_preview || 'No pass summary stored.').trim()}
+                      {(
+                        pass.objective ||
+                        pass.strategy ||
+                        pass.response_preview ||
+                        'No pass summary stored.'
+                      ).trim()}
                     </div>
                     <div className='trace-timeline-meta'>
                       <span>in {formatTokens(pass.input_tokens || 0)}</span>
                       <span>out {formatTokens(pass.output_tokens || 0)}</span>
                       <span>total {formatTokens(pass.total_tokens || 0)}</span>
-                      <span>turn {formatCurrency(pass.estimated_cost_usd || 0)}</span>
-                      <span>run {formatCurrency(pass.cumulative_cost_usd || 0)}</span>
+                      <span>
+                        turn {formatCurrency(pass.estimated_cost_usd || 0)}
+                      </span>
+                      <span>
+                        run {formatCurrency(pass.cumulative_cost_usd || 0)}
+                      </span>
                     </div>
                     {(pass.selected_tools || []).length > 0 ? (
                       <div className='trace-run-card-copy'>
@@ -828,324 +863,344 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
           </section>
         </div>
       ) : (
-      <div className='trace-grid inspect-focus'>
-        <section className='trace-list-pane'>
-          <div className='trace-list-head'>
-            <input
-              className='trace-search'
-              placeholder='search events'
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-            />
-            <span className='trace-count'>{filteredEvents.length}</span>
-          </div>
+        <div className='trace-grid inspect-focus'>
+          <section className='trace-list-pane'>
+            <div className='trace-list-head'>
+              <input
+                className='trace-search'
+                placeholder='search events'
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+              />
+              <span className='trace-count'>{filteredEvents.length}</span>
+            </div>
 
-          <div className='trace-list'>
-            {filteredEvents.length === 0 ? (
-              <div className='trace-empty'>No trace events for this filter.</div>
-            ) : (
-              filteredEvents.map((event) => (
-                <button
-                  key={event.id}
-                  className={`trace-row ${selectedId === event.id ? 'active' : ''}`}
-                  onClick={() => setSelectedId(event.id)}
-                >
-                  <div className='trace-row-top'>
-                    <span className='t-type'>
-                      {humanizeNovaTraceEvent(event.event_type)}
-                    </span>
-                    <span className='t-time'>{formatTime(event.ts)}</span>
+            <div className='trace-list'>
+              {filteredEvents.length === 0 ? (
+                <div className='trace-empty'>
+                  No trace events for this filter.
+                </div>
+              ) : (
+                filteredEvents.map((event) => (
+                  <button
+                    key={event.id}
+                    className={`trace-row ${selectedId === event.id ? 'active' : ''}`}
+                    onClick={() => setSelectedId(event.id)}
+                  >
+                    <div className='trace-row-top'>
+                      <span className='t-type'>
+                        {humanizeShovsTraceEvent(event.event_type)}
+                      </span>
+                      <span className='t-time'>{formatTime(event.ts)}</span>
+                    </div>
+                    <div className='trace-row-meta'>
+                      <span>
+                        pass{' '}
+                        {typeof event.pass_index === 'number'
+                          ? event.pass_index
+                          : '--'}
+                      </span>
+                      <span>{formatBytes(event.size_bytes || 0)}</span>
+                      <span>{event.payload_ref ? 'blob' : 'inline'}</span>
+                    </div>
+                    <div className='trace-row-preview'>
+                      {describeShovsTraceEvent(event)}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+
+            <div className='trace-list-foot'>
+              <button
+                className='trace-action'
+                onClick={loadOlder}
+                disabled={!oldestTs || loadingOlder}
+              >
+                {loadingOlder ? 'loading...' : 'load older'}
+              </button>
+            </div>
+          </section>
+
+          <section className='trace-detail-pane'>
+            {!selectedEvent && !loadingDetail && (
+              <div className='trace-empty'>
+                Select an event to inspect details.
+              </div>
+            )}
+
+            {loadingDetail && (
+              <div className='trace-empty'>Loading event...</div>
+            )}
+
+            {selectedEvent && (
+              <>
+                <div className='trace-detail-head'>
+                  <div className='trace-detail-title'>
+                    {humanizeShovsTraceEvent(selectedEvent.event_type)}
                   </div>
-                  <div className='trace-row-meta'>
+                  <div className='trace-detail-meta'>
+                    <span>session: {selectedEvent.session_id}</span>
+                    <span>run: {selectedEvent.run_id || '--'}</span>
+                    <span>agent: {selectedEvent.agent_id}</span>
                     <span>
-                      pass{' '}
-                      {typeof event.pass_index === 'number'
-                        ? event.pass_index
+                      pass:{' '}
+                      {typeof selectedEvent.pass_index === 'number'
+                        ? selectedEvent.pass_index
                         : '--'}
                     </span>
-                    <span>{formatBytes(event.size_bytes || 0)}</span>
-                    <span>{event.payload_ref ? 'blob' : 'inline'}</span>
+                    <span>time: {formatTime(selectedEvent.ts)}</span>
                   </div>
-                  <div className='trace-row-preview'>
-                    {describeNovaTraceEvent(event)}
-                  </div>
-                </button>
-              ))
-            )}
-          </div>
-
-          <div className='trace-list-foot'>
-            <button
-              className='trace-action'
-              onClick={loadOlder}
-              disabled={!oldestTs || loadingOlder}
-            >
-              {loadingOlder ? 'loading...' : 'load older'}
-            </button>
-          </div>
-        </section>
-
-        <section className='trace-detail-pane'>
-          {!selectedEvent && !loadingDetail && (
-            <div className='trace-empty'>
-              Select an event to inspect details.
-            </div>
-          )}
-
-          {loadingDetail && <div className='trace-empty'>Loading event...</div>}
-
-          {selectedEvent && (
-            <>
-              <div className='trace-detail-head'>
-                <div className='trace-detail-title'>
-                  {humanizeNovaTraceEvent(selectedEvent.event_type)}
                 </div>
-                <div className='trace-detail-meta'>
-                  <span>session: {selectedEvent.session_id}</span>
-                  <span>run: {selectedEvent.run_id || '--'}</span>
-                  <span>agent: {selectedEvent.agent_id}</span>
-                  <span>
-                    pass:{' '}
-                    {typeof selectedEvent.pass_index === 'number'
-                      ? selectedEvent.pass_index
-                      : '--'}
-                  </span>
-                  <span>time: {formatTime(selectedEvent.ts)}</span>
+
+                <div className='trace-json-wrap'>
+                  <div className='trace-json-head'>Readable Summary</div>
+                  <pre className='trace-json'>{selectedSummary}</pre>
                 </div>
-              </div>
 
-              <div className='trace-json-wrap'>
-                <div className='trace-json-head'>Readable Summary</div>
-                <pre className='trace-json'>{selectedSummary}</pre>
-              </div>
-
-              {selectedPacketSections.length > 0 && (
-                <div className='trace-packet-wrap'>
-                  <div className='trace-json-head'>Compiled Packet</div>
-                  {selectedIncludedItems.length > 0 && (
-                    <div className='trace-packet-badges'>
-                      {selectedIncludedItems.map((item) => (
-                        <span
-                          key={`${String(item.item_id || item.title || 'item')}-${String(item.trace_id || '')}`}
-                          className='trace-packet-badge'
+                {selectedPacketSections.length > 0 && (
+                  <div className='trace-packet-wrap'>
+                    <div className='trace-json-head'>Compiled Packet</div>
+                    {selectedIncludedItems.length > 0 && (
+                      <div className='trace-packet-badges'>
+                        {selectedIncludedItems.map((item) => (
+                          <span
+                            key={`${String(item.item_id || item.title || 'item')}-${String(item.trace_id || '')}`}
+                            className='trace-packet-badge'
+                          >
+                            {String(item.kind || 'item')} ·{' '}
+                            {String(item.title || item.item_id || 'section')}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                    <div className='trace-packet-list'>
+                      {selectedPacketSections.map((section, index) => (
+                        <div
+                          key={`${section.title}-${index}`}
+                          className='trace-packet-card'
                         >
-                          {String(item.kind || 'item')} ·{' '}
-                          {String(item.title || item.item_id || 'section')}
-                        </span>
+                          <div className='trace-packet-title'>
+                            {section.title}
+                          </div>
+                          <pre className='trace-packet-copy'>
+                            {section.body}
+                          </pre>
+                        </div>
                       ))}
                     </div>
-                  )}
-                  <div className='trace-packet-list'>
-                    {selectedPacketSections.map((section, index) => (
-                      <div
-                        key={`${section.title}-${index}`}
-                        className='trace-packet-card'
-                      >
-                        <div className='trace-packet-title'>{section.title}</div>
-                        <pre className='trace-packet-copy'>{section.body}</pre>
-                      </div>
-                    ))}
                   </div>
-                </div>
-              )}
+                )}
 
-              {(loadingRunReplay || runReplay) && (
-                <div className='trace-run-wrap'>
-                  <div className='trace-json-head'>Run Replay</div>
-                  {loadingRunReplay && !runReplay ? (
-                    <div className='trace-empty'>Loading run replay...</div>
-                  ) : (
-                    <>
-                      <div className='trace-run-head'>
-                        <div className='trace-run-stats'>
-                          <span className='trace-run-stat'>
-                            status: {runReplay?.run?.status || '--'}
-                          </span>
-                          <span className='trace-run-stat'>
-                            checkpoints: {runReplay?.summary?.checkpoint_count ?? 0}
-                          </span>
-                          <span className='trace-run-stat'>
-                            passes: {runReplay?.summary?.pass_count ?? 0}
-                          </span>
-                          <span className='trace-run-stat'>
-                            artifacts: {runReplay?.summary?.artifact_count ?? 0}
-                          </span>
-                          <span className='trace-run-stat'>
-                            evidence: {runReplay?.summary?.evidence_count ?? 0}
-                          </span>
-                        </div>
-                        {runReplay?.latest_pass?.objective && (
-                          <div className='trace-run-copy'>
-                            objective: {runReplay.latest_pass.objective}
-                          </div>
-                        )}
-                        {runReplay?.latest_checkpoint?.strategy && (
-                          <div className='trace-run-copy'>
-                            strategy: {runReplay.latest_checkpoint.strategy}
-                          </div>
-                        )}
-                      </div>
-
-                      {(runReplay?.latest_checkpoint?.notes ||
-                        (runReplay?.latest_pass?.selected_tools || []).length >
-                          0) && (
+                {(loadingRunReplay || runReplay) && (
+                  <div className='trace-run-wrap'>
+                    <div className='trace-json-head'>Run Replay</div>
+                    {loadingRunReplay && !runReplay ? (
+                      <div className='trace-empty'>Loading run replay...</div>
+                    ) : (
+                      <>
                         <div className='trace-run-head'>
-                          {runReplay?.latest_checkpoint?.notes && (
+                          <div className='trace-run-stats'>
+                            <span className='trace-run-stat'>
+                              status: {runReplay?.run?.status || '--'}
+                            </span>
+                            <span className='trace-run-stat'>
+                              checkpoints:{' '}
+                              {runReplay?.summary?.checkpoint_count ?? 0}
+                            </span>
+                            <span className='trace-run-stat'>
+                              passes: {runReplay?.summary?.pass_count ?? 0}
+                            </span>
+                            <span className='trace-run-stat'>
+                              artifacts:{' '}
+                              {runReplay?.summary?.artifact_count ?? 0}
+                            </span>
+                            <span className='trace-run-stat'>
+                              evidence:{' '}
+                              {runReplay?.summary?.evidence_count ?? 0}
+                            </span>
+                          </div>
+                          {runReplay?.latest_pass?.objective && (
                             <div className='trace-run-copy'>
-                              notes: {runReplay.latest_checkpoint.notes}
+                              objective: {runReplay.latest_pass.objective}
                             </div>
                           )}
-                          {(runReplay?.latest_pass?.selected_tools || []).length >
-                            0 && (
+                          {runReplay?.latest_checkpoint?.strategy && (
                             <div className='trace-run-copy'>
-                              selected tools:{' '}
-                              {runReplay?.latest_pass?.selected_tools?.join(
-                                ', ',
-                              )}
+                              strategy: {runReplay.latest_checkpoint.strategy}
                             </div>
                           )}
                         </div>
-                      )}
 
-                      {recentReplayCheckpoints.length > 0 && (
-                        <div className='trace-run-list'>
-                          {recentReplayCheckpoints.map((checkpoint) => (
-                            <div
-                              key={`checkpoint-${checkpoint.checkpoint_id}`}
-                              className='trace-run-card'
-                            >
-                              <div className='trace-run-card-head'>
-                                <span>
-                                  {checkpoint.phase || 'phase'} · status{' '}
-                                  {checkpoint.status || '--'}
-                                </span>
-                                <span>
-                                  turn{' '}
-                                  {typeof checkpoint.tool_turn === 'number'
-                                    ? checkpoint.tool_turn
-                                    : '--'}
-                                </span>
+                        {(runReplay?.latest_checkpoint?.notes ||
+                          (runReplay?.latest_pass?.selected_tools || [])
+                            .length > 0) && (
+                          <div className='trace-run-head'>
+                            {runReplay?.latest_checkpoint?.notes && (
+                              <div className='trace-run-copy'>
+                                notes: {runReplay.latest_checkpoint.notes}
                               </div>
-                              <div className='trace-run-card-copy'>
-                                {(
-                                  checkpoint.strategy ||
-                                  checkpoint.notes ||
-                                  'No checkpoint notes stored.'
-                                ).trim()}
+                            )}
+                            {(runReplay?.latest_pass?.selected_tools || [])
+                              .length > 0 && (
+                              <div className='trace-run-copy'>
+                                selected tools:{' '}
+                                {runReplay?.latest_pass?.selected_tools?.join(
+                                  ', ',
+                                )}
                               </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
+                            )}
+                          </div>
+                        )}
 
-                      {recentReplayPasses.length > 0 && (
-                        <div className='trace-run-list'>
-                          {recentReplayPasses.map((pass) => (
-                            <div
-                              key={`pass-${pass.pass_id}`}
-                              className='trace-run-card'
-                            >
-                              <div className='trace-run-card-head'>
-                                <span>
-                                  {pass.phase || 'phase'} · {pass.status || '--'}
-                                </span>
-                                <span>pass {pass.pass_id}</span>
+                        {recentReplayCheckpoints.length > 0 && (
+                          <div className='trace-run-list'>
+                            {recentReplayCheckpoints.map((checkpoint) => (
+                              <div
+                                key={`checkpoint-${checkpoint.checkpoint_id}`}
+                                className='trace-run-card'
+                              >
+                                <div className='trace-run-card-head'>
+                                  <span>
+                                    {checkpoint.phase || 'phase'} · status{' '}
+                                    {checkpoint.status || '--'}
+                                  </span>
+                                  <span>
+                                    turn{' '}
+                                    {typeof checkpoint.tool_turn === 'number'
+                                      ? checkpoint.tool_turn
+                                      : '--'}
+                                  </span>
+                                </div>
+                                <div className='trace-run-card-copy'>
+                                  {(
+                                    checkpoint.strategy ||
+                                    checkpoint.notes ||
+                                    'No checkpoint notes stored.'
+                                  ).trim()}
+                                </div>
                               </div>
-                              <div className='trace-run-card-copy'>
-                                {(
-                                  pass.objective ||
-                                  pass.strategy ||
-                                  pass.response_preview ||
-                                  'No pass summary stored.'
-                                ).trim()}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
+                            ))}
+                          </div>
+                        )}
 
-                      {(runReplay?.evidence?.length || 0) > 0 && (
-                        <div className='trace-run-list'>
-                          {runReplay!.evidence!.slice(0, 3).map((item, index) => (
-                            <div
-                              key={`${item.trace_id || item.item_id}-${index}`}
-                              className='trace-run-card'
-                            >
-                              <div className='trace-run-card-head'>
-                                <span>{item.phase || 'phase'}</span>
-                                <span>
-                                  {item.source}
-                                  {typeof item.tool_turn === 'number'
-                                    ? ` · turn ${item.tool_turn}`
-                                    : ''}
-                                </span>
+                        {recentReplayPasses.length > 0 && (
+                          <div className='trace-run-list'>
+                            {recentReplayPasses.map((pass) => (
+                              <div
+                                key={`pass-${pass.pass_id}`}
+                                className='trace-run-card'
+                              >
+                                <div className='trace-run-card-head'>
+                                  <span>
+                                    {pass.phase || 'phase'} ·{' '}
+                                    {pass.status || '--'}
+                                  </span>
+                                  <span>pass {pass.pass_id}</span>
+                                </div>
+                                <div className='trace-run-card-copy'>
+                                  {(
+                                    pass.objective ||
+                                    pass.strategy ||
+                                    pass.response_preview ||
+                                    'No pass summary stored.'
+                                  ).trim()}
+                                </div>
                               </div>
-                              <div className='trace-run-card-copy'>
-                                {item.summary || 'No evidence summary.'}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
+                            ))}
+                          </div>
+                        )}
 
-                      {(runReplay?.artifacts?.length || 0) > 0 && (
-                        <div className='trace-run-list'>
-                          {runReplay!.artifacts!.slice(0, 4).map((artifact) => (
-                            <div
-                              key={artifact.artifact_id}
-                              className='trace-run-card'
-                            >
-                              <div className='trace-run-card-head'>
-                                <span>{artifact.label}</span>
-                                <span>
-                                  {artifact.artifact_type}
-                                  {artifact.tool_name
-                                    ? ` · ${artifact.tool_name}`
-                                    : ''}
-                                </span>
-                              </div>
-                              <div className='trace-run-card-copy'>
-                                {(artifact.preview || '').trim() || 'No preview stored.'}
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </>
-                  )}
+                        {(runReplay?.evidence?.length || 0) > 0 && (
+                          <div className='trace-run-list'>
+                            {runReplay!
+                              .evidence!.slice(0, 3)
+                              .map((item, index) => (
+                                <div
+                                  key={`${item.trace_id || item.item_id}-${index}`}
+                                  className='trace-run-card'
+                                >
+                                  <div className='trace-run-card-head'>
+                                    <span>{item.phase || 'phase'}</span>
+                                    <span>
+                                      {item.source}
+                                      {typeof item.tool_turn === 'number'
+                                        ? ` · turn ${item.tool_turn}`
+                                        : ''}
+                                    </span>
+                                  </div>
+                                  <div className='trace-run-card-copy'>
+                                    {item.summary || 'No evidence summary.'}
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
+                        )}
+
+                        {(runReplay?.artifacts?.length || 0) > 0 && (
+                          <div className='trace-run-list'>
+                            {runReplay!
+                              .artifacts!.slice(0, 4)
+                              .map((artifact) => (
+                                <div
+                                  key={artifact.artifact_id}
+                                  className='trace-run-card'
+                                >
+                                  <div className='trace-run-card-head'>
+                                    <span>{artifact.label}</span>
+                                    <span>
+                                      {artifact.artifact_type}
+                                      {artifact.tool_name
+                                        ? ` · ${artifact.tool_name}`
+                                        : ''}
+                                    </span>
+                                  </div>
+                                  <div className='trace-run-card-copy'>
+                                    {(artifact.preview || '').trim() ||
+                                      'No preview stored.'}
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {promptMessages.length > 0 && (
+                  <div className='prompt-stack'>
+                    {promptMessages.map((msg, index) => {
+                      const role = String(msg.role || 'unknown');
+                      const content = String(msg.content || '');
+                      return (
+                        <details
+                          key={`${role}-${index}`}
+                          className='prompt-item'
+                        >
+                          <summary>
+                            <span className={`prompt-role role-${role}`}>
+                              {role}
+                            </span>
+                            <span className='prompt-size'>
+                              {formatBytes(content.length)}
+                            </span>
+                          </summary>
+                          <pre>{content}</pre>
+                        </details>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className='trace-json-wrap'>
+                  <div className='trace-json-head'>Raw event payload</div>
+                  <pre className='trace-json'>{eventJson}</pre>
                 </div>
-              )}
-
-              {promptMessages.length > 0 && (
-                <div className='prompt-stack'>
-                  {promptMessages.map((msg, index) => {
-                    const role = String(msg.role || 'unknown');
-                    const content = String(msg.content || '');
-                    return (
-                      <details key={`${role}-${index}`} className='prompt-item'>
-                        <summary>
-                          <span className={`prompt-role role-${role}`}>
-                            {role}
-                          </span>
-                          <span className='prompt-size'>
-                            {formatBytes(content.length)}
-                          </span>
-                        </summary>
-                        <pre>{content}</pre>
-                      </details>
-                    );
-                  })}
-                </div>
-              )}
-
-              <div className='trace-json-wrap'>
-                <div className='trace-json-head'>Raw event payload</div>
-                <pre className='trace-json'>{eventJson}</pre>
-              </div>
-            </>
-          )}
-        </section>
-      </div>
+              </>
+            )}
+          </section>
+        </div>
       )}
     </div>
   );

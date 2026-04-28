@@ -124,6 +124,13 @@ MAX_ACTIVE_GOALS = 6
 GOAL_RETIRE_AFTER_TURNS = 5
 GOAL_MIN_ACTIVATION_WEIGHT = 0.2
 
+# Resonance: modules sharing active goals with already-high-ranking modules
+# get a small lift, so the packet emerges as a coherent theme rather than a
+# list of independently-relevant facts. 0.0 = pure convergence; higher = more
+# theme-clustering. 0.15 is "noticeable but does not override convergence."
+DEFAULT_RESONANCE_WEIGHT = 0.15
+RESONANCE_SEED_THRESHOLD = 0.3  # Only confidently-relevant modules seed resonance.
+
 TRIVIAL_PATTERN = re.compile(
     r"^(ok|okay|thanks|thank you|great|sure|yes|no|got it|understood|"
     r"alright|cool|nice|good|perfect|sounds good|makes sense)[\s.!?]*$",
@@ -151,10 +158,14 @@ class ContextEngineV2:
         adapter: BaseLLMAdapter,
         semantic_graph=None,           # Pass your SemanticGraph instance
         compression_model: Optional[str] = None,
+        resonance_weight: float = DEFAULT_RESONANCE_WEIGHT,
+        convergent_top_n: int = TOP_N_BY_CONVERGENCE,
     ):
         self.adapter           = adapter
         self.compression_model = compression_model or cfg.DEFAULT_MODEL
         self.graph             = semantic_graph  # Optional — used for cross-session persistence
+        self.resonance_weight  = float(resonance_weight)
+        self.convergent_top_n  = int(convergent_top_n)
 
         # In-memory state (rebuilt from SemanticGraph on restore if needed)
         # module_key → {content, goals: set, hit_count, created_turn}
@@ -315,7 +326,7 @@ class ContextEngineV2:
 
         lines.append(f"Active Goals: {goal_summary}")
 
-        for key, module, score in ranked[:TOP_N_BY_CONVERGENCE]:
+        for key, module, score in ranked[:self.convergent_top_n]:
             content = module["content"]
             if len(content) > 200:
                 content = content[:180] + "..."
@@ -409,8 +420,16 @@ class ContextEngineV2:
         return [goal for goal, _meta in ranked]
 
     def _rank_by_convergence(self) -> list[tuple[str, dict, float]]:
-        """Return modules sorted by active-goal relevance, then durability/recency."""
-        scored = []
+        """Return modules sorted by active-goal relevance, with a resonance lift.
+
+        Two-pass ranking:
+          1. Score each module by convergence (active-goal overlap, weighted by recency).
+          2. Walk the convergence-sorted list and lift modules whose goal set overlaps
+             with already-seeded high-confidence modules' goal sets. This produces a
+             coherent theme in the injected packet instead of a list of independently
+             ranked facts.
+        """
+        scored: list[tuple[str, dict, float, float]] = []
         for key, mod in self._modules.items():
             score = self._convergence_score(key)
             shared_weight = sum(
@@ -419,6 +438,7 @@ class ContextEngineV2:
                 if goal in self._active_goals
             )
             scored.append((key, mod, score, shared_weight))
+
         scored.sort(
             key=lambda x: (
                 x[2],
@@ -429,7 +449,35 @@ class ContextEngineV2:
             ),
             reverse=True,
         )
-        return [(key, mod, score) for key, mod, score, _shared_weight in scored]
+
+        if self.resonance_weight <= 0 or not scored:
+            return [(key, mod, score) for key, mod, score, _ in scored]
+
+        # Resonance pass: seed from confidently-relevant modules; lift their
+        # goal-sharing neighbors so coherent themes cluster at the top.
+        seed_goals: set[str] = set()
+        with_resonance: list[tuple[str, dict, float]] = []
+        for key, mod, score, _shared in scored:
+            module_goals = mod.get("goals", set()) or set()
+            overlap_count = len(module_goals & seed_goals)
+            denom = max(len(seed_goals), 1)
+            resonance_bonus = (overlap_count / denom) * self.resonance_weight
+            with_resonance.append((key, mod, score + resonance_bonus))
+            if score >= RESONANCE_SEED_THRESHOLD:
+                seed_goals.update(module_goals)
+
+        # Stable resort by lifted score, preserving original tiebreakers via
+        # a secondary sort that mirrors the first pass.
+        with_resonance.sort(
+            key=lambda x: (
+                x[2],
+                1 if x[1].get("protected") else 0,
+                x[1]["hit_count"],
+                x[1].get("last_seen_turn", x[1].get("created_turn", 0)),
+            ),
+            reverse=True,
+        )
+        return with_resonance
 
     def _touch_goals(self, goals: list[str]) -> None:
         for goal in goals:

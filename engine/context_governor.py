@@ -33,10 +33,16 @@ class GovernedMemorySurface:
 
 class ContextGovernor:
     """
-    Shared context-engine resolver for managed and compatibility runtimes.
+    Unified context-engine façade.
 
-    This keeps V1/V2/V3 as policy modes behind one authority surface instead
-    of letting each runtime own a separate engine-selection implementation.
+    The platform exposes ONE context engine: the unified V3 (linear + compression
+    + convergent ranking + resonance). The v1/v2/v3 mode argument is preserved
+    on the resolve() signature for back-compat, but every request now returns the
+    same unified engine — V3 transparently migrates v1/v2 session blobs on first
+    compress.
+
+    The legacy v1 and v2 engine instances remain instantiable so existing tests
+    and any direct callers keep working, but the runtime path always lands on V3.
     """
 
     def __init__(
@@ -70,44 +76,34 @@ class ContextGovernor:
 
     def resolve(
         self,
-        mode: Optional[str],
+        mode: Optional[str] = None,  # Preserved for back-compat; ignored.
         *,
         compression_model: Optional[str] = None,
-        ):
-        normalized = str(mode or "v1").strip().lower()
-        if normalized not in {"v1", "v2", "v3"}:
-            normalized = "v1"
+    ):
+        """Return the unified engine.
 
+        The `mode` argument is accepted but no longer routes — every request
+        lands on V3, which auto-migrates v1/v2 session blobs on first compress.
+        Callers that want v1/v2 directly (tests, debugging) should instantiate
+        ContextEngine / ContextEngineV2 themselves.
+        """
+        # Keep v1 instantiated so any direct legacy callers still find it.
         self._ensure_v1_engine(compression_model)
 
-        if normalized == "v2":
-            if self._v2_engine is None:
-                from engine.context_engine_v2 import ContextEngineV2
+        if self._v3_engine is None:
+            from engine.context_engine_v3 import ContextEngineV3
 
-                self._v2_engine = ContextEngineV2(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=compression_model or "llama3.2",
-                )
-            engine = self._v2_engine
-        elif normalized == "v3":
-            if self._v3_engine is None:
-                from engine.context_engine_v3 import ContextEngineV3
+            self._v3_engine = ContextEngineV3(
+                adapter=self.adapter,
+                semantic_graph=self.graph,
+                compression_model=compression_model or "llama3.2",
+            )
+        engine = self._v3_engine
 
-                self._v3_engine = ContextEngineV3(
-                    adapter=self.adapter,
-                    semantic_graph=self.graph,
-                    compression_model=compression_model or "llama3.2",
-                )
-            engine = self._v3_engine
-        else:
-            engine = self._v1_engine
-
-        if engine is not None:
-            if hasattr(engine, "set_adapter"):
-                engine.set_adapter(self.adapter)
-            if compression_model and hasattr(engine, "compression_model"):
-                engine.compression_model = compression_model
+        if hasattr(engine, "set_adapter"):
+            engine.set_adapter(self.adapter)
+        if compression_model and hasattr(engine, "compression_model"):
+            engine.compression_model = compression_model
         return engine
 
     def mode_for_engine(self, engine: Optional[object]) -> str:
@@ -452,6 +448,7 @@ class ContextGovernor:
         assistant_response: str,
         plan: MemoryCommitPlan,
         current_context: str,
+        planned_locus_id: str = "",
     ) -> MemoryCommitOutcome:
         return await apply_governed_memory_commit(
             sessions=sessions,
@@ -465,6 +462,7 @@ class ContextGovernor:
             graph=self.graph,
             plan=plan,
             current_context=current_context,
+            planned_locus_id=planned_locus_id,
         )
 
     def _build_historical_context(

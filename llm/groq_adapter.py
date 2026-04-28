@@ -2,14 +2,20 @@
 Groq LLM Adapter
 -----------------
 Fast inference via Groq cloud API.
-Uses the Groq Python SDK for chat completions (NOT compound-beta — 
-that's used for web search in tools_web.py, not as a general LLM).
+Uses the Groq Python SDK (OpenAI-compatible chat completions).
 
-Requires: pip install groq  (already in requirements.txt)
+Requires: pip install groq
 Env vars: GROQ_API_KEY
+
+API notes:
+  - Streaming tool_calls arrive as fragmented deltas indexed by `tc.index` —
+    accumulate by index, emit once on `finish_reason == "tool_calls"`.
+  - DeepSeek-R1 distill models stream `<think>...</think>` reasoning inline;
+    we route those into a <THOUGHT> segment without losing surrounding content.
 """
 
 import asyncio
+import json
 import os
 from typing import AsyncIterator, Optional
 
@@ -49,8 +55,6 @@ class GroqLLMAdapter(BaseLLMAdapter):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        else:
-            kwargs["tool_choice"] = "none"
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
 
@@ -59,10 +63,7 @@ class GroqLLMAdapter(BaseLLMAdapter):
             try:
                 resp = await client.chat.completions.create(**kwargs)
                 msg = resp.choices[0].message
-                # When the model responds with native tool calls,
-                # serialize them so extract_tool_call() can parse downstream.
                 if msg.tool_calls:
-                    import json as _json
                     normalized = []
                     for tc in msg.tool_calls:
                         fn = tc.function
@@ -74,7 +75,7 @@ class GroqLLMAdapter(BaseLLMAdapter):
                             },
                         })
                     if normalized:
-                        return _json.dumps({"tool_calls": normalized})
+                        return json.dumps({"tool_calls": normalized})
                 return msg.content or ""
             except Exception as e:
                 last_err = e
@@ -103,50 +104,83 @@ class GroqLLMAdapter(BaseLLMAdapter):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        else:
-            kwargs["tool_choice"] = "none"
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
+
+        in_thought = False
+        tool_call_acc: dict[int, dict] = {}
+        finish_reason: Optional[str] = None
 
         try:
             stream = await client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 if interrupt_check and callable(interrupt_check) and interrupt_check():
                     break
-                if not chunk.choices: continue
-                delta = chunk.choices[0].delta
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
                 if delta and delta.content:
                     content = delta.content
-                    if "<think>" in content:
-                        yield "<THOUGHT>"
-                        content = content.replace("<think>", "")
-                    if "</think>" in content:
-                        yield content.replace("</think>", "")
-                        yield "</THOUGHT>"
-                        content = ""
-                    if content:
-                        yield content
-                
-                # Handle native tool calls from Groq
+                    # Robust <think>...</think> handling that survives token splits.
+                    while content:
+                        if in_thought:
+                            close_idx = content.find("</think>")
+                            if close_idx == -1:
+                                yield content
+                                content = ""
+                            else:
+                                if close_idx > 0:
+                                    yield content[:close_idx]
+                                yield "</THOUGHT>"
+                                in_thought = False
+                                content = content[close_idx + len("</think>"):]
+                        else:
+                            open_idx = content.find("<think>")
+                            if open_idx == -1:
+                                yield content
+                                content = ""
+                            else:
+                                if open_idx > 0:
+                                    yield content[:open_idx]
+                                yield "<THOUGHT>"
+                                in_thought = True
+                                content = content[open_idx + len("<think>"):]
+
                 if delta and delta.tool_calls:
-                    import json
-                    yield json.dumps({"tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        } for tc in delta.tool_calls
-                    ]})
+                    for tc in delta.tool_calls:
+                        idx = tc.index if tc.index is not None else 0
+                        slot = tool_call_acc.setdefault(
+                            idx, {"id": None, "name": "", "arguments": ""}
+                        )
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            slot["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            slot["arguments"] += tc.function.arguments
+
+            if tool_call_acc and finish_reason == "tool_calls":
+                normalized = []
+                for idx in sorted(tool_call_acc):
+                    slot = tool_call_acc[idx]
+                    normalized.append({
+                        "id": slot["id"],
+                        "type": "function",
+                        "function": {
+                            "name": slot["name"],
+                            "arguments": slot["arguments"] or "{}",
+                        },
+                    })
+                yield json.dumps({"tool_calls": normalized})
         except Exception as e:
             raise self._wrap_error(e) from e
 
     def _wrap_error(self, e: Exception) -> LLMError:
-        """Helper to map Groq/OpenAI errors to our internal exceptions."""
         err_str = str(e).lower()
-        # Groq SDK uses its own exception types, but we can check the message/class
         if "rate_limit" in err_str or "429" in err_str:
             return RateLimitError(f"Groq Rate Limit: {e}")
         if "500" in err_str or "503" in err_str or "service_unavailable" in err_str:
@@ -159,16 +193,21 @@ class GroqLLMAdapter(BaseLLMAdapter):
         try:
             client = self._get_client()
             models = await client.models.list()
-            # Filter and sort to prioritize production models
             ids = [m.id for m in models.data]
-            return ids if ids else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"]
+            return ids if ids else self._default_models()
         except Exception:
-            return [
-                "llama-3.3-70b-versatile", 
-                "llama-3.1-8b-instant", 
-                "mixtral-8x7b-32768", 
-                "groq/compound-mini"
-            ]
+            return self._default_models()
+
+    @staticmethod
+    def _default_models() -> list[str]:
+        return [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "deepseek-r1-distill-llama-70b",
+            "qwen-2.5-32b",
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+        ]
 
     async def health(self) -> bool:
         if not self.api_key:

@@ -414,14 +414,22 @@ async def _bash(command: str, timeout: int = BASH_TIMEOUT, workdir: Optional[str
     """
     # STRICT SAFETY: Block dangerous commands before they hit Docker
     if _BLOCKED_COMMANDS.search(command):
+        # Even on a denial, surface verification so the planner sees
+        # missing write targets and cannot claim success on the next turn.
+        denied_verification = _verify_expected_paths(_extract_write_targets(command, workdir=workdir))
+        denied_hard_failure = bool(denied_verification.get("missing_paths"))
         return json.dumps(
             {
                 "type": "bash_result",
                 "success": False,
-                "status": "DENIED",
-                "message": "Bash command blocked for safety (contains destructive patterns).",
+                "status": "HARD_FAILURE" if denied_hard_failure else "DENIED",
+                "message": (
+                    "Bash command blocked for safety; expected write targets are missing."
+                    if denied_hard_failure
+                    else "Bash command blocked for safety (contains destructive patterns)."
+                ),
                 "command": command,
-                "verification": _verification_payload(mode="not_applicable"),
+                "verification": denied_verification,
                 "output": "[denied] Bash command blocked for safety (contains destructive patterns).",
             }
         )
@@ -1236,6 +1244,54 @@ UPDATE_MEMORY_TOOL = Tool(
     tags=["memory", "core"]
 )
 
+# Meta-recall queries ("what do you remember", "list everything", "*") cannot be
+# answered by similarity search because they don't *describe* a topic — they ask
+# for a state dump. Embedding "tell me everything you remember" pulls nothing
+# because no stored fact is semantically close to that meta-question. Detect
+# these and short-circuit to a deterministic dump of current facts and loci.
+_META_RECALL_PATTERN = re.compile(
+    r"\b(?:everything|all (?:facts?|memor\w*|things|stuff)|"
+    r"what do you (?:remember|know)|"
+    r"tell me (?:about )?(?:me|yourself|everything|what you know|all)|"
+    r"list (?:all )?(?:memor\w*|facts?|everything))\b",
+    re.IGNORECASE,
+)
+_META_RECALL_LITERALS = {"*", "all", "everything", "all memory", "all memories"}
+
+
+def _is_meta_recall_query(topic: str) -> bool:
+    if not topic:
+        return False
+    stripped = topic.strip().rstrip("?.! ").lower()
+    if stripped in _META_RECALL_LITERALS:
+        return True
+    return bool(_META_RECALL_PATTERN.search(stripped))
+
+
+def _dump_session_memory(graph, session_id: str, owner_id: Optional[str]) -> str:
+    facts = list(graph.get_current_facts(session_id, owner_id=owner_id) or [])
+    try:
+        loci = list(graph.list_loci(owner_id=owner_id) or [])
+    except Exception:
+        loci = []
+
+    if not facts and not loci:
+        return "No memories stored for this session yet."
+
+    lines = ["Memory dump:"]
+    if facts:
+        lines.append(f"  Current facts ({len(facts)}):")
+        for subject, predicate, object_ in facts:
+            lines.append(f"  - [{subject}] --[{predicate}]--> [{object_}]")
+    if loci:
+        lines.append(f"  Spatial loci ({len(loci)}):")
+        for locus in loci:
+            lid = locus.get("id") or locus.get("locus_id") or "?"
+            name = locus.get("name") or ""
+            lines.append(f"  - {lid}: {name}".rstrip(": "))
+    return "\n".join(lines)
+
+
 async def _query_memory(
     topic: str,
     session_id: Optional[str] = None,
@@ -1247,6 +1303,12 @@ async def _query_memory(
         owner_id = kwargs.get("_owner_id")
         active_session_id = session_id or kwargs.get("_session_id")
         graph = _build_runtime_graph(kwargs)
+
+        # Intent route: meta-recall questions get a deterministic dump instead
+        # of a similarity search that would return nothing useful.
+        if _is_meta_recall_query(topic) and active_session_id:
+            return _dump_session_memory(graph, active_session_id, owner_id)
+
         from memory.retrieval import unified_memory_search
 
         payload = await unified_memory_search(
@@ -1420,6 +1482,34 @@ TODO_UPDATE_TOOL = Tool(
         "required": ["task_id", "status"],
     },
     handler=_todo_update,
+    tags=["tasking", "planning"],
+)
+
+
+async def _todo_read(_session_id: Optional[str] = None, **kwargs) -> str:
+    """Return the current session task list state."""
+    session_id = _session_id or kwargs.get("session_id")
+    if not session_id:
+        return "todo_read failed: missing session context"
+    tracker = get_session_task_tracker()
+    if not tracker.has_tasks(session_id):
+        return "No active task list for this session."
+    return tracker.render(session_id)
+
+
+TODO_READ_TOOL = Tool(
+    name="todo_read",
+    description=(
+        "Read the current session task list. "
+        "Call this to review pending and in-progress tasks before deciding the next step. "
+        "Use after todo_write to check what still needs doing, and before todo_update to confirm the task id."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {},
+        "required": [],
+    },
+    handler=_todo_read,
     tags=["tasking", "planning"],
 )
 
@@ -1802,6 +1892,7 @@ ALL_TOOLS = [
     QUERY_MEMORY_TOOL,
     TODO_WRITE_TOOL,
     TODO_UPDATE_TOOL,
+    TODO_READ_TOOL,
     GENERATE_APP_TOOL,
     PDF_PROCESSOR_TOOL,
     RAG_SEARCH_TOOL,

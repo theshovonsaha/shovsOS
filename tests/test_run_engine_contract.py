@@ -199,6 +199,10 @@ async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
         context_engine=context_engine,
         graph=graph,
     )
+    # The runtime resolves its compression engine through the governor; pin the
+    # mock there so compress_exchange's stubbed return value (including the
+    # blockable "General working_on …" fact) actually drives the assertions.
+    engine._context_governor._v3_engine = context_engine
 
     request = RunEngineRequest(
         session_id="run-engine-1",
@@ -347,7 +351,10 @@ async def test_run_engine_direct_fact_turn_skips_planner_and_tools_when_determin
     assert not any(event["type"] == "tool_call" for event in events)
     orchestrator.plan_with_context.assert_not_awaited()
     orchestrator.observe_with_context.assert_not_awaited()
-    orchestrator.verify_with_context.assert_awaited()
+    # Direct-fact-memory-only routes intentionally skip LLM verification —
+    # the answer is sourced from the deterministic fact graph (pre-grounded),
+    # so there is nothing to ground-check against tool evidence.
+    orchestrator.verify_with_context.assert_not_awaited()
 
     phase_context_events = [event for event in traces.events if event["event_type"] == "phase_context"]
     assert any("deterministic_only" in str(event["data"].get("content", "")) for event in phase_context_events)

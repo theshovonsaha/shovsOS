@@ -224,6 +224,27 @@ class RunStore:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_run_evals_run_id ON run_evals(run_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_run_evals_owner_id ON run_evals(owner_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_run_passes_run_id ON run_passes(run_id)")
+            # Per-(owner, agent, tool) outcome history. Lets the planner avoid
+            # known-bad tool choices instead of relearning them every turn.
+            # Append-only; we read it back as aggregate failure rates over a
+            # lookback window so old failures fade in influence.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tool_outcomes (
+                    outcome_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_id TEXT,
+                    agent_id TEXT,
+                    tool_name TEXT NOT NULL,
+                    success INTEGER NOT NULL,
+                    error_kind TEXT,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tool_outcomes_lookup "
+                "ON tool_outcomes(owner_id, agent_id, tool_name, created_at)"
+            )
             conn.commit()
 
     def start_run(
@@ -292,6 +313,80 @@ class RunStore:
             if row is None:
                 return None
             return RunRecord(**dict(row))
+
+    def record_tool_outcome(
+        self,
+        *,
+        owner_id: Optional[str],
+        agent_id: str,
+        tool_name: str,
+        success: bool,
+        error_kind: str = "",
+    ) -> None:
+        """Append one (owner, agent, tool) outcome row.
+
+        Cheap fire-and-forget write — the planner reads it back as an
+        aggregate failure rate. We don't store full payloads here because
+        they live in ``run_passes`` and ``run_artifacts``; this table is
+        purely a small, indexable signal store.
+        """
+        if not tool_name:
+            return
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO tool_outcomes
+                (owner_id, agent_id, tool_name, success, error_kind, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    owner_id,
+                    str(agent_id or ""),
+                    str(tool_name),
+                    1 if success else 0,
+                    str(error_kind or "")[:80],
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            conn.commit()
+
+    def get_tool_failure_rates(
+        self,
+        *,
+        owner_id: Optional[str],
+        agent_id: str,
+        lookback_days: int = 7,
+        min_attempts: int = 3,
+    ) -> dict[str, float]:
+        """Return ``{tool_name: failure_rate}`` for tools attempted ≥
+        ``min_attempts`` times by this (owner, agent) pair in the lookback
+        window. Tools below the threshold are omitted to suppress noise.
+        """
+        cutoff = (
+            datetime.now(timezone.utc).timestamp() - max(1, int(lookback_days)) * 86400
+        )
+        cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                SELECT tool_name,
+                       COUNT(*) AS attempts,
+                       SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failures
+                FROM tool_outcomes
+                WHERE COALESCE(owner_id, '') = COALESCE(?, '')
+                  AND agent_id = ?
+                  AND created_at >= ?
+                GROUP BY tool_name
+                """,
+                (owner_id, str(agent_id or ""), cutoff_iso),
+            )
+            out: dict[str, float] = {}
+            for row in cursor.fetchall():
+                attempts = int(row["attempts"] or 0)
+                failures = int(row["failures"] or 0)
+                if attempts >= max(1, int(min_attempts)):
+                    out[row["tool_name"]] = failures / attempts
+            return out
 
     def save_checkpoint(
         self,

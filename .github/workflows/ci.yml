@@ -15,8 +15,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: "pip"
+          python-version: '3.10'
+          cache: 'pip'
 
       - name: Install Python dependencies
         run: |
@@ -42,8 +42,8 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
-          cache: "pip"
+          python-version: '3.10'
+          cache: 'pip'
 
       - name: Install Python dependencies
         run: |
@@ -54,7 +54,7 @@ jobs:
       - name: Run full backend tests
         run: pytest -q
 
-  frontend-build-nova:
+  frontend-build-shovs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -63,20 +63,20 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          cache: "npm"
+          node-version: '22'
+          cache: 'npm'
           cache-dependency-path: |
             package-lock.json
-            frontend_nova/package-lock.json
+            frontend_shovs/package-lock.json
 
       - name: Install root deps
         run: npm ci
 
-      - name: Install Nova deps
-        run: npm --prefix frontend_nova ci
+      - name: Install Shovs Platform deps
+        run: npm --prefix frontend_shovs ci
 
-      - name: Build Nova
-        run: npm --prefix frontend_nova run build
+      - name: Build Shovs Platform
+        run: npm --prefix frontend_shovs run build
 
   frontend-build-consumer:
     runs-on: ubuntu-latest
@@ -87,8 +87,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          cache: "npm"
+          node-version: '22'
+          cache: 'npm'
           cache-dependency-path: |
             package-lock.json
             frontend_consumer/package-lock.json

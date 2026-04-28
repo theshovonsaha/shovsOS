@@ -2,19 +2,37 @@
 OpenAI-compatible LLM Adapter
 ------------------------------
 Works with OpenAI, Azure OpenAI, and any OpenAI-compatible API
-(Together, Fireworks, local vLLM, etc.)
+(Together, Fireworks, vLLM, LM Studio, etc.)
 
 Requires: pip install openai
 Env vars: OPENAI_API_KEY, OPENAI_BASE_URL (optional for custom endpoints)
+
+API notes (verified against current OpenAI Chat Completions API):
+  - Reasoning models (o1, o3, o4, gpt-5 family) require `max_completion_tokens`
+    instead of `max_tokens`, and reject `temperature` other than the default.
+  - Streaming tool_calls arrive as fragmented deltas indexed by `tc.index` —
+    arguments must be concatenated character-by-character before the call is
+    well-formed JSON. Yielding each delta as a separate JSON object breaks
+    downstream parsers.
+  - Vision images are attached as `image_url` content parts on the last user turn.
 """
 
 import asyncio
+import json
 import os
+import re
 from typing import AsyncIterator, Optional
 
 from llm.base_adapter import BaseLLMAdapter, LLMError, RateLimitError, ProviderError
 
 RETRY_DELAYS = [0.5, 1.5, 3.0]
+
+# Reasoning models — these reject `temperature` and require `max_completion_tokens`.
+_REASONING_MODEL_RE = re.compile(r"^(?:o1|o3|o4|gpt-5)(?:-|$)", re.IGNORECASE)
+
+
+def _is_reasoning_model(model: str) -> bool:
+    return bool(_REASONING_MODEL_RE.match(model or ""))
 
 
 class OpenAIAdapter(BaseLLMAdapter):
@@ -42,6 +60,42 @@ class OpenAIAdapter(BaseLLMAdapter):
             self._client = AsyncOpenAI(**kwargs)
         return self._client
 
+    def _build_kwargs(
+        self,
+        *,
+        model: str,
+        messages: list[dict],
+        temperature: float,
+        max_tokens: Optional[int],
+        tools: Optional[list[dict]],
+        images: Optional[list[str]],
+        stream: bool = False,
+    ) -> dict:
+        msgs = self._prepare_messages(messages, images)
+        kwargs: dict = {
+            "model": model,
+            "messages": msgs,
+        }
+        if stream:
+            kwargs["stream"] = True
+
+        is_reasoning = _is_reasoning_model(model)
+        if is_reasoning:
+            # Reasoning models only accept the default temperature (1.0).
+            # Token budget uses a different parameter name.
+            if max_tokens:
+                kwargs["max_completion_tokens"] = int(max_tokens)
+        else:
+            kwargs["temperature"] = temperature
+            if max_tokens:
+                kwargs["max_tokens"] = int(max_tokens)
+
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        return kwargs
+
     async def complete(
         self,
         model: str,
@@ -52,27 +106,22 @@ class OpenAIAdapter(BaseLLMAdapter):
         tools: Optional[list[dict]] = None,
     ) -> str:
         client = self._get_client()
-        msgs = self._prepare_messages(messages, images)
-        kwargs = {
-            "model": model,
-            "messages": msgs,
-            "temperature": temperature,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        if max_tokens:
-            kwargs["max_tokens"] = max_tokens
+        kwargs = self._build_kwargs(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            images=images,
+            stream=False,
+        )
 
         last_err: Exception = RuntimeError("no attempts made")
         for i, delay in enumerate(RETRY_DELAYS):
             try:
                 resp = await client.chat.completions.create(**kwargs)
                 msg = resp.choices[0].message
-                # When the model responds with native tool calls,
-                # serialize them so extract_tool_call() can parse downstream.
                 if msg.tool_calls:
-                    import json as _json
                     normalized = []
                     for tc in msg.tool_calls:
                         fn = tc.function
@@ -84,7 +133,7 @@ class OpenAIAdapter(BaseLLMAdapter):
                             },
                         })
                     if normalized:
-                        return _json.dumps({"tool_calls": normalized})
+                        return json.dumps({"tool_calls": normalized})
                 return msg.content or ""
             except Exception as e:
                 last_err = e
@@ -104,47 +153,66 @@ class OpenAIAdapter(BaseLLMAdapter):
         interrupt_check: Optional[object] = None,
     ) -> AsyncIterator[str]:
         client = self._get_client()
-        msgs = self._prepare_messages(messages, images)
-        kwargs = {
-            "model": model,
-            "messages": msgs,
-            "temperature": temperature,
-            "stream": True,
-        }
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
-        if max_tokens:
-            kwargs["max_tokens"] = max_tokens
+        kwargs = self._build_kwargs(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            images=images,
+            stream=True,
+        )
+
+        # Tool call deltas arrive fragmented; accumulate by index, emit once.
+        tool_call_acc: dict[int, dict] = {}
+        finish_reason: Optional[str] = None
 
         try:
             stream = await client.chat.completions.create(**kwargs)
             async for chunk in stream:
                 if interrupt_check and callable(interrupt_check) and interrupt_check():
                     break
-                if not chunk.choices: continue
-                delta = chunk.choices[0].delta
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
                 if delta and delta.content:
                     yield delta.content
-                
-                # Handle native tool calls from OpenAI
+
                 if delta and delta.tool_calls:
-                    import json
-                    yield json.dumps({"tool_calls": [
-                        {
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments
-                            }
-                        } for tc in delta.tool_calls
-                    ]})
+                    for tc in delta.tool_calls:
+                        idx = tc.index if tc.index is not None else 0
+                        slot = tool_call_acc.setdefault(
+                            idx, {"id": None, "name": "", "arguments": ""}
+                        )
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function and tc.function.name:
+                            slot["name"] = tc.function.name
+                        if tc.function and tc.function.arguments:
+                            slot["arguments"] += tc.function.arguments
+
+            if tool_call_acc and finish_reason == "tool_calls":
+                normalized = []
+                for idx in sorted(tool_call_acc):
+                    slot = tool_call_acc[idx]
+                    args = slot["arguments"] or "{}"
+                    normalized.append({
+                        "id": slot["id"],
+                        "type": "function",
+                        "function": {
+                            "name": slot["name"],
+                            "arguments": args,
+                        },
+                    })
+                yield json.dumps({"tool_calls": normalized})
         except Exception as e:
             raise self._wrap_error(e) from e
 
     def _wrap_error(self, e: Exception) -> LLMError:
-        """Helper to map OpenAI errors to our internal exceptions."""
         err_str = str(e).lower()
         if "rate_limit" in err_str or "429" in err_str:
             return RateLimitError(f"OpenAI Rate Limit: {e}")
@@ -159,9 +227,20 @@ class OpenAIAdapter(BaseLLMAdapter):
             ids = [m.id for m in models.data]
             if self.base_url:
                 return ids
-            return [m for m in ids if "gpt" in m or "o1" in m or "o3" in m]
+            # Filter to chat-capable families (skip embeddings, tts, whisper).
+            return [
+                m for m in ids
+                if any(p in m for p in ("gpt-4", "gpt-5", "o1", "o3", "o4", "chatgpt"))
+            ]
         except Exception:
-            return ["gpt-4o", "gpt-4o-mini", "o3-mini"] if not self.base_url else []
+            return [
+                "gpt-4o",
+                "gpt-4o-mini",
+                "gpt-4.1",
+                "gpt-4.1-mini",
+                "o3-mini",
+                "o4-mini",
+            ] if not self.base_url else []
 
     async def health(self) -> bool:
         if not self.api_key and not self.base_url:
@@ -177,7 +256,6 @@ class OpenAIAdapter(BaseLLMAdapter):
         """Convert internal protocol to OpenAI format, including vision if needed."""
         if not images:
             return messages
-        # Attach images to the last user message as content parts
         msgs = [m.copy() for m in messages]
         for msg in reversed(msgs):
             if msg["role"] == "user":
@@ -185,7 +263,7 @@ class OpenAIAdapter(BaseLLMAdapter):
                 for img_b64 in images:
                     content_parts.append({
                         "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
                     })
                 msg["content"] = content_parts
                 break

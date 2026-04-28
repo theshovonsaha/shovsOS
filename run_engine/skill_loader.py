@@ -84,6 +84,9 @@ def _strip_yaml_frontmatter(content: str) -> tuple[dict[str, str], str]:
         if colon_idx > 0:
             key = line[:colon_idx].strip().lower()
             value = line[colon_idx + 1:].strip()
+            # Strip inline YAML braces (e.g. metadata: { "key": "val" } → skip complex values)
+            if value.startswith("{"):
+                continue
             metadata[key] = value
 
     return metadata, body
@@ -127,8 +130,25 @@ def load_skill_manifest(
 
     name = metadata.get("name", skill_name)
     description = metadata.get("description", "")
+    eligibility = metadata.get("eligibility", "auto").strip().lower()
+    if eligibility not in ("always", "explicit_only", "auto"):
+        eligibility = "auto"
 
-    return SkillManifest(name=name, description=description, body=body)
+    # Parse comma-separated lists for triggers and requirements
+    def _parse_list(raw: str) -> list[str]:
+        return [v.strip() for v in raw.split(",") if v.strip()]
+
+    triggers = _parse_list(metadata.get("triggers", ""))
+    requirements = _parse_list(metadata.get("requirements", ""))
+
+    return SkillManifest(
+        name=name,
+        description=description,
+        body=body,
+        triggers=triggers,
+        requirements=requirements,
+        eligibility=eligibility,
+    )
 
 
 def load_skill_context(

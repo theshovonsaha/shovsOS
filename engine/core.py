@@ -157,18 +157,7 @@ SYSTEM_ECHO_BLOCK_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 
-def _get_token_encoding():
-    """
-    Resolve a safe tokenizer without raising.
-    Falls back to a minimal char-based encoder if tiktoken mappings are unavailable.
-    """
-    try:
-        return tiktoken.get_encoding("cl100k_base")
-    except Exception:
-        try:
-            return tiktoken.get_encoding("o200k_base")
-        except Exception:
-            return None
+from engine.tokenization import get_token_encoding as _get_token_encoding
 
 def _truncate_for_model(content: str, model: str) -> str:
     """Truncate tool result to fit within the model's token context limit."""

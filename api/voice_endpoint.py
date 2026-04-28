@@ -113,7 +113,7 @@ def setup_voice_routes(app: FastAPI, *, run_engine, profile_manager) -> None:
                         endpointing_ms = int(1000 - (sensitivity * 900)) # 100ms to 1000ms range
                         
                         async with dg_connection.connect(
-                            model="nova-3",
+                            model="shovs-3",
                             language="en",
                             smart_format=True,
                             interim_results=True,
@@ -373,7 +373,7 @@ async def _transcribe_audio_deepgram(audio_bytes: bytes, api_key: str) -> str:
             "buffer": audio_bytes,
         }
         options = {
-            "model": "nova-3",
+            "model": "shovs-3",
             "smart_format": True,
             "language": "en",
         }

@@ -36,7 +36,7 @@ npm install
 Pick the frontend you want to run:
 
 ```bash
-cd frontend_nova && npm install && cd ..
+cd frontend_shovs && npm install && cd ..
 ```
 
 ```bash
@@ -69,6 +69,7 @@ LLM_PROVIDER=auto
 ```
 
 Supported values:
+
 - `auto`
 - `ollama`
 - `lmstudio`
@@ -135,6 +136,7 @@ GROQ_API_KEY=gsk_...
 ## Search Configuration
 
 The web tooling can use:
+
 - local SearXNG
 - Brave
 - Tavily
@@ -159,6 +161,7 @@ npm run dev:services
 ```
 
 This starts:
+
 - `searxng`
 - `agent-sandbox`
 
@@ -173,10 +176,10 @@ ENABLE_MCP_IN_DEV=false
 
 ## Running the App
 
-### Nova Workspace
+### Shovs Platform Workspace
 
 ```bash
-npm run dev:nova
+npm run dev:shovs
 ```
 
 ### Consumer Frontend
@@ -194,7 +197,7 @@ npm run dev:backend
 ### Frontend Only
 
 ```bash
-npm run dev:frontend:nova
+npm run dev:frontend:shovs
 ```
 
 ### Consumer Only
@@ -207,37 +210,41 @@ npm run dev:frontend:consumer
 
 - Backend API: [http://localhost:8000](http://localhost:8000)
 - FastAPI docs: [http://localhost:8000/docs](http://localhost:8000/docs)
-- Nova frontend: check the Vite output port in terminal
+- Shovs Platform frontend: check the Vite output port in terminal
 
 ## Recommended First Local Setup
 
 ### Option A: LM Studio on Apple Silicon
 
 Good for:
+
 - local-first development
 - OpenAI-compatible transport
 - small-model testing
 
 Suggested model pattern:
+
 - chat/planner/context: a small instruct model
 - embeddings: a dedicated embedding model if available
 
 ### Option B: Ollama
 
 Good for:
+
 - simplest local setup
 - fast smoke tests
 
 ### Option C: llama.cpp
 
 Good for:
+
 - lightweight local serving
 - engineering-focused local workflows
 
 ## First Smoke Test
 
 1. Start the backend.
-2. Open Nova.
+2. Open Shovs Platform.
 3. Select a model/provider.
 4. Send:
 
@@ -246,6 +253,7 @@ Research wigglebudget.com and give me a TLDR.
 ```
 
 If you are using a small local model, start with:
+
 - `Execution Loop = Single`
 - `Manager Agent = off`
 - `Max Tool Calls = 2 or 3`
@@ -285,6 +293,7 @@ Use `shovs-memory` when you want deterministic fact writes, correction-aware tem
 ### Local model runs but the turn fails with context overflow
 
 The runtime now retries local overflow cases with a smaller prompt, but you should still reduce pressure by:
+
 - lowering `Max Tool Calls`
 - lowering `Max Turns`
 - using `Single` loop for small local models
@@ -294,6 +303,7 @@ The runtime now retries local overflow cases with a smaller prompt, but you shou
 This is usually a small-model tool-obedience issue, not a backend startup issue.
 
 Recommended:
+
 - try `Single` first
 - reduce complexity of the request
 - keep tool budgets low
@@ -302,6 +312,7 @@ Recommended:
 ### The agent creates a file and then cannot open it
 
 The file tools operate inside the sandbox root. Current behavior accepts both:
+
 - `report.html`
 - `/sandbox/report.html`
 
@@ -310,11 +321,13 @@ If you see this class of issue again, it is a tool-path bug, not a memory or mod
 ### Memory storage fails with Ollama embedding errors
 
 This usually means one of:
+
 - the embed model is not available locally
 - `EMBED_MODEL` still points at the wrong provider/model
 - Ollama is up, but only the chat model is available
 
 Recommended:
+
 - make sure Ollama is running
 - make sure the embedding model exists locally, for example `nomic-embed-text`
 - set `EMBED_MODEL=ollama:nomic-embed-text` when using Ollama memory and retrieval
@@ -323,6 +336,7 @@ Recommended:
 ### Web search is unstable
 
 This usually means:
+
 - rate limits
 - missing API keys
 - network instability
@@ -333,6 +347,7 @@ The runtime now degrades more aggressively instead of retrying forever, but exte
 ## Storage
 
 Important runtime stores:
+
 - `sessions.db`
 - `agents.db`
 - `memory_graph.db`
@@ -340,4 +355,4 @@ Important runtime stores:
 - `runs.db`
 - `chroma_db/`
 
-Nova includes storage backup/reset controls for these stores.
+Shovs Platform includes storage backup/reset controls for these stores.

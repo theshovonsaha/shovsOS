@@ -1,12 +1,32 @@
 """
-ContextEngineV3 — Hybrid Durable + Convergent Context
------------------------------------------------------
-Experimental context engine that combines:
-- V1 durable linear memory for stable facts/corrections
-- V2 convergent module ranking for active-goal relevance
+ContextEngineV3 — The Unified Convergent Memory engine.
+-------------------------------------------------------
+This is THE context engine for the platform. The v1/v2/v3 numeric labels are
+historical: V3 is the unified engine that composes the four concerns of a real
+context layer into one pipeline.
 
-Storage format remains a single string in SessionManager.compressed_context.
-Existing V1/V2 sessions are bootstrapped on first use.
+Four-stage pipeline:
+  1. LINEAR LANE        — recent turns kept verbatim (handled upstream by
+                          SessionManager.sliding_window).
+  2. COMPRESSION        — older exchanges compressed into durable bullets via
+                          the V1 compressor (proven, stable).
+  3. CONVERGENT RANKING — active goals + module registry surface the
+                          right-context-at-the-right-time (V2 mechanics).
+  4. RESONANCE          — modules sharing goals with high-converging modules
+                          get a small lift, so the packet emerges as a
+                          coherent theme rather than a list of facts.
+
+Tunable knobs (constructor kwargs, not modes):
+  - linear_window_size:  recent turns kept verbatim (advisory; sessions own
+                          the actual sliding window).
+  - durable_cap:         max durable lines surfaced per turn.
+  - convergent_top_n:    max convergent modules surfaced per turn.
+  - resonance_weight:    0 disables resonance; ~0.15 is "noticeable theme
+                          clustering"; >0.3 starts overriding convergence.
+
+Storage format is a single JSON string in SessionManager.compressed_context.
+Sessions whose blob is in v1 (plain bullets) or v2 (legacy JSON) are migrated
+on first compress — no data loss, one-way transition.
 """
 
 from __future__ import annotations
@@ -17,10 +37,17 @@ from typing import Optional
 
 from llm.base_adapter import BaseLLMAdapter
 from engine.context_engine import ContextEngine
-from engine.context_engine_v2 import ContextEngineV2
+from engine.context_engine_v2 import ContextEngineV2, DEFAULT_RESONANCE_WEIGHT
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
+
+
+# Defaults chosen for an interactive multi-turn agent on a typical 32k-128k context.
+# Override per agent-profile via ContextGovernor if a workload needs different policy.
+DEFAULT_DURABLE_CAP = 8
+DEFAULT_CONVERGENT_TOP_N = 12
+DEFAULT_LINEAR_WINDOW_SIZE = 6  # advisory; the session manager owns the actual window
 
 
 class ContextEngineV3:
@@ -29,15 +56,34 @@ class ContextEngineV3:
         adapter: BaseLLMAdapter,
         semantic_graph=None,
         compression_model: Optional[str] = None,
+        *,
+        linear_window_size: int = DEFAULT_LINEAR_WINDOW_SIZE,
+        durable_cap: int = DEFAULT_DURABLE_CAP,
+        convergent_top_n: int = DEFAULT_CONVERGENT_TOP_N,
+        resonance_weight: float = DEFAULT_RESONANCE_WEIGHT,
     ):
         self.adapter = adapter
         self.compression_model = compression_model or cfg.DEFAULT_MODEL
+        self.linear_window_size = int(linear_window_size)
+        self.durable_cap = int(durable_cap)
+        self.convergent_top_n = int(convergent_top_n)
+        self.resonance_weight = float(resonance_weight)
+
         self._v1 = ContextEngine(adapter=adapter, compression_model=compression_model)
         self._v2 = ContextEngineV2(
             adapter=adapter,
             semantic_graph=semantic_graph,
             compression_model=compression_model,
+            resonance_weight=self.resonance_weight,
+            convergent_top_n=self.convergent_top_n,
         )
+
+    def set_resonance_weight(self, weight: float) -> None:
+        self.resonance_weight = float(weight)
+        self._v2.resonance_weight = self.resonance_weight
+
+    def set_durable_cap(self, cap: int) -> None:
+        self.durable_cap = int(cap)
 
     def set_adapter(self, adapter: BaseLLMAdapter):
         self.adapter = adapter
@@ -191,7 +237,7 @@ class ContextEngineV3:
         if durable_context:
             durable_lines = [line for line in durable_context.split("\n") if line.strip()]
             if durable_lines:
-                chosen = self._select_durable_lines(durable_lines, max_items=8)
+                chosen = self._select_durable_lines(durable_lines, max_items=self.durable_cap)
                 parts.append(
                     "--- Durable Memory (V3) ---\n"
                     + "\n".join(chosen)
@@ -231,7 +277,7 @@ class ContextEngineV3:
         if durable_context:
             durable_lines = [line for line in durable_context.split("\n") if line.strip()]
             if durable_lines:
-                chosen = self._select_durable_lines(durable_lines, max_items=8)
+                chosen = self._select_durable_lines(durable_lines, max_items=self.durable_cap)
                 durable_block = (
                     "--- Durable Memory (V3) ---\n"
                     + "\n".join(chosen)

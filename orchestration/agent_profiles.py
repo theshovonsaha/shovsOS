@@ -152,6 +152,7 @@ class AgentProfile(BaseModel):
     default_use_planner: bool = True
     default_loop_mode: str = "auto"
     default_context_mode: str = "v3"
+    unified_model_mode: bool = True
     revision:      int = 1
     created_at:    str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at:    str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -182,6 +183,7 @@ class ProfileManager:
                     default_use_planner INTEGER DEFAULT 1,
                     default_loop_mode TEXT DEFAULT 'auto',
                     default_context_mode TEXT DEFAULT 'v2',
+                    unified_model_mode INTEGER DEFAULT 1,
                     revision INTEGER DEFAULT 1,
                     created_at TEXT,
                     updated_at TEXT
@@ -230,6 +232,10 @@ class ProfileManager:
                 pass
             try:
                 conn.execute("ALTER TABLE agent_profiles ADD COLUMN skills TEXT DEFAULT '[]'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE agent_profiles ADD COLUMN unified_model_mode INTEGER DEFAULT 1")
             except sqlite3.OperationalError:
                 pass
             try:
@@ -328,6 +334,11 @@ class ProfileManager:
         p = self._sanitize_profile(p)
         existing = self.get(p.id, owner_id=p.owner_id)
         if existing:
+            # Embed model is immutable after creation — silently keep the original.
+            # The vector store and existing memory rows are bound to the embedder
+            # used at creation time; swapping embedders mid-life corrupts retrieval.
+            if existing.embed_model and p.embed_model != existing.embed_model:
+                p = p.model_copy(update={"embed_model": existing.embed_model})
             changed = any(
                 getattr(existing, field) != getattr(p, field)
                 for field in (
@@ -347,6 +358,7 @@ class ProfileManager:
                     "default_use_planner",
                     "default_loop_mode",
                     "default_context_mode",
+                    "unified_model_mode",
                 )
             )
             if changed and p.revision <= existing.revision:
@@ -356,12 +368,13 @@ class ProfileManager:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO agent_profiles
-                (id, owner_id, name, description, runtime_kind, model, embed_model, system_prompt, tools, skills, avatar_url, workspace_path, bootstrap_files, bootstrap_max_chars, default_use_planner, default_loop_mode, default_context_mode, revision, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, owner_id, name, description, runtime_kind, model, embed_model, system_prompt, tools, skills, avatar_url, workspace_path, bootstrap_files, bootstrap_max_chars, default_use_planner, default_loop_mode, default_context_mode, unified_model_mode, revision, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 p.id, p.owner_id, p.name, p.description, p.runtime_kind, p.model, p.embed_model, p.system_prompt,
                 json.dumps(p.tools), json.dumps(p.skills), p.avatar_url, p.workspace_path, json.dumps(p.bootstrap_files), p.bootstrap_max_chars,
                 1 if p.default_use_planner else 0, p.default_loop_mode, p.default_context_mode,
+                1 if p.unified_model_mode else 0,
                 p.revision, p.created_at, p.updated_at
             ))
             conn.commit()
@@ -525,6 +538,7 @@ class ProfileManager:
             default_use_planner=bool(r["default_use_planner"]) if "default_use_planner" in r.keys() else True,
             default_loop_mode=r["default_loop_mode"] if "default_loop_mode" in r.keys() and r["default_loop_mode"] else "auto",
             default_context_mode=r["default_context_mode"] if "default_context_mode" in r.keys() and r["default_context_mode"] else "v2",
+            unified_model_mode=bool(r["unified_model_mode"]) if "unified_model_mode" in r.keys() and r["unified_model_mode"] is not None else True,
             revision=r["revision"] if "revision" in r.keys() else 1,
             created_at=r["created_at"],
             updated_at=r["updated_at"]

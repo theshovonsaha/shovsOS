@@ -136,6 +136,7 @@ async def apply_memory_commit(
     graph,
     plan: MemoryCommitPlan,
     current_context: str,
+    planned_locus_id: str = "",
 ) -> MemoryCommitOutcome:
     next_context = str(plan.new_context or current_context or "")
     if plan.new_context:
@@ -174,6 +175,7 @@ async def apply_memory_commit(
                 predicate = str(item.get("predicate") or "").strip()
                 if not subject or not predicate or subject == "General":
                     continue
+                item_locus = str(item.get("locus_id") or "").strip() or (planned_locus_id or None)
                 graph.add_temporal_fact(
                     session_id,
                     subject,
@@ -182,9 +184,44 @@ async def apply_memory_commit(
                     turn,
                     owner_id=owner_id,
                     run_id=run_id,
+                    locus_id=item_locus,
                 )
+                try:
+                    from plugins.hook_registry import hooks
+                    hooks.emit_sync(
+                        "memory_stored",
+                        {
+                            "subject": subject,
+                            "predicate": predicate,
+                            "object": str(item.get("object") or ""),
+                            "turn": turn,
+                            "owner_id": owner_id,
+                        },
+                        run_id=run_id,
+                        session_id=session_id,
+                    )
+                except Exception:
+                    pass
         except Exception as exc:
             graph_error = str(exc)
+
+        # Slice 1: refresh per-locus compiled drawers so the
+        # compiled_drawer lane in unified_memory_search has live content.
+        if hasattr(graph, "compile_locus_drawer"):
+            touched_loci: set[str] = set()
+            for item in merged_facts:
+                lid = str(item.get("locus_id") or "").strip()
+                if lid:
+                    touched_loci.add(lid)
+            if planned_locus_id:
+                touched_loci.add(str(planned_locus_id).strip())
+            for lid in touched_loci:
+                if not lid:
+                    continue
+                try:
+                    graph.compile_locus_drawer(lid, owner_id=owner_id)
+                except Exception:
+                    pass
 
     indexed_fact_keys: list[str] = []
     index_error = ""

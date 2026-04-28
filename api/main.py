@@ -239,7 +239,7 @@ def _seed_standard_profiles():
             ),
             default_use_planner=True,
             default_loop_mode="auto",
-            default_context_mode="v2",
+            default_context_mode="v3",
             bootstrap_files=["IDENTITY.md", "SOUL.md"],
         ),
     ]
@@ -422,6 +422,7 @@ async def chat_stream(
     embed_model:       Optional[str]    = Form(None),
     forced_tools_json: Optional[str]    = Form(None),
     owner_id:          Optional[str]    = Form(None),
+    reasoning_enabled: Optional[bool]   = Form(None),
     files:             List[UploadFile] = File(default=[]),
 ):
     forced_tools = []
@@ -471,9 +472,9 @@ async def chat_stream(
                 owner_id=owner_id,
             )
             profile = profile_manager.get(agent_id or "default", owner_id=owner_id) or profile_manager.get("default", owner_id=owner_id)
-            resolved_context_mode = context_mode or getattr(profile, "default_context_mode", "v2")
+            resolved_context_mode = context_mode or getattr(profile, "default_context_mode", "v3")
             if resolved_context_mode not in {"v1", "v2", "v3"}:
-                resolved_context_mode = "v2"
+                resolved_context_mode = "v3"
             if not effective_session_id:
                 created = session_manager.create(
                     model=model or (profile.model if profile else FALLBACK_CHAT_MODEL),
@@ -483,15 +484,32 @@ async def chat_stream(
                 )
                 session_manager.set_context_mode(created.id, resolved_context_mode)
                 effective_session_id = created.id
+                try:
+                    from plugins.hook_registry import hooks
+                    hooks.emit_sync(
+                        "session_started",
+                        {"agent_id": created.agent_id, "model": created.model, "owner_id": owner_id},
+                        session_id=created.id,
+                    )
+                except Exception:
+                    pass
             else:
                 existing_session = session_manager.get(effective_session_id, owner_id=owner_id)
                 if existing_session:
                     session_manager.set_context_mode(effective_session_id, resolved_context_mode)
 
             resolved_use_planner = use_planner if use_planner is not None else bool(getattr(profile, "default_use_planner", True))
-            resolved_planner_model = planner_model or None
-            resolved_context_model = context_model or None
-            resolved_embed_model = embed_model or getattr(profile, "embed_model", None) or "nomic-embed-text"
+            # Unified mode: one model drives chat/planner/context. Per-slot
+            # overrides from the client are dropped so the agent stays coherent.
+            unified = bool(getattr(profile, "unified_model_mode", True))
+            if unified:
+                resolved_planner_model = None
+                resolved_context_model = None
+            else:
+                resolved_planner_model = planner_model or None
+                resolved_context_model = context_model or None
+            # Embed model is profile-bound and immutable; ignore any client value.
+            resolved_embed_model = getattr(profile, "embed_model", None) or "nomic-embed-text"
 
             run_request = RunEngineRequest(
                 session_id=effective_session_id,
@@ -514,6 +532,7 @@ async def chat_stream(
                 agent_revision=getattr(profile, "revision", None),
                 forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
                 workspace_path=getattr(profile, "workspace_path", None),
+                reasoning_enabled=reasoning_enabled,
             )
             async for event in run_engine.stream(run_request):
                 yield f"data: {json.dumps(event)}\n\n"
@@ -563,7 +582,7 @@ async def clear_session_context(session_id: str, owner_id: str):
 @app.post("/sessions/{session_id}/context-mode")
 async def set_context_mode(session_id: str, payload: dict):
     owner_id = _require_owner_id(payload.get("owner_id"))
-    mode = payload.get("mode", "v1")
+    mode = payload.get("mode", "v3")
     if mode not in ("v1", "v2", "v3"):
         raise HTTPException(400, "mode must be 'v1', 'v2', or 'v3'")
 
@@ -591,13 +610,13 @@ async def create_session(payload: Optional[dict] = Body(default=None)):
     owner_id = _require_owner_id(payload.get("owner_id"))
     agent_id = payload.get("agent_id") or "default"
     model = payload.get("model") or FALLBACK_CHAT_MODEL
-    requested_mode = payload.get("context_mode") or "v1"
-    context_mode = requested_mode if requested_mode in ("v1", "v2", "v3") else "v1"
+    requested_mode = payload.get("context_mode") or "v3"
+    context_mode = requested_mode if requested_mode in ("v1", "v2", "v3") else "v3"
 
     profile = profile_manager.get(agent_id, owner_id=owner_id) or profile_manager.get("default", owner_id=owner_id)
     system_prompt = profile.system_prompt if profile else ""
     if "context_mode" not in payload and profile:
-        context_mode = getattr(profile, "default_context_mode", "v2")
+        context_mode = getattr(profile, "default_context_mode", "v3")
 
     s = session_manager.create(
         model=model,
@@ -606,6 +625,15 @@ async def create_session(payload: Optional[dict] = Body(default=None)):
         owner_id=owner_id,
     )
     session_manager.set_context_mode(s.id, context_mode)
+    try:
+        from plugins.hook_registry import hooks
+        hooks.emit_sync(
+            "session_started",
+            {"agent_id": s.agent_id, "model": s.model, "owner_id": owner_id},
+            session_id=s.id,
+        )
+    except Exception:
+        pass
 
     return {
         "id": s.id,
@@ -642,16 +670,27 @@ async def edit_session_message(session_id: str, message_index: int, payload: dic
     if not new_content.strip():
         raise HTTPException(400, "content is required")
 
+    # truncate_downstream=True by default — removes messages after the edit
+    # so ghost facts cannot re-teach superseded content on the next turn.
+    # Pass truncate_downstream=false explicitly to preserve downstream messages
+    # (use only for typo corrections in the most recent message).
+    truncate_downstream = payload.get("truncate_downstream", True)
+
     session = session_manager.get(session_id, owner_id=owner_id)
     if not session:
         raise HTTPException(404, "Session not found")
 
+    history_before = len(session.full_history)
     message = session_manager.edit_message(
         session_id,
         content=new_content,
         message_index=message_index,
         owner_id=owner_id,
+        truncate_downstream=bool(truncate_downstream),
     )
+    session_after = session_manager.get(session_id, owner_id=owner_id)
+    history_after = len(session_after.full_history) if session_after else history_before
+    messages_truncated = max(0, history_before - history_after)
     if message is None:
         raise HTTPException(404, "Message not found")
 
@@ -679,6 +718,11 @@ async def edit_session_message(session_id: str, message_index: int, payload: dic
     return {
         "session_id": session_id,
         "message": message,
+        "cascade": {
+            "messages_truncated": messages_truncated,
+            "history_length_after": history_after,
+            "truncate_downstream": bool(truncate_downstream),
+        },
         "derived_state_reset": {
             "compressed_context": True,
             "candidate_signals": True,
@@ -852,11 +896,13 @@ async def update_agent(agent_id: str, payload: dict):
     p = profile_manager.get(agent_id, owner_id=owner_id)
     if not p:
         raise HTTPException(404, "Agent not found")
+    # NOTE: embed_model is intentionally NOT in this set — embedders are
+    # immutable after agent creation because the vector store and existing
+    # memory rows are bound to the embedder used at creation time.
     allowed = {
         "name",
         "description",
         "model",
-        "embed_model",
         "system_prompt",
         "tools",
         "skills",
@@ -867,7 +913,13 @@ async def update_agent(agent_id: str, payload: dict):
         "default_use_planner",
         "default_loop_mode",
         "default_context_mode",
+        "unified_model_mode",
     }
+    if "embed_model" in payload and payload["embed_model"] != p.embed_model:
+        raise HTTPException(
+            400,
+            "embed_model is immutable after agent creation. Create a new agent to use a different embedder.",
+        )
     for key, val in payload.items():
         if key in allowed:
             setattr(p, key, val)

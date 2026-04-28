@@ -1,14 +1,25 @@
-"""Session-scoped task tracker for TodoWrite-style continuity."""
+"""Session-scoped task tracker for TodoWrite-style continuity.
+
+Persistence: tasks are mirrored to a SQLite table keyed by session_id so they
+survive process restarts. The in-memory dict stays the hot path; SQLite is
+used for cold-start hydration and disaster recovery.
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import sqlite3
+import threading
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from threading import RLock
-from typing import Literal
+from typing import Literal, Optional
 
 TaskStatus = Literal["pending", "in_progress", "completed"]
 TaskPriority = Literal["low", "medium", "high"]
+
+_DEFAULT_DB_PATH = "session_tasks.db"
 
 
 @dataclass
@@ -20,12 +31,78 @@ class Task:
 
 
 class SessionTaskTracker:
-    """Keeps lightweight task state per session id."""
+    """Keeps lightweight task state per session id (in-memory + SQLite)."""
 
-    def __init__(self):
+    def __init__(self, db_path: Optional[str] = None):
         self._tasks_by_session: dict[str, list[Task]] = {}
         self._meta_by_session: dict[str, dict] = {}
         self._lock = RLock()
+        self._db_path = db_path or _DEFAULT_DB_PATH
+        self._db_lock = threading.Lock()
+        try:
+            self._init_db()
+            self._hydrate_from_db()
+        except sqlite3.OperationalError:
+            # Read-only filesystem or other persistence failure — fall back to memory only.
+            pass
+
+    def _init_db(self) -> None:
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        with self._db_lock, sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_tasks (
+                    session_id TEXT PRIMARY KEY,
+                    tasks_json TEXT NOT NULL,
+                    topic TEXT,
+                    version INTEGER DEFAULT 1,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.commit()
+
+    def _hydrate_from_db(self) -> None:
+        with self._db_lock, sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute("SELECT * FROM session_tasks"):
+                try:
+                    raw_tasks = json.loads(row["tasks_json"]) or []
+                except Exception:
+                    continue
+                parsed = [Task(**t) for t in raw_tasks if isinstance(t, dict)]
+                self._tasks_by_session[row["session_id"]] = parsed
+                self._meta_by_session[row["session_id"]] = {
+                    "topic": row["topic"] or "",
+                    "version": int(row["version"] or 1),
+                    "updated_at": row["updated_at"],
+                }
+
+    def _persist(self, session_id: str) -> None:
+        tasks = self._tasks_by_session.get(session_id, [])
+        meta = self._meta_by_session.get(session_id, {})
+        try:
+            with self._db_lock, sqlite3.connect(self._db_path) as conn:
+                if not tasks:
+                    conn.execute("DELETE FROM session_tasks WHERE session_id = ?", (session_id,))
+                else:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO session_tasks
+                        (session_id, tasks_json, topic, version, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            session_id,
+                            json.dumps([asdict(t) for t in tasks]),
+                            meta.get("topic", ""),
+                            int(meta.get("version", 1)),
+                            meta.get("updated_at"),
+                        ),
+                    )
+                conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     def write(self, session_id: str, tasks: list[dict], topic: str | None = None) -> str:
         if not session_id:
@@ -54,6 +131,7 @@ class SessionTaskTracker:
                 "version": int(self._meta_by_session.get(session_id, {}).get("version", 0)) + 1,
                 "topic": (topic or "").strip(),
             }
+            self._persist(session_id)
         return self.render(session_id)
 
     def update(self, session_id: str, task_id: str, status: str) -> str:
@@ -72,6 +150,7 @@ class SessionTaskTracker:
                 if task.id == task_id:
                     task.status = normalized_status
                     self._touch(session_id)
+                    self._persist(session_id)
                     return self._render_locked(tasks)
 
         return f"todo_update failed: task '{task_id}' not found"
@@ -88,6 +167,7 @@ class SessionTaskTracker:
         with self._lock:
             self._tasks_by_session.pop(session_id, None)
             self._meta_by_session.pop(session_id, None)
+            self._persist(session_id)
 
     def is_stale(self, session_id: str, timeout_seconds: int) -> bool:
         with self._lock:

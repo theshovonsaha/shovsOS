@@ -1,7 +1,13 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+} from 'react';
 import {
-  buildTimelineEntries as buildNovaTimelineEntries,
-  describeTraceEvent as describeNovaTraceEvent,
+  buildTimelineEntries as buildShovsTimelineEntries,
+  describeTraceEvent as describeShovsTraceEvent,
 } from './monitor/presentation';
 import { getOwnerId } from './owner';
 import { OperatorInterventions } from './components/OperatorInterventions';
@@ -174,8 +180,10 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
       id: `runtime:${runtimeEvent.id}`,
       title: 'Runtime',
       eyebrow: runtimeEvent.event_type.replace(/_/g, ' '),
-      summary: clipText(describeNovaTraceEvent(runtimeEvent), 150),
-      detail: runtimeEvent.run_id ? `run ${runtimeEvent.run_id.slice(0, 10)}` : undefined,
+      summary: clipText(describeShovsTraceEvent(runtimeEvent), 150),
+      detail: runtimeEvent.run_id
+        ? `run ${runtimeEvent.run_id.slice(0, 10)}`
+        : undefined,
       tone: runtimeEvent.event_type === 'route_decision' ? 'good' : 'neutral',
     });
   }
@@ -184,9 +192,13 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
     cards.push({
       id: `tool:${toolEvent.id}`,
       title: 'Latest Tool',
-      eyebrow: typeof toolEvent.pass_index === 'number' ? `pass ${toolEvent.pass_index}` : 'tool activity',
-      summary: clipText(describeNovaTraceEvent(toolEvent), 150),
-      detail: toolEvent.event_type === 'tool_result' ? 'observe phase' : 'act phase',
+      eyebrow:
+        typeof toolEvent.pass_index === 'number'
+          ? `pass ${toolEvent.pass_index}`
+          : 'tool activity',
+      summary: clipText(describeShovsTraceEvent(toolEvent), 150),
+      detail:
+        toolEvent.event_type === 'tool_result' ? 'observe phase' : 'act phase',
       tone:
         toolEvent.event_type === 'tool_result' &&
         toolEvent.data?.success === false
@@ -200,7 +212,7 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
       id: `verify:${verifyEvent.id}`,
       title: 'Verification',
       eyebrow: verifyEvent.event_type.replace(/_/g, ' '),
-      summary: clipText(describeNovaTraceEvent(verifyEvent), 150),
+      summary: clipText(describeShovsTraceEvent(verifyEvent), 150),
       tone:
         verifyEvent.event_type === 'verification_warning' ||
         verifyEvent.data?.supported === false
@@ -214,7 +226,7 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
       id: `response:${responseEvent.id}`,
       title: 'Response',
       eyebrow: 'latest output',
-      summary: clipText(describeNovaTraceEvent(responseEvent), 150),
+      summary: clipText(describeShovsTraceEvent(responseEvent), 150),
       tone: 'neutral',
     });
   }
@@ -222,8 +234,10 @@ function buildConsoleCards(traceEvents: TraceEventSummary[]): ConsoleCard[] {
   return cards;
 }
 
-function buildTimelineEntries(traceEvents: TraceEventSummary[]): TimelineEntry[] {
-  return buildNovaTimelineEntries(traceEvents, 18).map((entry) => ({
+function buildTimelineEntries(
+  traceEvents: TraceEventSummary[],
+): TimelineEntry[] {
+  return buildShovsTimelineEntries(traceEvents, 18).map((entry) => ({
     id: entry.id,
     stage: entry.stage,
     title: entry.headline,
@@ -247,7 +261,9 @@ export const LogPanel: React.FC<LogPanelProps> = ({
   const ownerId = useMemo(() => getOwnerId(), []);
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [traceEvents, setTraceEvents] = useState<TraceEventSummary[]>([]);
-  const [view, setView] = useState<'overview' | 'timeline' | 'logs'>('overview');
+  const [view, setView] = useState<'overview' | 'timeline' | 'logs'>(
+    'overview',
+  );
   const [filter, setFilter] = useState<string>('all');
   const [search, setSearch] = useState('');
   const [paused, setPaused] = useState(false);
@@ -288,17 +304,22 @@ export const LogPanel: React.FC<LogPanelProps> = ({
     setLoadError(null);
 
     Promise.all([
-      fetch(`/api/logs/recent?${historyParams.toString()}`).then(async (res) => {
-        if (!res.ok) throw new Error(`Recent logs failed: HTTP ${res.status}`);
-        const data: RecentLogsResponse = await res.json();
-        const incoming = Array.isArray(data.logs) ? data.logs : [];
-        setEntries((prev) => mergeEntries(prev, incoming));
-      }),
+      fetch(`/api/logs/recent?${historyParams.toString()}`).then(
+        async (res) => {
+          if (!res.ok)
+            throw new Error(`Recent logs failed: HTTP ${res.status}`);
+          const data: RecentLogsResponse = await res.json();
+          const incoming = Array.isArray(data.logs) ? data.logs : [];
+          setEntries((prev) => mergeEntries(prev, incoming));
+        },
+      ),
       fetchTraceConsole(),
     ])
       .catch((err) => {
         setLoadError(
-          err instanceof Error ? err.message : 'Failed to load operator history',
+          err instanceof Error
+            ? err.message
+            : 'Failed to load operator history',
         );
       })
       .finally(() => setLoadingHistory(false));
@@ -358,14 +379,22 @@ export const LogPanel: React.FC<LogPanelProps> = ({
     const ordered = [
       ...PREFERRED_CATEGORIES.filter((cat) => discovered.has(cat)),
       ...Array.from(discovered)
-        .filter((cat) => !PREFERRED_CATEGORIES.includes(cat as (typeof PREFERRED_CATEGORIES)[number]))
+        .filter(
+          (cat) =>
+            !PREFERRED_CATEGORIES.includes(
+              cat as (typeof PREFERRED_CATEGORIES)[number],
+            ),
+        )
         .sort(),
     ];
 
     return ['all', ...ordered];
   }, [entries]);
 
-  const consoleCards = useMemo(() => buildConsoleCards(traceEvents), [traceEvents]);
+  const consoleCards = useMemo(
+    () => buildConsoleCards(traceEvents),
+    [traceEvents],
+  );
   const timelineEntries = useMemo(
     () => buildTimelineEntries(traceEvents),
     [traceEvents],
@@ -436,10 +465,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({
           </div>
         ) : (
           consoleCards.map((card) => (
-            <div
-              key={card.id}
-              className={`log-console-card tone-${card.tone}`}
-            >
+            <div key={card.id} className={`log-console-card tone-${card.tone}`}>
               <div className='log-console-top'>
                 <span className='log-console-title'>{card.title}</span>
                 <span className='log-console-eyebrow'>{card.eyebrow}</span>
@@ -466,37 +492,40 @@ export const LogPanel: React.FC<LogPanelProps> = ({
       </div>
 
       {view === 'logs' ? (
-      <div className='log-filters'>
-        {categories.map((cat) => (
-          <button
-            key={cat}
-            className={`log-cat-btn ${filter === cat ? 'active' : ''}`}
-            onClick={() => setFilter(cat)}
-            style={
-              filter === cat && cat !== 'all'
-                ? { borderColor: CAT_COLOR[cat] || 'var(--border-hi)', color: CAT_COLOR[cat] || 'var(--text)' }
-                : {}
-            }
-          >
-            {cat !== 'all' && (
-              <span
-                className='log-cat-dot'
-                style={{ background: CAT_COLOR[cat] || 'var(--text-dim)' }}
-              />
-            )}
-            {cat === 'all' ? 'all' : categoryLabel(cat)}
-          </button>
-        ))}
-        <div className='log-search-wrap'>
-          <input
-            className='log-search'
-            placeholder='search logs...'
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-          />
+        <div className='log-filters'>
+          {categories.map((cat) => (
+            <button
+              key={cat}
+              className={`log-cat-btn ${filter === cat ? 'active' : ''}`}
+              onClick={() => setFilter(cat)}
+              style={
+                filter === cat && cat !== 'all'
+                  ? {
+                      borderColor: CAT_COLOR[cat] || 'var(--border-hi)',
+                      color: CAT_COLOR[cat] || 'var(--text)',
+                    }
+                  : {}
+              }
+            >
+              {cat !== 'all' && (
+                <span
+                  className='log-cat-dot'
+                  style={{ background: CAT_COLOR[cat] || 'var(--text-dim)' }}
+                />
+              )}
+              {cat === 'all' ? 'all' : categoryLabel(cat)}
+            </button>
+          ))}
+          <div className='log-search-wrap'>
+            <input
+              className='log-search'
+              placeholder='search logs...'
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+            />
+          </div>
+          <span className='log-count'>{filtered.length}</span>
         </div>
-        <span className='log-count'>{filtered.length}</span>
-      </div>
       ) : null}
 
       <div
@@ -504,7 +533,8 @@ export const LogPanel: React.FC<LogPanelProps> = ({
         className='log-entries'
         onScroll={(e) => {
           const el = e.currentTarget;
-          const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          const atBottom =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 40;
           setAutoScroll(atBottom);
         }}
       >
@@ -524,7 +554,9 @@ export const LogPanel: React.FC<LogPanelProps> = ({
                     <span key={cat} className='log-overview-tag'>
                       <span
                         className='log-cat-dot'
-                        style={{ background: CAT_COLOR[cat] || 'var(--text-dim)' }}
+                        style={{
+                          background: CAT_COLOR[cat] || 'var(--text-dim)',
+                        }}
                       />
                       {cat}
                     </span>
@@ -535,7 +567,10 @@ export const LogPanel: React.FC<LogPanelProps> = ({
               <div className='log-overview-title'>Latest phases</div>
               <div className='log-phase-list'>
                 {timelineEntries.slice(0, 6).map((entry) => (
-                  <div key={entry.id} className={`log-phase-item tone-${entry.tone}`}>
+                  <div
+                    key={entry.id}
+                    className={`log-phase-item tone-${entry.tone}`}
+                  >
                     <span className='log-phase-stage'>{entry.stage}</span>
                     <span className='log-phase-copy'>{entry.summary}</span>
                   </div>
@@ -552,10 +587,15 @@ export const LogPanel: React.FC<LogPanelProps> = ({
           ) : (
             <div className='log-timeline'>
               {timelineEntries.map((entry) => (
-                <div key={entry.id} className={`log-timeline-card tone-${entry.tone}`}>
+                <div
+                  key={entry.id}
+                  className={`log-timeline-card tone-${entry.tone}`}
+                >
                   <div className='log-timeline-top'>
                     <span className='log-timeline-stage'>{entry.stage}</span>
-                    <span className='log-timeline-time'>{formatTime(entry.ts)}</span>
+                    <span className='log-timeline-time'>
+                      {formatTime(entry.ts)}
+                    </span>
                   </div>
                   <div className='log-timeline-title'>{entry.title}</div>
                   <div className='log-timeline-summary'>{entry.summary}</div>
@@ -569,7 +609,9 @@ export const LogPanel: React.FC<LogPanelProps> = ({
         ) : filtered.length === 0 ? (
           <div className='log-empty'>
             <div>◈</div>
-            <div>no log entries{filter !== 'all' ? ` for [${filter}]` : ''}</div>
+            <div>
+              no log entries{filter !== 'all' ? ` for [${filter}]` : ''}
+            </div>
           </div>
         ) : (
           filtered.map((entry, index) => (
@@ -580,7 +622,9 @@ export const LogPanel: React.FC<LogPanelProps> = ({
       </div>
 
       <div className='log-footer'>
-        <span>{entries.length} total · {filtered.length} shown</span>
+        <span>
+          {entries.length} total · {filtered.length} shown
+        </span>
         {!autoScroll && (
           <button
             className='log-btn'
@@ -608,8 +652,12 @@ const LogRow: React.FC<{ entry: LogEntry }> = React.memo(({ entry }) => {
   const hasMeta = entry.meta && Object.keys(entry.meta).length > 0;
   const categoryDisplay = categoryLabel(entry.category);
   const sourceCategory = String(entry.meta?.source_category || '').trim();
-  const stageLabel = String(entry.meta?.phase || entry.meta?.trace_phase || '').trim();
-  const toolName = String(entry.meta?.tool_name || entry.meta?.tool || '').trim();
+  const stageLabel = String(
+    entry.meta?.phase || entry.meta?.trace_phase || '',
+  ).trim();
+  const toolName = String(
+    entry.meta?.tool_name || entry.meta?.tool || '',
+  ).trim();
 
   return (
     <div
@@ -630,22 +678,22 @@ const LogRow: React.FC<{ entry: LogEntry }> = React.memo(({ entry }) => {
       <div className='log-session' title={entry.session}>
         {shortSession(entry.session)}
       </div>
-      <div
-        className='log-glyph'
-        style={{ color: LEVEL_COLOR[entry.level] }}
-      >
+      <div className='log-glyph' style={{ color: LEVEL_COLOR[entry.level] }}>
         {LEVEL_GLYPH[entry.level]}
       </div>
       <div
         className='log-msg'
         style={{
-          color: entry.level === 'info' ? 'var(--text)' : LEVEL_COLOR[entry.level],
+          color:
+            entry.level === 'info' ? 'var(--text)' : LEVEL_COLOR[entry.level],
         }}
       >
         {entry.message}
         {(stageLabel || toolName) && (
           <div className='log-row-tags'>
-            {stageLabel ? <span className='log-row-tag'>{stageLabel}</span> : null}
+            {stageLabel ? (
+              <span className='log-row-tag'>{stageLabel}</span>
+            ) : null}
             {toolName ? <span className='log-row-tag'>{toolName}</span> : null}
           </div>
         )}
@@ -669,7 +717,9 @@ const LogRow: React.FC<{ entry: LogEntry }> = React.memo(({ entry }) => {
               <span className='log-meta-key'>{key}</span>
               <span className='log-meta-val'>
                 {typeof value === 'object' ? (
-                  <pre style={{ margin: 0, background: 'transparent', padding: 0 }}>
+                  <pre
+                    style={{ margin: 0, background: 'transparent', padding: 0 }}
+                  >
                     {JSON.stringify(value, null, 2)}
                   </pre>
                 ) : (

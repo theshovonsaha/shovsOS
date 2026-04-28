@@ -7,9 +7,10 @@ interface PremiumSelectProps {
     onChange: (value: string) => void;
     label?: string;
     placeholder?: string;
+    disabled?: boolean;
 }
 
-export const PremiumSelect: React.FC<PremiumSelectProps> = ({ value, options, onChange, label, placeholder }) => {
+export const PremiumSelect: React.FC<PremiumSelectProps> = ({ value, options, onChange, label, placeholder, disabled }) => {
     const [isOpen, setIsOpen] = useState(false);
     const [query, setQuery] = useState('');
     const containerRef = useRef<HTMLDivElement>(null);
@@ -125,8 +126,10 @@ export const PremiumSelect: React.FC<PremiumSelectProps> = ({ value, options, on
             {label && <label className="premium-select-label">{label}</label>}
             <div
                 ref={triggerRef}
-                className={`premium-select-trigger ${isOpen ? 'active' : ''}`}
-                onClick={() => setIsOpen(!isOpen)}
+                className={`premium-select-trigger ${isOpen ? 'active' : ''} ${disabled ? 'disabled' : ''}`}
+                style={disabled ? { opacity: 0.55, cursor: 'not-allowed', pointerEvents: 'none' } : undefined}
+                onClick={() => { if (!disabled) setIsOpen(!isOpen); }}
+                aria-disabled={disabled}
             >
                 <div className="premium-select-value" title={value || placeholder || 'Select model'}>
                     {getDisplayValue() || <span className="placeholder">{placeholder || 'Select...'}</span>}

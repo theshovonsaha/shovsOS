@@ -184,29 +184,49 @@ def _hybrid_rerank(
     return pinned + reranked
 
 
-def _detect_locus_from_query(query: str, graph: SemanticGraph, owner_id: Optional[str] = None) -> Optional[str]:
+def detect_locus_by_overlap(query: str, loci: list[dict]) -> Optional[str]:
+    """Token-overlap locus detector against an in-memory list of locus dicts.
+
+    Used by both ``_detect_locus_from_query`` (which loads loci from a graph)
+    and the orchestrator's plan path (which already has the list). Centralizing
+    the algorithm here keeps the planner and the retrieval lane in sync — they
+    used to disagree (the planner did a brittle substring match, retrieval did
+    token overlap), causing facts to land in one locus and queries to find
+    nothing.
     """
-    Perform a 'Spatial Scan' on the query to see if it targets a specific Locus.
-    Matches against locus_id and name.
-    """
-    loci = graph.list_loci(owner_id=owner_id)
     if not loci:
         return None
-    
     q_tokens = _tokenize_set(query)
+    if not q_tokens:
+        return None
+
+    best_id: Optional[str] = None
+    best_score = 0
     for locus in loci:
         lid = str(locus.get("id", "")).lower()
         lname = str(locus.get("name", "")).lower()
-        if lid in q_tokens or lname in q_tokens:
-            return locus.get("id")
-            
-    # Phrases like "in the <name>"
-    for locus in loci:
-        lname = str(locus.get("name", "")).lower()
-        if f"in the {lname}" in query.lower() or f"in {lname}" in query.lower():
-            return locus.get("id")
-            
-    return None
+        id_tokens = _tokenize_set(lid.replace("_", " "))
+        name_tokens = _tokenize_set(lname)
+        locus_tokens = id_tokens | name_tokens
+        if not locus_tokens:
+            continue
+        shared = q_tokens & locus_tokens
+        if not shared:
+            continue
+        if len(shared) > best_score:
+            best_score = len(shared)
+            best_id = locus.get("id")
+    return best_id
+
+
+def _detect_locus_from_query(query: str, graph: SemanticGraph, owner_id: Optional[str] = None) -> Optional[str]:
+    """Perform a 'Spatial Scan' on the query to see if it targets a Locus.
+
+    Loads the locus list from ``graph`` then delegates to
+    :func:`detect_locus_by_overlap`. Kept as a thin wrapper because the
+    retrieval lane has the graph in scope, while the planner does not.
+    """
+    return detect_locus_by_overlap(query, graph.list_loci(owner_id=owner_id))
 
 
 def _lexical_overlap_score(query: str, text: str) -> float:
@@ -296,7 +316,7 @@ async def unified_memory_search(
     session_id: Optional[str] = None,
     locus_id: Optional[str] = None,
     top_k: int = 5,
-    threshold: float = 0.5,
+    threshold: float = 0.3,
     graph: Optional[SemanticGraph] = None,
 ) -> dict:
     """
@@ -348,6 +368,32 @@ async def unified_memory_search(
                 },
             )
             source_counts["compiled_drawer"] += 1
+
+        # Slice 4: expand to neighbor loci so an answer that lives one hop
+        # away (e.g. detected "european_travel_plan" → linked "passports")
+        # still surfaces. Capped depth ≤2, fanout ≤5, score decays per hop.
+        if hasattr(graph, "get_locus_neighbors"):
+            try:
+                neighbors = graph.get_locus_neighbors(locus_id, max_depth=2, max_fanout=5)
+            except Exception:
+                neighbors = []
+            for neighbor_id, _depth, neighbor_score in neighbors:
+                neighbor_drawer = graph.get_compiled_drawer(neighbor_id)
+                if not neighbor_drawer:
+                    continue
+                _upsert_hit(
+                    merged,
+                    dedupe_key=f"drawer|{neighbor_id}",
+                    score=min(0.95, max(0.0, float(neighbor_score))),
+                    source="compiled_drawer",
+                    payload={
+                        "kind": "compiled_drawer",
+                        "locus_id": neighbor_id,
+                        "content": neighbor_drawer,
+                        "neighbor_of": locus_id,
+                    },
+                )
+                source_counts["compiled_drawer"] += 1
 
     semantic_hits = await graph.traverse(
         query,

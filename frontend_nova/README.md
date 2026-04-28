@@ -1,4 +1,4 @@
-# Frontend Nova
+# Frontend Shovs Platform
 
 Operator workspace for Shovs LLM OS.
 
@@ -12,7 +12,7 @@ Operator workspace for Shovs LLM OS.
 ## Run
 
 ```bash
-cd frontend_nova
+cd frontend_shovs
 npm install
 npm run dev
 ```

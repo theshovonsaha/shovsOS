@@ -119,6 +119,88 @@ def is_retry_sensitive_tool(tool_name: str) -> bool:
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 _PRICING_RE = re.compile(r"\b(pricing|plans?|cost|tiers?|subscribe)\b", re.IGNORECASE)
 _LOGIN_RE = re.compile(r"\b(sign in|log in|login|register|subscribe to read|paywall|members only)\b", re.IGNORECASE)
+_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "of", "for", "in", "on", "at", "to",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might",
+    "what", "which", "who", "how", "when", "where", "why", "this", "that",
+    "with", "from", "by", "as", "it", "its", "not", "no", "so", "if", "then",
+})
+
+
+def _relevance_score(query: str, title: str, snippet: str, url: str) -> float:
+    """
+    Score a search result by keyword overlap with the query.
+
+    Approach (inspired by OpenClaw link-understanding/detect.ts):
+    - Tokenize query into meaningful keywords (strip stopwords)
+    - Weighted hit: title hit = 3pts, snippet hit = 1pt, url-path hit = 2pts
+    - Normalize by keyword count so short queries aren't disadvantaged
+    - Returns 0.0–1.0 (higher = more relevant)
+    """
+    if not query:
+        return 0.0
+
+    def _tokens(text: str) -> set[str]:
+        raw = re.findall(r"[a-z0-9]+", text.lower())
+        return {w for w in raw if w not in _STOPWORDS and len(w) > 1}
+
+    kw = _tokens(query)
+    if not kw:
+        return 0.0
+
+    title_hits = len(kw & _tokens(title))
+    snippet_hits = len(kw & _tokens(snippet))
+
+    # URL path keywords (strip scheme + domain for path scoring)
+    try:
+        path = re.sub(r"^https?://[^/]+", "", url).lower()
+        url_hits = len(kw & _tokens(path))
+    except Exception:
+        url_hits = 0
+
+    raw_score = title_hits * 3 + snippet_hits * 1 + url_hits * 2
+    max_score = len(kw) * 3  # best case: all kw in title
+    return raw_score / max_score if max_score > 0 else 0.0
+
+
+def _pick_best_url(results: list[dict], query: str) -> str:
+    """
+    Pick the most relevant URL from a list of search result dicts.
+
+    Scores each result by keyword overlap with the query.
+    Falls back to first URL with a snippet, then first URL overall.
+    """
+    if not results:
+        return ""
+
+    scored: list[tuple[float, str]] = []
+    for r in results[:10]:
+        u = str(r.get("url") or r.get("link") or "").strip()
+        if not u.startswith("http"):
+            continue
+        title = str(r.get("title") or "").strip()
+        snippet = str(r.get("snippet") or r.get("description") or "").strip()
+        score = _relevance_score(query, title, snippet, u)
+        scored.append((score, u))
+
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_url = scored[0]
+        if best_score > 0:
+            return best_url
+
+    # Fallback: first result with snippet, then first result
+    for r in results[:5]:
+        u = str(r.get("url") or r.get("link") or "").strip()
+        snippet = str(r.get("snippet") or r.get("description") or "").strip()
+        if u.startswith("http") and snippet:
+            return u
+    if results:
+        fallback = str(results[0].get("url") or results[0].get("link") or "").strip()
+        if fallback.startswith("http"):
+            return fallback
+    return ""
 
 
 def generate_tool_signals(
@@ -138,28 +220,17 @@ def generate_tool_signals(
     text = str(content or "")
 
     if tool == "web_search":
+        query = str((arguments or {}).get("query", ""))
         # Parse JSON search results to extract best candidate URL for follow-up fetch.
         try:
             payload = json.loads(text)
             results = payload.get("results") or payload.get("organic_results") or []
             if isinstance(results, list) and results:
-                # Best URL = first result that has a snippet
-                best_url = ""
-                for r in results[:5]:
-                    u = str(r.get("url") or r.get("link") or "").strip()
-                    snippet = str(r.get("snippet") or r.get("description") or "").strip()
-                    if u.startswith("http") and snippet:
-                        best_url = u
-                        break
-                if not best_url and results:
-                    candidate = str(results[0].get("url") or results[0].get("link") or "").strip()
-                    if candidate.startswith("http"):
-                        best_url = candidate
+                best_url = _pick_best_url(results, query)
                 if best_url:
                     signals.append(f"[READ_MORE: {best_url}]")
 
                 # Suggest a pricing-focused follow-up if the query looks commercial
-                query = str((arguments or {}).get("query", "")).lower()
                 if _PRICING_RE.search(query) and best_url:
                     host = re.match(r"https?://[^/]+", best_url)
                     if host:
@@ -224,6 +295,70 @@ def enrich_tool_result_content(
     except Exception:
         pass
     return content
+
+
+def diagnose_tool_failure(
+    tool_name: str,
+    content: str,
+    arguments: dict[str, Any] | None = None,
+) -> list[str]:
+    """Classify a failed tool result and emit recovery hints.
+
+    Failed tools used to drop into the actor's view as raw error text, leaving
+    the model to guess the recovery path (often by inventing tools or repeating
+    the same call). Surfacing structured `[SIGNAL: detail]` hints lets the
+    actor's existing signal-reading rules drive an intel-gathering retry
+    instead of a blind one.
+    """
+    text = str(content or "").strip()
+    lowered = text.lower()
+    hints: list[str] = []
+
+    if (
+        "argument error" in lowered
+        or "unexpected keyword argument" in lowered
+        or "missing 1 required" in lowered
+        or "missing required argument" in lowered
+        or "got multiple values for" in lowered
+    ):
+        hints.append(
+            f"[ARG_ERROR: {tool_name} signature mismatch — call list_tools "
+            f"to confirm the tool's parameters before retrying]"
+        )
+    elif "unknown tool" in lowered or "tool not found" in lowered or "no such tool" in lowered:
+        hints.append(
+            f"[UNKNOWN_TOOL: '{tool_name}' is not registered — call list_tools "
+            f"to see what is actually available; do not invent tool names]"
+        )
+    elif "embedding request failed" in lowered or "failed to generate embedding" in lowered:
+        hints.append(
+            "[EMBED_DOWN: embedding service unreachable — vector indexing skipped; "
+            "deterministic fact storage still works, retry later for semantic recall]"
+        )
+    elif (
+        " 401" in text or " 403" in text
+        or "unauthorized" in lowered or "permission denied" in lowered
+        or ("auth" in lowered and ("required" in lowered or "fail" in lowered))
+    ):
+        hints.append("[AUTH_REQUIRED: try a different source or skip this fetch]")
+    elif " 503" in text or " 502" in text or " 504" in text or "service unavailable" in lowered:
+        hints.append("[PROVIDER_DOWN: upstream provider unavailable — wait or switch provider]")
+    elif " 404" in text or "not found" in lowered:
+        hints.append("[NOT_FOUND: target does not exist — verify path/url before retry]")
+    elif "connection" in lowered and ("fail" in lowered or "refused" in lowered or "reset" in lowered):
+        hints.append("[NETWORK: connection failed — retry once, then try a different source]")
+    elif "invalid json" in lowered or "decode error" in lowered or "expecting value" in lowered:
+        hints.append("[BAD_FORMAT: tool input malformed — re-encode arguments as valid JSON]")
+    elif "timeout" in lowered or "timed out" in lowered:
+        hints.append("[TIMEOUT: operation took too long — retry with narrower scope or different tool]")
+
+    if not hints:
+        hints.append(
+            f"[FAILURE: {tool_name} did not succeed — gather more context "
+            f"(list_tools, query_memory, or read related state) before retrying]"
+        )
+
+    return hints
 
 
 def canonical_tool_result(

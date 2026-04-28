@@ -171,6 +171,15 @@ class SemanticGraph:
                 conn.execute("ALTER TABLE facts ADD COLUMN locus_id TEXT")
             except sqlite3.OperationalError:
                 pass
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS locus_edges (
+                    src_id TEXT NOT NULL,
+                    dst_id TEXT NOT NULL,
+                    weight REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (src_id, dst_id)
+                )
+            ''')
             conn.commit()
 
     async def _get_embedding(self, text: str) -> List[float]:
@@ -372,6 +381,38 @@ class SemanticGraph:
             for r in rows
         ]
 
+    def delete_triplets(
+        self,
+        subject: str,
+        predicate: str,
+        owner_id: Optional[str] = None,
+    ) -> int:
+        """Hard-delete vector triplets matching (subject, predicate). Returns rows deleted.
+
+        Used by the void/update path so retrieval (`traverse`) stops surfacing
+        embeddings whose deterministic fact has been superseded — preventing
+        the annotation-style ghost where old triplets still rank in similarity.
+        """
+        sub = (subject or "").strip()
+        pred = (predicate or "").strip()
+        if not sub or not pred:
+            return 0
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            if owner_id is None:
+                cursor.execute(
+                    "DELETE FROM memories WHERE subject = ? AND predicate = ?",
+                    (sub, pred),
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM memories WHERE subject = ? AND predicate = ? "
+                    "AND COALESCE(owner_id, '') = COALESCE(?, '')",
+                    (sub, pred, owner_id),
+                )
+            conn.commit()
+            return cursor.rowcount
+
     def delete_by_id(self, memory_id: int, owner_id: Optional[str] = None) -> bool:
         """Delete a single memory by its ID. Returns True if deleted."""
         with sqlite3.connect(self.db_path) as conn:
@@ -473,6 +514,42 @@ class SemanticGraph:
                       AND subject = ? AND predicate = ? AND valid_to IS NULL
                 ''', (turn, session_id, owner_id, subject.strip(), predicate.strip()))
             conn.commit()
+
+    def get_owner_current_facts(
+        self,
+        owner_id: Optional[str],
+        limit: int = 40,
+    ) -> List[Tuple[str, str, str]]:
+        """Return currently valid facts scoped to an owner across every session.
+
+        Used by the L0 identity brief so a fresh session still carries forward
+        who the owner is without needing an explicit locus query. Deduplicates
+        on (subject, predicate) — the most recently valid_from wins.
+        """
+        safe_limit = max(1, int(limit))
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT subject, predicate, object
+                FROM facts
+                WHERE COALESCE(owner_id, '') = COALESCE(?, '') AND valid_to IS NULL
+                  AND subject IS NOT NULL AND predicate IS NOT NULL
+                ORDER BY valid_from DESC, id DESC
+                ''',
+                (owner_id,),
+            )
+            seen: set[tuple[str, str]] = set()
+            out: List[Tuple[str, str, str]] = []
+            for subject, predicate, obj in cursor.fetchall():
+                key = ((subject or "").strip().lower(), (predicate or "").strip().lower())
+                if not key[0] or not key[1] or key in seen:
+                    continue
+                seen.add(key)
+                out.append((subject, predicate, obj))
+                if len(out) >= safe_limit:
+                    break
+            return out
 
     def get_current_facts(self, session_id: str, owner_id: Optional[str] = None) -> List[Tuple[str, str, str]]:
         """Return all currently valid facts (un-voided) for this session."""
@@ -593,6 +670,134 @@ class SemanticGraph:
             if row and row[0]:
                 return row[0]
             return None
+
+    def compile_locus_drawer(
+        self,
+        locus_id: str,
+        owner_id: Optional[str] = None,
+        max_facts: int = 40,
+    ) -> Optional[str]:
+        """Render a dense markdown summary of a locus's current facts and write
+        it to the `compiled_drawer` column.
+
+        The drawer is what `unified_memory_search` slams to score=1.0 when a
+        locus is detected — without a writer the column was always NULL, so
+        the high-priority lane was dead. This is the mempalace closet pattern
+        adapted natively: a per-locus index doc that retrieval can pin-hit.
+        """
+        meta = self.get_locus(locus_id, owner_id=owner_id)
+        if meta is None:
+            return None
+        facts = self.list_temporal_facts_by_locus(
+            locus_id, owner_id=owner_id, limit=max_facts
+        ) or []
+        current = [f for f in facts if f.get("status") == "current"]
+
+        lines: list[str] = []
+        name = str(meta.get("name") or locus_id).strip()
+        description = str(meta.get("description") or "").strip()
+        lines.append(f"# {name}")
+        if description:
+            lines.append(description)
+        if current:
+            lines.append("")
+            lines.append("## Current facts")
+            for fact in current:
+                subject = str(fact.get("subject") or "").strip()
+                predicate = str(fact.get("predicate") or "").strip()
+                object_ = str(fact.get("object") or "").strip()
+                if not (subject and predicate and object_):
+                    continue
+                lines.append(f"- {subject} — {predicate}: {object_}")
+        compiled = "\n".join(lines).strip()
+        if not compiled:
+            return None
+        self.update_compiled_drawer(locus_id, compiled)
+        return compiled
+
+    def list_locus_ids(self, owner_id: Optional[str] = None) -> list[str]:
+        """Distinct locus ids known to the graph, scoped by owner if given."""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            if owner_id is None:
+                cursor.execute("SELECT id FROM loci")
+            else:
+                cursor.execute(
+                    "SELECT id FROM loci WHERE COALESCE(owner_id, '') = COALESCE(?, '')",
+                    (owner_id,),
+                )
+            return [row[0] for row in cursor.fetchall() if row and row[0]]
+
+    def add_locus_edge(
+        self,
+        src_id: str,
+        dst_id: str,
+        weight: float = 1.0,
+    ) -> None:
+        """Record an undirected association between two loci.
+
+        Stored as a directed pair so callers can express asymmetric weights,
+        but `get_locus_neighbors` follows edges in both directions.
+        """
+        if not src_id or not dst_id or src_id == dst_id:
+            return
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                '''
+                INSERT INTO locus_edges (src_id, dst_id, weight, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(src_id, dst_id) DO UPDATE SET weight = excluded.weight
+                ''',
+                (src_id, dst_id, float(weight), now),
+            )
+            conn.commit()
+
+    def get_locus_neighbors(
+        self,
+        src_id: str,
+        max_depth: int = 2,
+        max_fanout: int = 5,
+    ) -> List[Tuple[str, int, float]]:
+        """Return (neighbor_id, depth, score) for loci reachable from `src_id`.
+
+        BFS bounded by `max_depth` (≤2) and per-level fanout (`max_fanout` ≤5).
+        Score decays geometrically per hop (0.85 ** depth) and multiplies edge
+        weight; nearer / heavier neighbors rank first.
+        """
+        if not src_id:
+            return []
+        depth_cap = max(1, min(int(max_depth or 1), 3))
+        fanout_cap = max(1, min(int(max_fanout or 5), 10))
+        seen = {src_id}
+        frontier: list[tuple[str, float]] = [(src_id, 1.0)]
+        out: list[tuple[str, int, float]] = []
+        with sqlite3.connect(self.db_path) as conn:
+            for depth in range(1, depth_cap + 1):
+                next_frontier: list[tuple[str, float]] = []
+                for node, parent_score in frontier:
+                    cursor = conn.execute(
+                        '''
+                        SELECT dst_id AS other, weight FROM locus_edges WHERE src_id = ?
+                        UNION
+                        SELECT src_id AS other, weight FROM locus_edges WHERE dst_id = ?
+                        ORDER BY weight DESC
+                        LIMIT ?
+                        ''',
+                        (node, node, fanout_cap),
+                    )
+                    for other, weight in cursor.fetchall():
+                        if not other or other in seen:
+                            continue
+                        seen.add(other)
+                        score = parent_score * float(weight or 1.0) * (0.85 ** depth)
+                        out.append((other, depth, score))
+                        next_frontier.append((other, score))
+                if not next_frontier:
+                    break
+                frontier = next_frontier
+        out.sort(key=lambda t: (-t[2], t[1]))
+        return out
 
     def list_loci(self, owner_id: Optional[str] = None) -> List[Dict]:
         """List all registered spatial Loci."""

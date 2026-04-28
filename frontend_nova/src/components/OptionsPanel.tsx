@@ -105,6 +105,7 @@ interface OptionsPanelProps {
   embedModel: string;
   setEmbedModel: (val: string) => void;
   embedModels: Record<string, string[]>;
+  unifiedModelMode?: boolean;
   contextMode: 'v1' | 'v2' | 'v3';
   setSessionContextMode: (mode: 'v1' | 'v2' | 'v3') => void;
   clearSessionContext: () => void;
@@ -156,9 +157,9 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   contextModel,
   setContextModel,
   embedModel,
-  setEmbedModel,
+  setEmbedModel: _setEmbedModel,
   contextMode,
-  setSessionContextMode,
+  setSessionContextMode: _setSessionContextMode,
   clearSessionContext,
   showPlannerLog,
   setShowPlannerLog,
@@ -167,6 +168,7 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   showObserverActivity,
   setShowObserverActivity,
   embedModels,
+  unifiedModelMode = true,
 }) => {
   const [memories, setMemories] = useState<Memory[]>([]);
   const [total, setTotal] = useState(0);
@@ -561,8 +563,9 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 lineHeight: 1.4,
               }}
             >
-              Nova now uses the canonical managed runtime only. Planning,
-              evidence, verification, and memory policy all flow through one path.
+              Shovs Platform now uses the canonical managed runtime only.
+              Planning, evidence, verification, and memory policy all flow
+              through one path.
             </p>
           </div>
 
@@ -609,7 +612,7 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
               proactively select tools before execution.
             </p>
 
-            {usePlanner && (
+            {usePlanner && !unifiedModelMode && (
               <div style={{ marginTop: '12px' }}>
                 <label
                   className='settings-label'
@@ -627,6 +630,19 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                   options={{ system: [''], ...models }}
                   onChange={(val) => setPlannerModel(val)}
                 />
+              </div>
+            )}
+            {usePlanner && unifiedModelMode && (
+              <div
+                style={{
+                  marginTop: '8px',
+                  fontSize: '11px',
+                  color: 'var(--text-dim)',
+                  lineHeight: 1.4,
+                }}
+              >
+                Planner uses the agent's Execution Model (unified mode). Disable
+                Unified Model Mode in the agent profile to override per-slot.
               </div>
             )}
 
@@ -758,11 +774,7 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
               }}
             >
               <span style={{ opacity: 0.6 }}>&#9679;</span>
-              {contextMode === 'v3'
-                ? 'V3 Hybrid — durable anchors + convergent goal ranking'
-                : contextMode === 'v2'
-                  ? 'V2 Convergent — active-goal ranked modules'
-                  : 'V1 Linear — durable bullet compression'}
+              Unified Convergent Memory
             </div>
             <p
               className='settings-help'
@@ -773,8 +785,9 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 lineHeight: 1.4,
               }}
             >
-              Managed by agent profile. V3 is the default and combines stable
-              fact memory with active-goal relevance ranking.
+              Linear recent turns, durable bullet compression, convergent goal
+              ranking, and resonance-based theme clustering — composed into one
+              engine. Older v1/v2 sessions auto-migrate on first compress.
             </p>
           </div>
 
@@ -799,25 +812,41 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
             >
               Context Engine Intelligence
             </label>
-            <PremiumSelect
-              label=''
-              value={contextModel}
-              options={models}
-              onChange={(val) => setContextModel(val)}
-            />
-            <p
-              className='settings-help'
-              style={{
-                marginTop: '8px',
-                fontSize: '11px',
-                color: 'var(--text-dim)',
-                lineHeight: 1.4,
-              }}
-            >
-              The model used for background memory compression. Defaults to the
-              active session model (auto). Override manually if you want a
-              lighter/faster model for compression.
-            </p>
+            {unifiedModelMode ? (
+              <p
+                className='settings-help'
+                style={{
+                  fontSize: '11px',
+                  color: 'var(--text-dim)',
+                  lineHeight: 1.4,
+                }}
+              >
+                Compression uses the agent's Execution Model (unified mode).
+                Per-slot override is disabled. Switch to granular control in the
+                agent profile to choose a lighter/faster compression model.
+              </p>
+            ) : (
+              <>
+                <PremiumSelect
+                  label=''
+                  value={contextModel}
+                  options={models}
+                  onChange={(val) => setContextModel(val)}
+                />
+                <p
+                  className='settings-help'
+                  style={{
+                    marginTop: '8px',
+                    fontSize: '11px',
+                    color: 'var(--text-dim)',
+                    lineHeight: 1.4,
+                  }}
+                >
+                  Background memory compression model. Pick a chat-capable model
+                  only — embedding models are filtered out automatically.
+                </p>
+              </>
+            )}
           </div>
 
           <div
@@ -839,13 +868,14 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 fontWeight: 600,
               }}
             >
-              Semantic Embedding Model
+              Semantic Embedding Model (locked)
             </label>
             <PremiumSelect
               label=''
               value={embedModel}
               options={embedModels}
-              onChange={(val) => setEmbedModel(val)}
+              onChange={() => {}}
+              disabled
             />
             <p
               className='settings-help'
@@ -856,10 +886,9 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 lineHeight: 1.4,
               }}
             >
-              The model used for semantic vector search in memory. Use a
-              provider-prefixed embedding model such as `ollama:...`,
-              `lmstudio:...`, `llamacpp:...`, or `openai:...` so the runtime
-              uses the correct embeddings endpoint.
+              Embedder is fixed at agent creation. Memory rows are bound to it —
+              switching mid-life would corrupt retrieval. Create a new agent to
+              use a different embedder.
             </p>
           </div>
 
@@ -1026,7 +1055,7 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
             >
               Old DBs can absolutely cause stale memory, old sessions, and
               retrieval pollution. Use this to back up and reset the exact
-              stores Nova is using.
+              stores Shovs Platform is using.
             </p>
 
             <div className='storage-grid'>
@@ -1179,7 +1208,8 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
               <div style={{ display: 'grid', gap: '8px', marginTop: '8px' }}>
                 <div className='memory-footer'>
                   <span className='memory-date'>
-                    Overall score: {(benchmarkResult.overall_score * 100).toFixed(1)}%
+                    Overall score:{' '}
+                    {(benchmarkResult.overall_score * 100).toFixed(1)}%
                   </span>
                   <span className='memory-date'>
                     {new Date(benchmarkResult.ran_at).toLocaleString()}
@@ -1188,35 +1218,71 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 <div className='memory-triplet'>
                   <span className='memory-subject'>Deterministic</span>
                   <span className='memory-predicate'>
-                    P {(benchmarkResult.metrics.deterministic_extraction.precision * 100).toFixed(1)}% · R{' '}
-                    {(benchmarkResult.metrics.deterministic_extraction.recall * 100).toFixed(1)}%
+                    P{' '}
+                    {(
+                      benchmarkResult.metrics.deterministic_extraction
+                        .precision * 100
+                    ).toFixed(1)}
+                    % · R{' '}
+                    {(
+                      benchmarkResult.metrics.deterministic_extraction.recall *
+                      100
+                    ).toFixed(1)}
+                    %
                   </span>
                   <span className='memory-object'>
-                    F1 {(benchmarkResult.metrics.deterministic_extraction.f1 * 100).toFixed(1)}% · Void{' '}
-                    {(benchmarkResult.metrics.deterministic_extraction.void_accuracy * 100).toFixed(1)}%
+                    F1{' '}
+                    {(
+                      benchmarkResult.metrics.deterministic_extraction.f1 * 100
+                    ).toFixed(1)}
+                    % · Void{' '}
+                    {(
+                      benchmarkResult.metrics.deterministic_extraction
+                        .void_accuracy * 100
+                    ).toFixed(1)}
+                    %
                   </span>
                 </div>
                 <div className='memory-triplet'>
                   <span className='memory-subject'>Direct Fact Guard</span>
                   <span className='memory-predicate'>
-                    Accuracy {(benchmarkResult.metrics.direct_fact_guard.accuracy * 100).toFixed(1)}%
+                    Accuracy{' '}
+                    {(
+                      benchmarkResult.metrics.direct_fact_guard.accuracy * 100
+                    ).toFixed(1)}
+                    %
                   </span>
                   <span className='memory-object'>
-                    {benchmarkResult.metrics.direct_fact_guard.duration_ms.toFixed(2)} ms
+                    {benchmarkResult.metrics.direct_fact_guard.duration_ms.toFixed(
+                      2,
+                    )}{' '}
+                    ms
                   </span>
                 </div>
                 <div className='memory-triplet'>
                   <span className='memory-subject'>Semantic Retrieval</span>
                   <span className='memory-predicate'>
-                    Hit@3 {(benchmarkResult.metrics.semantic_retrieval.hit_rate_at_3 * 100).toFixed(1)}%
+                    Hit@3{' '}
+                    {(
+                      benchmarkResult.metrics.semantic_retrieval.hit_rate_at_3 *
+                      100
+                    ).toFixed(1)}
+                    %
                   </span>
                   <span className='memory-object'>
-                    MRR {(benchmarkResult.metrics.semantic_retrieval.mrr_at_3 * 100).toFixed(1)}%
+                    MRR{' '}
+                    {(
+                      benchmarkResult.metrics.semantic_retrieval.mrr_at_3 * 100
+                    ).toFixed(1)}
+                    %
                   </span>
                 </div>
               </div>
             ) : (
-              <div className='memory-empty' style={{ minHeight: 'unset', marginTop: '8px' }}>
+              <div
+                className='memory-empty'
+                style={{ minHeight: 'unset', marginTop: '8px' }}
+              >
                 No benchmark run yet for this owner.
               </div>
             )}

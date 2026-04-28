@@ -17,6 +17,7 @@ This page reflects the current project as implemented, not the older marketing f
 ### 2. Managed Loop
 
 Managed mode supports:
+
 - `plan`
 - `act`
 - `observe`
@@ -54,6 +55,7 @@ This happens inside one run, not as a default multi-agent swarm.
 ### 6. Provider Layer
 
 Supported providers:
+
 - Ollama
 - LM Studio
 - llama.cpp
@@ -79,10 +81,11 @@ Supported providers:
 
 ### 9. Frontend Planes
 
-- Nova workspace
+- Shovs Platform workspace
 - consumer frontend
 
-Nova already includes:
+Shovs Platform already includes:
+
 - model/provider controls
 - loop controls
 - planner toggle
@@ -97,6 +100,7 @@ Nova already includes:
 The value of the system is not only "many tools" or "many providers."
 
 The differentiator is:
+
 - explicit execution structure
 - truthful state transitions
 - smaller, cleaner prompt payloads
@@ -128,7 +132,7 @@ The monitor is much more readable now, but reasoning and observer activity can s
 
 ### 6. Active Workspace Builder Controls
 
-The builder is functional in Nova Dashboard, but the same controls should also be easier to reach from the active workspace.
+The builder is functional in Shovs Platform Dashboard, but the same controls should also be easier to reach from the active workspace.
 
 ## Near-Term Roadmap
 
@@ -153,11 +157,12 @@ The builder is functional in Nova Dashboard, but the same controls should also b
 ### Product Planes
 
 - further tighten consumer behavior on top of the kernel
-- keep Nova focused, mobile-friendly, operator-readable, and builder-capable
+- keep Shovs Platform focused, mobile-friendly, operator-readable, and builder-capable
 
 ## Longer-Term Direction
 
 The long-term direction remains:
+
 - one kernel
 - multiple planes
 - plural context

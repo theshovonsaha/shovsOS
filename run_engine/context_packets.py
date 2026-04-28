@@ -24,6 +24,7 @@ from run_engine.evidence_lane import build_working_evidence_block, build_working
 from run_engine.meta_context import build_meta_context_block, build_meta_context_snapshot
 from run_engine.tool_contract import format_tool_result_line
 from run_engine.types import CompiledPassPacket, RunEngineRequest
+from memory.task_tracker import get_session_task_tracker
 
 
 DEFAULT_PHASE_CHAR_BUDGETS: dict[ContextPhase, int] = {
@@ -286,6 +287,57 @@ def build_phase_packet(
     if deterministic_facts_item is not None:
         items.append(deterministic_facts_item)
 
+    # ── L0 identity brief ────────────────────────────────────────────────────
+    # Owner-scoped current facts pulled across every session. Provides cross-
+    # session continuity on a fresh chat where session-scoped current_facts is
+    # empty. Filtered to facts not already in this turn's deterministic set so
+    # we don't duplicate.
+    graph = getattr(context_governor, "graph", None)
+    owner_id_for_brief = getattr(inputs.request, "owner_id", None)
+    if graph is not None and owner_id_for_brief and hasattr(graph, "get_owner_current_facts"):
+        try:
+            owner_facts = graph.get_owner_current_facts(owner_id_for_brief, limit=40) or []
+        except Exception:
+            owner_facts = []
+        session_keys = {
+            ((s or "").strip().lower(), (p or "").strip().lower())
+            for s, p, _ in (inputs.current_facts or [])
+        }
+        identity_lines: list[str] = []
+        for subject, predicate, object_ in owner_facts:
+            key = ((subject or "").strip().lower(), (predicate or "").strip().lower())
+            if not key[0] or not key[1] or key in session_keys:
+                continue
+            identity_lines.append(f"- {subject} — {predicate}: {object_}")
+        if identity_lines:
+            items.append(
+                ContextItem(
+                    item_id="identity_brief",
+                    kind=ContextKind.MEMORY,
+                    title="Owner Identity Brief",
+                    content=(
+                        "Cross-session facts known about the owner (do not contradict without explicit correction):\n"
+                        + "\n".join(identity_lines)
+                    ),
+                    source="semantic_graph",
+                    priority=34,
+                    max_chars=1400,
+                    trace_id="run_engine:identity_brief",
+                    provenance={
+                        "fact_count": len(identity_lines),
+                        "owner_id": owner_id_for_brief,
+                    },
+                    # Cross-session identity is only useful for planning the
+                    # turn and shaping the final response. Acting and verify
+                    # work off the deterministic + working evidence lanes;
+                    # paying ~1.4KB on every tool turn would be wasted.
+                    phase_visibility=frozenset({
+                        ContextPhase.PLANNING,
+                        ContextPhase.RESPONSE,
+                    }),
+                )
+            )
+
     candidate_context_item = build_candidate_context_item(
         candidate_context=candidate_context,
         source=(
@@ -419,6 +471,40 @@ def build_phase_packet(
                     }),
                 )
             )
+
+    # ── Active task list injection (ACTING + RESPONSE only) ──────────────────
+    # When the agent wrote a todo_write plan, surface the current task state
+    # in the acting context so the actor knows to call todo_update as tasks
+    # start and complete — without needing to call todo_read first.
+    _session_id_for_tasks = str(getattr(inputs.session, "id", "") or "").strip()
+    if _session_id_for_tasks:
+        try:
+            _tracker = get_session_task_tracker()
+            if _tracker.has_active_tasks(_session_id_for_tasks):
+                _task_state = _tracker.render(_session_id_for_tasks)
+                items.append(
+                    ContextItem(
+                        item_id="active_task_list",
+                        kind=ContextKind.WORKING,
+                        title="Active Task List",
+                        content=(
+                            _task_state
+                            + "\n\nCall todo_update(task_id, 'in_progress') before starting a task "
+                            "and todo_update(task_id, 'completed') immediately after it finishes."
+                        ),
+                        source="task_tracker",
+                        priority=41,
+                        max_chars=700,
+                        trace_id="run_engine:active_task_list",
+                        provenance={"session_id": _session_id_for_tasks},
+                        phase_visibility=frozenset({
+                            ContextPhase.ACTING,
+                            ContextPhase.RESPONSE,
+                        }),
+                    )
+                )
+        except Exception:
+            pass  # Never block packet build for task state
 
     tension_content = render_conversation_tension(inputs.conversation_tension or ConversationTension())
     tension_item = build_conversation_tension_item(

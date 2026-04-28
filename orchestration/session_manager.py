@@ -52,6 +52,7 @@ class Session:
     lock:                asyncio.Lock = field(default_factory=asyncio.Lock)
     message_count:       int = 0
     context_mode:        str = "v1"
+    last_active_skill:   Optional[str] = None  # Sticky planner hint — last skill picked on this session
     _interrupted:        bool = False # Transient interrupt signal  # "v1" (linear) | "v2" (convergent) | "v3" (hybrid)
 
 
@@ -366,7 +367,21 @@ class SessionManager:
         message_id: Optional[str] = None,
         message_index: Optional[int] = None,
         owner_id: Optional[str] = None,
+        truncate_downstream: bool = True,
     ) -> Optional[dict]:
+        """
+        Edit a historical message and atomically reset all downstream derived state.
+
+        Args:
+            truncate_downstream: When True (default), removes all messages *after*
+                the edited message from full_history. This prevents ghost facts —
+                downstream messages that reference old content from re-teaching
+                superseded facts to the context engine on the next turn.
+                Set False only if you need to preserve downstream messages
+                (e.g., lightweight typo correction in the most recent message).
+
+        Returns the updated message dict, or None if not found.
+        """
         s = self.get(session_id, owner_id=owner_id)
         if not s:
             return None
@@ -390,7 +405,18 @@ class SessionManager:
         target.setdefault("created_at", target["edited_at"])
         target.setdefault("id", str(uuid.uuid4()))
         target["sequence"] = target_index
-        s.full_history[target_index] = target
+
+        # ── Cascade: truncate downstream messages ──────────────────────────
+        # Downstream messages were generated in response to the old content.
+        # Keeping them would re-teach superseded facts to the context engine
+        # on the next turn (the ghost-forward problem). Truncating them is
+        # the atomic cascade — history is now consistent with the edited message.
+        if truncate_downstream and target_index < len(s.full_history) - 1:
+            s.full_history = s.full_history[: target_index + 1]
+            s.full_history[target_index] = target
+        else:
+            s.full_history[target_index] = target
+
         s.sliding_window = s.full_history[-SLIDING_WINDOW_SIZE:]
         s.message_count = len(s.full_history)
 
@@ -400,6 +426,10 @@ class SessionManager:
         )
         s.first_message = first_user
         s.title = (first_user or "New Chat")[:60] + ("…" if first_user and len(first_user) > 60 else "")
+
+        # ── Cascade: reset all derived state ──────────────────────────────
+        # compressed_context, candidate_signals, candidate_context are compiled
+        # from history — they are now stale and must be cleared.
         s.compressed_context = ""
         s.candidate_signals = []
         s.candidate_context = ""

@@ -121,9 +121,9 @@ def make_consumer_router(
             owner_id=owner_id,
         )
         model = payload.get("model") or options.get("model") or getattr(profile, "model", None)
-        context_mode = payload.get("context_mode") or getattr(profile, "default_context_mode", "v2")
+        context_mode = payload.get("context_mode") or getattr(profile, "default_context_mode", "v3")
         if context_mode not in {"v1", "v2", "v3"}:
-            context_mode = "v2"
+            context_mode = "v3"
         s = sessions.create(
             model=model,
             system_prompt=getattr(profile, "system_prompt", "") or "",
@@ -131,6 +131,15 @@ def make_consumer_router(
             owner_id=owner_id,
         )
         sessions.set_context_mode(s.id, context_mode)
+        try:
+            from plugins.hook_registry import hooks
+            hooks.emit_sync(
+                "session_started",
+                {"agent_id": s.agent_id, "model": s.model, "owner_id": owner_id, "plane": "consumer"},
+                session_id=s.id,
+            )
+        except Exception:
+            pass
         return {
             "id": s.id,
             "model": s.model,
@@ -145,6 +154,7 @@ def make_consumer_router(
         session_id: Optional[str] = Form(None),
         model: Optional[str] = Form(None),
         owner_id: Optional[str] = Form(None),
+        reasoning_enabled: Optional[bool] = Form(None),
         files: list[UploadFile] = File(default=[]),
     ):
         owner_id = _require_owner_id(owner_id)
@@ -173,9 +183,9 @@ def make_consumer_router(
 
             tool_events = 0
             sid = session_id
-            resolved_context_mode = getattr(profile, "default_context_mode", "v2")
+            resolved_context_mode = getattr(profile, "default_context_mode", "v3")
             if resolved_context_mode not in {"v1", "v2", "v3"}:
-                resolved_context_mode = "v2"
+                resolved_context_mode = "v3"
             if not sid:
                 created = sessions.create(
                     model=active_model,
@@ -185,6 +195,15 @@ def make_consumer_router(
                 )
                 sid = created.id
                 sessions.set_context_mode(sid, resolved_context_mode)
+                try:
+                    from plugins.hook_registry import hooks
+                    hooks.emit_sync(
+                        "session_started",
+                        {"agent_id": created.agent_id, "model": created.model, "owner_id": owner_id, "plane": "consumer"},
+                        session_id=sid,
+                    )
+                except Exception:
+                    pass
             else:
                 existing = sessions.get(sid, owner_id=owner_id)
                 if existing and getattr(existing, "context_mode", "") != resolved_context_mode:
@@ -204,6 +223,7 @@ def make_consumer_router(
                 images=image_b64s or None,
                 agent_revision=getattr(profile, "revision", None),
                 workspace_path=getattr(profile, "workspace_path", None),
+                reasoning_enabled=reasoning_enabled,
             )
             async for event in run_engine.stream(run_request):
                 event_type = event.get("type")
@@ -232,6 +252,8 @@ def make_consumer_router(
                     yield f"data: {json.dumps({'type': 'plan', 'strategy': event.get('strategy', ''), 'tools': event.get('tools', []), 'confidence': event.get('confidence', 0)})}\n\n"
                 elif event_type == "verification_warning":
                     yield f"data: {json.dumps({'type': 'verification_warning', 'issues': event.get('issues', []), 'confidence': event.get('confidence', 0)})}\n\n"
+                elif event_type == "redraft":
+                    yield f"data: {json.dumps({'type': 'redraft', 'reason': event.get('reason', ''), 'issues': event.get('issues', []), 'side_effect_guard': bool(event.get('side_effect_guard', False))})}\n\n"
                 elif event_type == "conversation_tension":
                     yield f"data: {json.dumps({'type': 'tension', 'summary': event.get('summary', ''), 'challenge_level': event.get('challenge_level', '')})}\n\n"
                 elif event_type == "logical_stall_alert":

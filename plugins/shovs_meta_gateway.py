@@ -13,6 +13,19 @@ from memory.semantic_graph import SemanticGraph
 from memory.retrieval import unified_memory_search
 from config.logger import log
 
+
+def _resolve_turn(session_id: Optional[str], owner_id: Optional[str], graph: SemanticGraph) -> int:
+    """Resolve the current turn number for temporal fact operations."""
+    try:
+        from orchestration.session_manager import SessionManager
+        sm = SessionManager()
+        session = sm.get(session_id, owner_id=owner_id) if session_id else None
+        if session:
+            return len(session.full_history)
+    except Exception:
+        pass
+    return 0
+
 _tool_registry: Optional[ToolRegistry] = None
 _graph: Optional[SemanticGraph] = None
 
@@ -84,6 +97,104 @@ async def _spatial_store(subject: str, predicate: str, object: str, locus_id: Op
         return f"Error storing fact: {e}"
 
 
+async def _spatial_update(
+    subject: str,
+    predicate: str,
+    object: str,
+    locus_id: Optional[str] = None,
+    _owner_id: Optional[str] = None,
+    _session_id: Optional[str] = None,
+    _run_id: Optional[str] = None,
+    **kwargs,
+) -> str:
+    """
+    Correct or update a fact in Shovs memory.
+
+    Voids any existing fact for (subject, predicate) in this session's
+    deterministic timeline, then writes the new value. Also updates the
+    semantic graph triplet so future retrieval prefers the new value.
+    Pass locus_id to anchor the corrected fact to a specific Memory Palace room.
+    """
+    if not _graph:
+        return "Memory graph not available."
+
+    session_id = _session_id or kwargs.get("session_id")
+    try:
+        if locus_id:
+            existing = _graph.get_locus(locus_id, owner_id=_owner_id)
+            if existing is None:
+                _graph.register_locus(locus_id, name=locus_id, owner_id=_owner_id)
+
+        turn = _resolve_turn(session_id, _owner_id, _graph)
+
+        if session_id:
+            # Void the previous fact for this (subject, predicate) pair
+            _graph.void_temporal_fact(
+                session_id, subject.strip(), predicate.strip(), turn, owner_id=_owner_id
+            )
+            # Write the corrected fact into the deterministic timeline
+            _graph.add_temporal_fact(
+                session_id, subject.strip(), predicate.strip(), object.strip(),
+                turn, owner_id=_owner_id, run_id=_run_id, locus_id=locus_id,
+            )
+
+        # Hard-filter: drop superseded vector triplets so semantic retrieval
+        # cannot resurface the old value alongside the corrected one.
+        _graph.delete_triplets(subject.strip(), predicate.strip(), owner_id=_owner_id)
+
+        # Update the semantic graph triplet
+        await _graph.add_triplet(
+            subject=subject.strip(),
+            predicate=predicate.strip(),
+            object_=object.strip(),
+            owner_id=_owner_id,
+            run_id=_run_id,
+            locus_id=locus_id,
+        )
+        locus_note = f" (Locus: {locus_id})" if locus_id else ""
+        lane_note = "session + semantic memory" if session_id else "semantic memory only"
+        return (
+            f"Updated memory in {lane_note}: [{subject}] --[{predicate}]--> [{object}]{locus_note}"
+        )
+    except Exception as e:
+        return f"Error updating fact: {e}"
+
+
+async def _spatial_void(
+    subject: str,
+    predicate: str,
+    _owner_id: Optional[str] = None,
+    _session_id: Optional[str] = None,
+    **kwargs,
+) -> str:
+    """
+    Void (delete) a fact from the current session's deterministic memory.
+
+    Marks the most recent fact for (subject, predicate) as superseded so it
+    will no longer surface in retrieval. Use when the user explicitly says
+    "forget" or "that's no longer true" and there is no replacement value.
+    """
+    if not _graph:
+        return "Memory graph not available."
+
+    session_id = _session_id or kwargs.get("session_id")
+    if not session_id:
+        return "shovs_memory_void requires an active session (cannot void without session context)."
+
+    try:
+        turn = _resolve_turn(session_id, _owner_id, _graph)
+        _graph.void_temporal_fact(
+            session_id, subject.strip(), predicate.strip(), turn, owner_id=_owner_id
+        )
+        # Hard-filter: drop matching vector triplets so semantic retrieval
+        # honors the void rather than ranking the stale embedding alongside.
+        removed = _graph.delete_triplets(subject.strip(), predicate.strip(), owner_id=_owner_id)
+        suffix = f" — removed {removed} vector triplet(s)" if removed else ""
+        return f"Voided fact: [{subject}] --[{predicate}]--> (no longer current){suffix}"
+    except Exception as e:
+        return f"Error voiding fact: {e}"
+
+
 async def _create_locus(locus_id: str, name: Optional[str] = None, description: str = "", _owner_id: Optional[str] = None) -> str:
     """Register a new named spatial room (Locus) in the Memory Palace."""
     if not _graph:
@@ -151,6 +262,49 @@ SPATIAL_STORE_TOOL = Tool(
     tags=["meta", "memory"]
 )
 
+SPATIAL_UPDATE_TOOL = Tool(
+    name="shovs_memory_update",
+    description=(
+        "Correct or update an existing fact in Shovs memory. "
+        "Voids the previous value for (subject, predicate) and writes the new one. "
+        "Use when the user corrects a fact: 'actually my name is James not John', "
+        "'I moved to Vancouver', 'forget the old price — it's $49 now'. "
+        "Pass locus_id to anchor the correction to a specific Memory Palace room."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string", "description": "The entity the fact is about (e.g. 'User', 'Project')"},
+            "predicate": {"type": "string", "description": "The relationship being corrected (e.g. 'name', 'location', 'price')"},
+            "object": {"type": "string", "description": "The new correct value"},
+            "locus_id": {"type": "string", "description": "Optional: Anchor to this Memory Palace room ID"},
+        },
+        "required": ["subject", "predicate", "object"],
+    },
+    handler=_spatial_update,
+    tags=["meta", "memory"],
+)
+
+SPATIAL_VOID_TOOL = Tool(
+    name="shovs_memory_void",
+    description=(
+        "Remove (void) a fact from memory when the user says it is no longer true "
+        "and provides no replacement. Examples: 'forget my editor preference', "
+        "'I no longer work at Google', 'ignore the old budget'. "
+        "Use shovs_memory_update instead when a replacement value is provided."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string", "description": "The entity the fact is about (e.g. 'User')"},
+            "predicate": {"type": "string", "description": "The relationship to void (e.g. 'preferred_editor', 'employer')"},
+        },
+        "required": ["subject", "predicate"],
+    },
+    handler=_spatial_void,
+    tags=["meta", "memory"],
+)
+
 LIST_LOCI_TOOL = Tool(
     name="shovs_list_loci",
     description="List all available spatial rooms (Memory Palace Loci) for context anchoring.",
@@ -183,5 +337,7 @@ def register_gateway_tools(registry: ToolRegistry):
     registry.register(GET_MANIFEST_TOOL)
     registry.register(SPATIAL_QUERY_TOOL)
     registry.register(SPATIAL_STORE_TOOL)
+    registry.register(SPATIAL_UPDATE_TOOL)
+    registry.register(SPATIAL_VOID_TOOL)
     registry.register(LIST_LOCI_TOOL)
     registry.register(CREATE_LOCUS_TOOL)
