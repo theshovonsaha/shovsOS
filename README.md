@@ -30,112 +30,56 @@ Five things make this different from a prompt wrapper:
 
 ```mermaid
 flowchart TD
-  subgraph FRONTEND_PLANES[FRONTEND PLANES]
-    A1[frontend_shovs: operator workspace, agent builder, monitor, options]
-    A2[frontend_consumer: end-user chat surface (managed runtime, narrowed)]
+  classDef magic fill:#f9f0ff,stroke:#d0bdf4,stroke-width:2px,color:#333
+  classDef guard fill:#ffebee,stroke:#ffcdd2,stroke-width:2px,color:#333
+  classDef storage fill:#fff3e0,stroke:#ffcc80,stroke-width:2px,color:#333
+  classDef tech fill:#e3f2fd,stroke:#90caf9,stroke-width:2px,color:#333
+
+  subgraph FRONTEND["🖥️ Product Surfaces (The Hook)"]
+    direction LR
+    A1["🛠️ Shovs OS (Operator)<br/>Workspace & Builder"]:::tech
+    A2["✨ Consumer UI<br/>Viral 'Magic' Chat Surface"]:::magic
   end
-  subgraph FastAPI_ENTRYPOINTS[FastAPI ENTRYPOINTS]
-    B1[/chat/stream]
-    B2[/consumer/chat/stream]
-    B3[/sessions/*]
-    B4[/agents/*]
-    B5[/memory/*]
-    B6[/rag/*]
-    B7[/logs/*]
-    B8[/trace/*]
+
+  subgraph FastAPI_ENTRYPOINTS["🚪 API Gateways"]
+    B1["/chat/stream"]
+    B2["/consumer/chat/stream"]
   end
-  subgraph RunEngine[RunEngine (run_engine/engine.py)]
-    C1[PLAN]
-    C2[ACT]
-    C3[OBSERVE]
-    C4[VERIFY]
-    C5[COMMIT]
-    C6[Tool Loop +Hooks]
-    C7[Run Store ledger]
-    C8[Side-effect guard]
-    C9[Memory Pipeline (facts/voids/candid.)]
+
+  subgraph RunEngine["⚙️ Autonomous Loop (The Engine)"]
+    direction TB
+    C1{"1. PLAN"} --> C2("2. ACT") --> C3{"3. OBSERVE"} --> C4("4. VERIFY") --> C5[/"5. COMMIT"/]:::magic
+    
+    C2 -.-> C6["Tool Sandbox"]
+    C4 -.-> C8["🛡️ Side-Effect Guard<br/>(Trust & Correctness)"]:::guard
+    C5 -.-> C9["🧠 Convergent Memory Pipeline<br/>(Retention & Wow-Factor)"]:::magic
   end
-  subgraph CONTEXT_GOVERNOR[CONTEXT GOVERNOR (engine/context_governor.py)]
-    D1[ContextEngineV3 — Unified Convergent Memory]
-    D2[compile_context_items() — engine/context_compiler.py]
+
+  subgraph CONTEXT_GOVERNOR["🧠 Context Governor (The Secret Sauce)"]
+    D1["ContextEngineV3<br/>Phase-Aware Packet Compiler"]:::tech
+    D2["Semantic Resonance & Fact Routing"]:::tech
   end
-  subgraph CONTEXT_LANES[CONTEXT LANES]
-    E1[runtime_metadata]
-    E2[core_instruction]
-    E3[active_skill]
-    E4[current_objective]
-    E5[meta_context]
-    E6[loop_contract]
-    E7[session_anchor]
-    E8[deterministic_facts]
-    E9[phase_guidance]
-    E10[candidate_context]
-    E11[conversation_tension]
-    E12[observation_state]
-    E13[working_evidence]
-    E14[working_state]
-    E15[historical_context]
+
+  subgraph STORAGE_TOPOLOGY["🗄️ Storage & Knowledge Graph"]
+    direction LR
+    F1[("SQLite<br/>Ledgers")]:::storage
+    F6[("Memory Graph<br/>(Facts & Voids)")]:::storage
+    F8[("Vector DB<br/>(Chroma)")]:::storage
   end
-  subgraph STORAGE_TOPOLOGY[STORAGE TOPOLOGY]
-    F1[sessions.db]
-    F2[consumer_sessions.db]
-    F3[agents.db]
-    F4[runs.db]
-    F5[tool_results.db]
-    F6[memory_graph.db]
-    F7[chroma_db/]
-    F8[data/chroma/]
-    F9[logs/tool_audit.jsonl + trace_index.jsonl + payload blobs]
+
+  subgraph PROVIDERS["☁️ Model Agnostic"]
+    G1["Local: Ollama, MLX"]
+    G2["Cloud: OpenAI, Anthropic, Gemini"]
   end
-  subgraph PROVIDERS[PROVIDERS (llm/adapter_factory.py)]
-    G1[Local: Ollama, LM Studio, llama.cpp, local OpenAI-compat]
-    G2[Cloud: OpenAI, Anthropic, Groq, Gemini, NVIDIA]
-    G3[Unified embedding transport (/api/embed + /v1/embeddings)]
-  end
-  A1 --> B1
-  A2 --> B2
-  B1 --> C1
-  B2 --> C1
-  B3 --> C1
-  B4 --> C1
-  B5 --> C1
-  B6 --> C1
-  B7 --> C1
-  B8 --> C1
-  C1 --> C2 --> C3 --> C4 --> C5
-  C2 --> C6
-  C3 --> C7
-  C4 --> C8
-  C5 --> C9
-  C9 --> D1
-  D1 --> D2
-  D2 --> E1
-  D2 --> E2
-  D2 --> E3
-  D2 --> E4
-  D2 --> E5
-  D2 --> E6
-  D2 --> E7
-  D2 --> E8
-  D2 --> E9
-  D2 --> E10
-  D2 --> E11
-  D2 --> E12
-  D2 --> E13
-  D2 --> E14
-  D2 --> E15
-  E1 --> F1
-  E2 --> F2
-  E3 --> F3
-  E4 --> F4
-  E5 --> F5
-  E6 --> F6
-  E7 --> F7
-  E8 --> F8
-  E9 --> F9
-  F1 --> G1
-  F2 --> G2
-  F3 --> G3
+
+  %% Flow
+  A1 -->|Admin| B1
+  A2 -->|End-User| B2
+  B1 & B2 --> RunEngine
+  
+  C9 --> CONTEXT_GOVERNOR
+  CONTEXT_GOVERNOR --> STORAGE_TOPOLOGY
+  STORAGE_TOPOLOGY --> PROVIDERS
 ```
 
 ### Phase packet flow (one turn, end-to-end)

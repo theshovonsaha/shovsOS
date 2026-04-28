@@ -158,7 +158,7 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   setContextModel,
   embedModel,
   setEmbedModel: _setEmbedModel,
-  contextMode,
+  contextMode: _contextMode,
   setSessionContextMode: _setSessionContextMode,
   clearSessionContext,
   showPlannerLog,
