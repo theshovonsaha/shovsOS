@@ -28,118 +28,114 @@ Five things make this different from a prompt wrapper:
 
 ## Architecture (real, not aspirational)
 
-```
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                               FRONTEND PLANES                                 │
-│  ┌─────────────────────────────────┐    ┌────────────────────────────────┐    │
-│  │  frontend_shovs                  │    │  frontend_consumer             │    │
-│  │  operator workspace, agent      │    │  end-user chat surface         │    │
-│  │  builder, monitor, options      │    │  (managed runtime, narrowed)   │    │
-│  └────────────────┬────────────────┘    └───────────────┬────────────────┘    │
-└──────────────────────────────────────────────────────────────────────────────┘
-                   │                                        │
-                   ▼                                        ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                           FastAPI ENTRYPOINTS                                 │
-│  /chat/stream    /consumer/chat/stream    /sessions/*    /agents/*            │
-│  /memory/*       /rag/*                   /logs/*        /trace/*             │
-│  → owner-scoped, SSE-streamed, single managed runtime spine                   │
-└────────────────────────────────────┬─────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                       RunEngine  (run_engine/engine.py)                       │
-│                       canonical managed runtime                               │
-│                                                                               │
-│   ┌─────────┐   ┌────────┐   ┌────────────┐   ┌─────────┐   ┌────────────┐    │
-│   │ PLAN    │──▶│  ACT   │──▶│  OBSERVE   │──▶│ VERIFY  │──▶│  COMMIT    │    │
-│   └─────────┘   └────────┘   └────────────┘   └─────────┘   └────────────┘    │
-│        ▲             │              │              │              │           │
-│        │             ▼              ▼              ▼              ▼           │
-│        │        ┌─────────┐   ┌──────────┐   ┌─────────┐   ┌──────────┐       │
-│        │        │  Tool   │   │ Run      │   │ Side-   │   │ Memory   │       │
-│        │        │ Loop    │   │ Store    │   │ effect  │   │ Pipeline │       │
-│        │        │ +Hooks  │   │ ledger   │   │ guard   │   │ (facts/  │       │
-│        │        └─────────┘   └──────────┘   └─────────┘   │ voids/   │       │
-│        │                                                    │ candid.) │       │
-│        │                                                    └──────────┘       │
-│        │                                                                       │
-│        └────── PacketBuildInputs ──── build_phase_packet() ──┐                │
-│                                                              │                │
-└──────────────────────────────────────────────────────────────┼────────────────┘
-                                                               ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│             CONTEXT GOVERNOR  (engine/context_governor.py)                    │
-│             one engine, four streams, per-phase compilation                   │
-│                                                                               │
-│  ┌─────────────────────────────────────────────────────────────────────┐      │
-│  │  ContextEngineV3 — Unified Convergent Memory                        │      │
-│  │   1. Linear lane          recent turns verbatim (sliding window)    │      │
-│  │   2. Compression          older exchanges → durable bullets (V1)    │      │
-│  │   3. Convergent ranking   active goals + module registry (V2)       │      │
-│  │   4. Resonance            theme lift on confidently-relevant mods   │      │
-│  │                                                                     │      │
-│  │  Knobs: durable_cap=8  convergent_top_n=12  resonance_weight=0.15   │      │
-│  └─────────────────────────────────────────────────────────────────────┘      │
-│                                  │                                            │
-│                                  ▼                                            │
-│  ┌─────────────────────────────────────────────────────────────────────┐      │
-│  │  compile_context_items()  — engine/context_compiler.py              │      │
-│  │  Reads ContextItem.phase_visibility, priority, max_chars            │      │
-│  │  Emits per-phase compiled packet + included/excluded trace          │      │
-│  └─────────────────────────────────────────────────────────────────────┘      │
-└───────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                              CONTEXT LANES                                    │
-│    (priority order — lower = closer to top of the prompt)                     │
-│                                                                               │
-│   10  runtime_metadata       model, session, turn count                       │
-│   20  core_instruction       agent system prompt                              │
-│   25  active_skill           SKILL.md (PLANNING + ACTING only, TTL=1)         │
-│   30  current_objective      effective user goal                              │
-│   31  meta_context           verification posture, falsifier, probe rule      │
-│   32  loop_contract          tool budget, execution risk tier                 │
-│   35  session_anchor         first message, turn count                        │
-│   36  deterministic_facts    hardened temporal facts (voided when superseded) │
-│   40  phase_guidance         acting/response rules + code intent note         │
-│   41  candidate_context      weak signals, not yet hardened                   │
-│   42  conversation_tension   contradictions + challenge calibration           │
-│   43  observation_state      loop status, evidence posture                    │
-│   44  working_evidence       tool results from this run                       │
-│   45  working_state          task list, objectives                            │
-│   55  historical_context     scored durable anchors from prior sessions       │
-│                                                                               │
-│   Each item carries: source, trace_id, provenance, phase_visibility,          │
-│   max_chars, formatted-flag. Compilation is traceable end-to-end.             │
-└───────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                            STORAGE TOPOLOGY                                   │
-│                                                                               │
-│   sessions.db          session state, sliding window, compressed_context      │
-│   consumer_sessions.db consumer-plane sessions                                │
-│   agents.db            profiles + dashboard config                            │
-│   runs.db              run identity, pass ledger, checkpoints, artifacts      │
-│   tool_results.db      raw tool result archive                                │
-│   memory_graph.db      temporal facts, voids, loci registry, vectors          │
-│   chroma_db/           vector memory + RAG chunks                             │
-│   data/chroma/         per-session RAG                                        │
-│   logs/tool_audit.jsonl + trace_index.jsonl + payload blobs                   │
-└───────────────────────────────────────────────────────────────────────────────┘
-                                     │
-                                     ▼
-┌───────────────────────────────────────────────────────────────────────────────┐
-│                    PROVIDERS  (llm/adapter_factory.py)                        │
-│                                                                               │
-│   Local           Ollama  ·  LM Studio  ·  llama.cpp  ·  local OpenAI-compat  │
-│   Cloud           OpenAI  ·  Anthropic  ·  Groq  ·  Gemini  ·  NVIDIA         │
-│                                                                               │
-│   All stream tokens, support reasoning models (o1/gpt-5/deepseek-r1/...),     │
-│   carry an unified embedding transport (/api/embed + /v1/embeddings).         │
-└───────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+  subgraph FRONTEND_PLANES[FRONTEND PLANES]
+    A1[frontend_shovs: operator workspace, agent builder, monitor, options]
+    A2[frontend_consumer: end-user chat surface (managed runtime, narrowed)]
+  end
+  subgraph FastAPI_ENTRYPOINTS[FastAPI ENTRYPOINTS]
+    B1[/chat/stream]
+    B2[/consumer/chat/stream]
+    B3[/sessions/*]
+    B4[/agents/*]
+    B5[/memory/*]
+    B6[/rag/*]
+    B7[/logs/*]
+    B8[/trace/*]
+  end
+  subgraph RunEngine[RunEngine (run_engine/engine.py)]
+    C1[PLAN]
+    C2[ACT]
+    C3[OBSERVE]
+    C4[VERIFY]
+    C5[COMMIT]
+    C6[Tool Loop +Hooks]
+    C7[Run Store ledger]
+    C8[Side-effect guard]
+    C9[Memory Pipeline (facts/voids/candid.)]
+  end
+  subgraph CONTEXT_GOVERNOR[CONTEXT GOVERNOR (engine/context_governor.py)]
+    D1[ContextEngineV3 — Unified Convergent Memory]
+    D2[compile_context_items() — engine/context_compiler.py]
+  end
+  subgraph CONTEXT_LANES[CONTEXT LANES]
+    E1[runtime_metadata]
+    E2[core_instruction]
+    E3[active_skill]
+    E4[current_objective]
+    E5[meta_context]
+    E6[loop_contract]
+    E7[session_anchor]
+    E8[deterministic_facts]
+    E9[phase_guidance]
+    E10[candidate_context]
+    E11[conversation_tension]
+    E12[observation_state]
+    E13[working_evidence]
+    E14[working_state]
+    E15[historical_context]
+  end
+  subgraph STORAGE_TOPOLOGY[STORAGE TOPOLOGY]
+    F1[sessions.db]
+    F2[consumer_sessions.db]
+    F3[agents.db]
+    F4[runs.db]
+    F5[tool_results.db]
+    F6[memory_graph.db]
+    F7[chroma_db/]
+    F8[data/chroma/]
+    F9[logs/tool_audit.jsonl + trace_index.jsonl + payload blobs]
+  end
+  subgraph PROVIDERS[PROVIDERS (llm/adapter_factory.py)]
+    G1[Local: Ollama, LM Studio, llama.cpp, local OpenAI-compat]
+    G2[Cloud: OpenAI, Anthropic, Groq, Gemini, NVIDIA]
+    G3[Unified embedding transport (/api/embed + /v1/embeddings)]
+  end
+  A1 --> B1
+  A2 --> B2
+  B1 --> C1
+  B2 --> C1
+  B3 --> C1
+  B4 --> C1
+  B5 --> C1
+  B6 --> C1
+  B7 --> C1
+  B8 --> C1
+  C1 --> C2 --> C3 --> C4 --> C5
+  C2 --> C6
+  C3 --> C7
+  C4 --> C8
+  C5 --> C9
+  C9 --> D1
+  D1 --> D2
+  D2 --> E1
+  D2 --> E2
+  D2 --> E3
+  D2 --> E4
+  D2 --> E5
+  D2 --> E6
+  D2 --> E7
+  D2 --> E8
+  D2 --> E9
+  D2 --> E10
+  D2 --> E11
+  D2 --> E12
+  D2 --> E13
+  D2 --> E14
+  D2 --> E15
+  E1 --> F1
+  E2 --> F2
+  E3 --> F3
+  E4 --> F4
+  E5 --> F5
+  E6 --> F6
+  E7 --> F7
+  E8 --> F8
+  E9 --> F9
+  F1 --> G1
+  F2 --> G2
+  F3 --> G3
 ```
 
 ### Phase packet flow (one turn, end-to-end)
