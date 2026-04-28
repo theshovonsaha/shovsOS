@@ -44,6 +44,7 @@ flowchart TD
   subgraph FastAPI_ENTRYPOINTS["🚪 API Gateways"]
     B1["/chat/stream"]
     B2["/consumer/chat/stream"]
+    B3["/sessions/* · /agents/* · /memory/* · /rag/*"]
   end
 
   subgraph RunEngine["⚙️ Autonomous Loop (The Engine)"]
@@ -56,8 +57,9 @@ flowchart TD
   end
 
   subgraph CONTEXT_GOVERNOR["🧠 Context Governor (The Secret Sauce)"]
-    D1["ContextEngineV3<br/>Phase-Aware Packet Compiler"]:::tech
-    D2["Semantic Resonance & Fact Routing"]:::tech
+    D1["ContextEngineV3 — Unified Convergent Memory"]:::tech
+    D2["Phase-Aware Packet Compiler"]:::tech
+    D1 --> D2
   end
 
   subgraph STORAGE_TOPOLOGY["🗄️ Storage & Knowledge Graph"]
@@ -68,18 +70,22 @@ flowchart TD
   end
 
   subgraph PROVIDERS["☁️ Model Agnostic"]
-    G1["Local: Ollama, MLX"]
+    G1["Local: Ollama, MLX, llama.cpp"]
     G2["Cloud: OpenAI, Anthropic, Gemini"]
+    G3["Unified embedding transport"]
+    G3 --> G1 & G2
   end
 
   %% Flow
   A1 -->|Admin| B1
   A2 -->|End-User| B2
-  B1 & B2 --> RunEngine
+  B1 & B2 & B3 --> RunEngine
   
-  C9 --> CONTEXT_GOVERNOR
-  CONTEXT_GOVERNOR --> STORAGE_TOPOLOGY
-  STORAGE_TOPOLOGY --> PROVIDERS
+  RunEngine -->|Drives| PROVIDERS
+  RunEngine -->|Persists| STORAGE_TOPOLOGY
+  
+  CONTEXT_GOVERNOR -->|Reads| STORAGE_TOPOLOGY
+  RunEngine -->|Assembles Packet via| CONTEXT_GOVERNOR
 ```
 
 ### Phase packet flow (one turn, end-to-end)
@@ -218,7 +224,7 @@ Embedding transport auto-detects `/api/embed` (current Ollama) and `/api/embeddi
 ## Repository map
 
 ```
-agent/
+shovsOS/
 ├── api/                    FastAPI routes  (main.py, consumer_routes.py, owner.py, ...)
 ├── engine/                 Context, schema, compiler, governor, fact guard, side-effect guard
 │   ├── context_engine_v3.py    Unified convergent memory engine
