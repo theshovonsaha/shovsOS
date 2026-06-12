@@ -39,6 +39,14 @@ const SAFE_SVG_PREVIEW_CONFIG = {
     FORBID_ATTR: FORBIDDEN_PREVIEW_ATTRIBUTES,
 };
 
+const copyText = async (value: string) => {
+    try {
+        await navigator.clipboard.writeText(value);
+    } catch {
+        // Clipboard can be unavailable in sandboxed or insecure contexts.
+    }
+};
+
 const buildPreviewDocument = (language: string, sanitizedMarkup: string) => {
     if (language === 'svg') {
         return [
@@ -92,6 +100,27 @@ const normalizeLLMMarkdown = (content: string) => {
     return normalized.trim();
 };
 
+const splitThoughtSegments = (sanitizedContent: string): { type: 'thought' | 'content', text: string }[] => {
+    const parts: { type: 'thought' | 'content', text: string }[] = [];
+    const regex = /<(THOUGHT|think)>([\s\S]*?)<\/\1>/gi;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(sanitizedContent)) !== null) {
+        if (match.index > lastIndex) {
+            parts.push({ type: 'content', text: sanitizedContent.substring(lastIndex, match.index) });
+        }
+        parts.push({ type: 'thought', text: match[2].trim() });
+        lastIndex = regex.lastIndex;
+    }
+
+    if (lastIndex < sanitizedContent.length) {
+        parts.push({ type: 'content', text: sanitizedContent.substring(lastIndex) });
+    }
+
+    return parts.length > 0 ? parts : [{ type: 'content', text: sanitizedContent }];
+};
+
 const StructuredPanel: React.FC<StructuredPanelProps> = ({
     title,
     subtitle,
@@ -133,6 +162,54 @@ const StructuredPanel: React.FC<StructuredPanelProps> = ({
     );
 };
 
+const SearchResultCard: React.FC<{ result: WebSearchResult; index: number }> = ({ result, index }) => {
+    const [expanded, setExpanded] = useState(false);
+    const hostname = (() => {
+        try {
+            return new URL(result.url).hostname.replace(/^www\./, '');
+        } catch {
+            return result.url;
+        }
+    })();
+
+    return (
+        <div className={`search-card ${expanded ? 'expanded' : ''}`}>
+            <div className="search-card-head">
+                <div className="search-card-rank">{index + 1}</div>
+                <div className="search-card-main">
+                    <a href={result.url} target="_blank" rel="noreferrer" className="search-card-title">
+                        {result.title || 'Untitled source'}
+                    </a>
+                    <div className="search-card-url">{hostname}</div>
+                </div>
+                <div className="search-card-actions">
+                    <button className="structured-panel-btn" onClick={() => setExpanded(prev => !prev)}>
+                        {expanded ? 'Less' : 'Details'}
+                    </button>
+                    <button className="structured-panel-btn secondary" onClick={() => void copyText(result.url)}>
+                        Copy
+                    </button>
+                </div>
+            </div>
+            <div className="search-card-snippet">
+                {expanded ? result.snippet : `${result.snippet.slice(0, 190)}${result.snippet.length > 190 ? '...' : ''}`}
+            </div>
+            {expanded ? (
+                <div className="search-card-detail-grid">
+                    <div>
+                        <span>source</span>
+                        <strong>{hostname}</strong>
+                    </div>
+                    <div>
+                        <span>url</span>
+                        <strong>{result.url}</strong>
+                    </div>
+                </div>
+            ) : null}
+        </div>
+    );
+};
+
 export const RichContentViewer: React.FC<RichContentViewerProps> = ({ content }) => {
     // Sanitize content to handle common LLM output issues that break KaTeX
     const sanitizedContent = normalizeLLMMarkdown(content)
@@ -147,24 +224,32 @@ export const RichContentViewer: React.FC<RichContentViewerProps> = ({ content })
     // Check if the content is a JSON result from tools
     const renderData = tryParseStructuredContent(sanitizedContent);
 
+    const segments = splitThoughtSegments(sanitizedContent);
+
     if (renderData && renderData.type === 'web_search_results') {
         const results = Array.isArray(renderData.results) ? renderData.results as WebSearchResult[] : [];
+        const domains = Array.from(new Set(results.map((result) => {
+            try {
+                return new URL(result.url).hostname.replace(/^www\./, '');
+            } catch {
+                return '';
+            }
+        }).filter(Boolean)));
         return (
             <StructuredPanel
                 title="Web search sources"
                 subtitle={renderData.query ? `Query: ${renderData.query}` : undefined}
-                summary={`${results.length} result${results.length === 1 ? '' : 's'} collected`}
+                summary={`${results.length} result${results.length === 1 ? '' : 's'} collected${domains.length ? ` across ${domains.length} source${domains.length === 1 ? '' : 's'}` : ''}`}
                 rawContent={JSON.stringify(renderData, null, 2)}
             >
+                <div className="search-evidence-strip">
+                    <span>{results.length} results</span>
+                    <span>{domains.slice(0, 3).join(' · ') || 'sources not recorded'}</span>
+                    {domains.length > 3 ? <span>+{domains.length - 3} more</span> : null}
+                </div>
                 <div className="search-results-viewer">
                     {results.map((r: WebSearchResult, i: number) => (
-                        <div key={`${i}-${r.url}`} className="search-card">
-                            <a href={r.url} target="_blank" rel="noreferrer" className="search-card-title">
-                                {r.title}
-                            </a>
-                            <div className="search-card-url">{r.url}</div>
-                            <div className="search-card-snippet">{r.snippet}</div>
-                        </div>
+                        <SearchResultCard key={`${i}-${r.url}`} result={r} index={i} />
                     ))}
                 </div>
             </StructuredPanel>
@@ -186,8 +271,16 @@ export const RichContentViewer: React.FC<RichContentViewerProps> = ({ content })
                     {renderData.error ? (
                         <div className="fetch-result-error">Error: {renderData.error}</div>
                     ) : (
-                        <div className="fetch-result-content">
-                            {rawFetchContent}
+                        <div className="fetch-result-shell">
+                            <div className="fetch-result-toolbar">
+                                <span>{renderData.truncated ? 'truncated' : 'complete'}</span>
+                                <button className="structured-panel-btn secondary" onClick={() => void copyText(rawFetchContent)}>
+                                    Copy text
+                                </button>
+                            </div>
+                            <div className="fetch-result-content">
+                                {rawFetchContent}
+                            </div>
                             {renderData.truncated && (
                                 <div className="fetch-result-note">
                                     Content truncated ({renderData.total_length} chars total)
@@ -275,28 +368,6 @@ export const RichContentViewer: React.FC<RichContentViewerProps> = ({ content })
             </div>
         );
     }
-
-    // Segment the content into thought and response blocks
-    const segments = useMemo(() => {
-        const parts: { type: 'thought' | 'content', text: string }[] = [];
-        const regex = /<(THOUGHT|think)>([\s\S]*?)<\/\1>/gi;
-        let lastIndex = 0;
-        let match;
-
-        while ((match = regex.exec(sanitizedContent)) !== null) {
-            if (match.index > lastIndex) {
-                parts.push({ type: 'content', text: sanitizedContent.substring(lastIndex, match.index) });
-            }
-            parts.push({ type: 'thought', text: match[2].trim() });
-            lastIndex = regex.lastIndex;
-        }
-        
-        if (lastIndex < sanitizedContent.length) {
-            parts.push({ type: 'content', text: sanitizedContent.substring(lastIndex) });
-        }
-        
-        return parts.length > 0 ? parts : [{ type: 'content', text: sanitizedContent }];
-    }, [sanitizedContent]);
 
     return (
         <div className="rich-content-viewer">

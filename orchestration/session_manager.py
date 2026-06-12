@@ -53,6 +53,7 @@ class Session:
     message_count:       int = 0
     context_mode:        str = "v1"
     last_active_skill:   Optional[str] = None  # Sticky planner hint — last skill picked on this session
+    continuation_state:  dict = field(default_factory=dict)
     _interrupted:        bool = False # Transient interrupt signal  # "v1" (linear) | "v2" (convergent) | "v3" (hybrid)
 
 
@@ -86,7 +87,8 @@ class SessionManager:
                     title TEXT,
                     first_message TEXT,
                     parent_id TEXT,
-                    message_count INTEGER
+                    message_count INTEGER,
+                    continuation_state_json TEXT
                 )
             ''')
             # Migrations for existing DBs
@@ -111,6 +113,9 @@ class SessionManager:
             try:
                 conn.execute("ALTER TABLE sessions ADD COLUMN candidate_signals_json TEXT")
             except sqlite3.OperationalError: pass
+            try:
+                conn.execute("ALTER TABLE sessions ADD COLUMN continuation_state_json TEXT")
+            except sqlite3.OperationalError: pass
             conn.commit()
 
     def _load_from_db(self):
@@ -130,6 +135,14 @@ class SessionManager:
         )
         full_history = self._normalize_history(json.loads(r["full_history"]))
         sliding_window = self._normalize_history(json.loads(r["sliding_window"]))
+        continuation_state = {}
+        if "continuation_state_json" in r.keys() and r["continuation_state_json"]:
+            try:
+                parsed_state = json.loads(r["continuation_state_json"])
+                if isinstance(parsed_state, dict):
+                    continuation_state = parsed_state
+            except Exception:
+                continuation_state = {}
         return Session(
             id=r["id"],
             agent_id=r["agent_id"] if "agent_id" in r.keys() else "default",
@@ -148,6 +161,7 @@ class SessionManager:
             parent_id=r["parent_id"] if "parent_id" in r.keys() else None,
             message_count=r["message_count"],
             context_mode=r["context_mode"] if "context_mode" in r.keys() else "v1",
+            continuation_state=continuation_state,
         )
 
     def _save_to_db(self, s: Session):
@@ -157,8 +171,8 @@ class SessionManager:
             conn.execute('''
                 INSERT OR REPLACE INTO sessions
                 (id, agent_id, owner_id, created_at, updated_at, model, system_prompt, compressed_context,
-                 candidate_context, candidate_signals_json, sliding_window, full_history, title, first_message, parent_id, message_count, context_mode)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 candidate_context, candidate_signals_json, sliding_window, full_history, title, first_message, parent_id, message_count, context_mode, continuation_state_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 s.id, s.agent_id, s.owner_id, s.created_at, s.updated_at, s.model, s.system_prompt,
                 s.compressed_context,
@@ -167,6 +181,7 @@ class SessionManager:
                 json.dumps(s.sliding_window),
                 json.dumps(s.full_history),
                 s.title, s.first_message, s.parent_id, s.message_count, s.context_mode,
+                json.dumps(s.continuation_state or {}),
             ))
             conn.commit()
 
@@ -329,6 +344,18 @@ class SessionManager:
             s.updated_at = datetime.now(timezone.utc).isoformat()
             self._save_to_db(s)
 
+    def update_continuation_state(self, session_id: str, state: dict, owner_id: Optional[str] = None):
+        if s := self.get(session_id, owner_id=owner_id):
+            s.continuation_state = dict(state or {})
+            s.updated_at = datetime.now(timezone.utc).isoformat()
+            self._save_to_db(s)
+
+    def clear_continuation_state(self, session_id: str, owner_id: Optional[str] = None):
+        if s := self.get(session_id, owner_id=owner_id):
+            s.continuation_state = {}
+            s.updated_at = datetime.now(timezone.utc).isoformat()
+            self._save_to_db(s)
+
     @staticmethod
     def _normalize_history(history: list[dict]) -> list[dict]:
         normalized: list[dict] = []
@@ -355,6 +382,7 @@ class SessionManager:
         s.compressed_context = ""
         s.candidate_signals = []
         s.candidate_context = ""
+        s.continuation_state = {}
         s.updated_at = datetime.now(timezone.utc).isoformat()
         self._save_to_db(s)
         return True

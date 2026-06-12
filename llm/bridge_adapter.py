@@ -108,7 +108,12 @@ class BridgeAdapter(BaseLLMAdapter):
         max_tokens: Optional[int] = None,
         images: Optional[list[str]] = None,
         tools: Optional[list[dict]] = None,
+        reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> str:
+        # Bridge handoff has no upstream provider — it just shuttles the
+        # request to a sidecar. ``reasoning_enabled`` is captured in the
+        # handoff payload for the receiver to honor (or ignore).
         request_id = uuid.uuid4().hex[:12]
         handoff = self._write_handoff(request_id, model, messages, temperature, tools)
         print(f"\n[BRIDGE] Handoff written: {handoff}")
@@ -124,6 +129,8 @@ class BridgeAdapter(BaseLLMAdapter):
         images: Optional[list[str]] = None,
         tools: Optional[list[dict]] = None,
         interrupt_check: Optional[object] = None,
+        reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> AsyncIterator[str]:
         # For streaming, use the same handoff mechanism but yield in chunks
         response = await self.complete(
@@ -133,6 +140,7 @@ class BridgeAdapter(BaseLLMAdapter):
             max_tokens=max_tokens,
             images=images,
             tools=tools,
+            reasoning_enabled=reasoning_enabled,
         )
         # Yield word-by-word to simulate streaming
         words = response.split(" ")

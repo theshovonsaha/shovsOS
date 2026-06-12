@@ -150,7 +150,7 @@ interface TraceMonitorProps {
   pendingConfirmation?: {
     call_id: string;
     tool: string;
-    arguments: Record<string, any>;
+    arguments: Record<string, unknown>;
     preview: string;
     reason: string;
     created_at?: string;
@@ -164,6 +164,15 @@ interface PacketSection {
   title: string;
   body: string;
 }
+
+type TraceSeverity =
+  | 'all'
+  | 'info'
+  | 'success'
+  | 'warning'
+  | 'error'
+  | 'retrying'
+  | 'blocked';
 
 const TRACE_PAGE_SIZE = 120;
 const VIEW_SCOPE_KEY = 'shovs_trace_scope';
@@ -216,6 +225,99 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
 }
 
+function tracePhase(event: TraceEventSummary): string {
+  const data =
+    event.data && typeof event.data === 'object'
+      ? (event.data as Record<string, unknown>)
+      : {};
+  const phase = String(data.phase || data.trace_phase || '').trim();
+  if (phase) return phase;
+  switch (event.event_type) {
+    case 'route_decision':
+    case 'plan':
+      return 'planning';
+    case 'phase_context':
+    case 'compiled_context':
+    case 'prompt_components':
+    case 'llm_prompt':
+      return 'context';
+    case 'llm_pass_start':
+    case 'llm_pass_complete':
+      return 'model';
+    case 'tool_call':
+    case 'tool_result':
+      return 'tool';
+    case 'verification_result':
+    case 'verification_warning':
+      return 'verification';
+    case 'assistant_response':
+      return 'response';
+    case 'memory_write_policy':
+    case 'memory_commit_plan':
+      return 'memory';
+    default:
+      return 'not recorded';
+  }
+}
+
+function traceSeverity(event: TraceEventSummary): Exclude<TraceSeverity, 'all'> {
+  const data =
+    event.data && typeof event.data === 'object'
+      ? (event.data as Record<string, unknown>)
+      : {};
+  const status = String(data.status || data.outcome || '').toLowerCase();
+  const eventType = event.event_type.toLowerCase();
+  const preview = String(event.preview || '').toLowerCase();
+  if (
+    eventType.includes('warning') ||
+    status.includes('warn') ||
+    preview.includes('warning')
+  )
+    return 'warning';
+  if (
+    eventType.includes('error') ||
+    status.includes('error') ||
+    status.includes('fail') ||
+    data.success === false
+  )
+    return 'error';
+  if (status.includes('blocked') || eventType.includes('blocked'))
+    return 'blocked';
+  if (status.includes('retry') || eventType.includes('redraft'))
+    return 'retrying';
+  if (
+    status.includes('complete') ||
+    status.includes('ok') ||
+    status.includes('success') ||
+    eventType === 'tool_result' ||
+    eventType === 'assistant_response' ||
+    eventType === 'verification_result'
+  )
+    return 'success';
+  return 'info';
+}
+
+function relatedTraceIds(event: TraceEventSummary): string[] {
+  const data =
+    event.data && typeof event.data === 'object'
+      ? (event.data as Record<string, unknown>)
+      : {};
+  return [
+    event.run_id ? `run ${event.run_id.slice(0, 10)}` : '',
+    event.session_id ? `session ${event.session_id.slice(0, 8)}` : '',
+    String(data.tool_name || data.tool || ''),
+    String(data.model || ''),
+  ].filter(Boolean) as string[];
+}
+
+async function copyText(value: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    // Clipboard can be unavailable in sandboxed or insecure contexts.
+  }
+}
+
 function isPromptMessage(
   item: unknown,
 ): item is { role?: string; content?: string } {
@@ -259,6 +361,9 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     const stored = localStorage.getItem(EVENT_FILTER_KEY) || 'all';
     return stored === 'story' ? 'all' : stored;
   });
+  const [phaseFilter, setPhaseFilter] = useState<string>('all');
+  const [severityFilter, setSeverityFilter] =
+    useState<TraceSeverity>('all');
   const [autoRefresh, setAutoRefresh] = useState<boolean>(
     () => localStorage.getItem(AUTO_REFRESH_KEY) !== 'false',
   );
@@ -293,21 +398,40 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
       eventType === 'all'
         ? events
         : events.filter((event) => event.event_type === eventType);
-    if (!search.trim()) return baseEvents;
+    const phaseEvents =
+      phaseFilter === 'all'
+        ? baseEvents
+        : baseEvents.filter((event) => tracePhase(event) === phaseFilter);
+    const severityEvents =
+      severityFilter === 'all'
+        ? phaseEvents
+        : phaseEvents.filter(
+            (event) => traceSeverity(event) === severityFilter,
+          );
+    if (!search.trim()) return severityEvents;
     const needle = search.trim().toLowerCase();
-    return baseEvents.filter((event) => {
+    return severityEvents.filter((event) => {
       const haystack = [
         event.event_type,
         event.session_id,
         event.agent_id,
+        event.run_id || '',
+        tracePhase(event),
+        traceSeverity(event),
         event.preview || '',
         describeShovsTraceEvent(event),
+        ...relatedTraceIds(event),
       ]
         .join(' ')
         .toLowerCase();
       return haystack.includes(needle);
     });
-  }, [eventType, events, search]);
+  }, [eventType, events, phaseFilter, search, severityFilter]);
+
+  const phaseOptions = useMemo(() => {
+    const phases = new Set(events.map(tracePhase));
+    return ['all', ...Array.from(phases).sort()];
+  }, [events]);
 
   const oldestTs = events.length ? events[events.length - 1].ts : undefined;
   const overview = useMemo(
@@ -596,7 +720,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     const included = (selectedEvent.data as Record<string, unknown>).included;
     if (!Array.isArray(included)) return [];
     return included.filter(
-      (item): item is Record<string, any> =>
+      (item): item is Record<string, unknown> =>
         typeof item === 'object' && item !== null,
     );
   }, [selectedEvent]);
@@ -660,6 +784,38 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                   {humanizeShovsTraceEvent(type)}
                 </option>
               ))}
+            </select>
+          </label>
+
+          <label className='trace-control compact'>
+            <span>phase</span>
+            <select
+              value={phaseFilter}
+              onChange={(e) => setPhaseFilter(e.target.value)}
+            >
+              {phaseOptions.map((phase) => (
+                <option key={phase} value={phase}>
+                  {phase}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className='trace-control compact'>
+            <span>status</span>
+            <select
+              value={severityFilter}
+              onChange={(e) =>
+                setSeverityFilter(e.target.value as TraceSeverity)
+              }
+            >
+              <option value='all'>all</option>
+              <option value='info'>info</option>
+              <option value='success'>success</option>
+              <option value='warning'>warning</option>
+              <option value='error'>error</option>
+              <option value='retrying'>retrying</option>
+              <option value='blocked'>blocked</option>
             </select>
           </label>
 
@@ -884,7 +1040,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                 filteredEvents.map((event) => (
                   <button
                     key={event.id}
-                    className={`trace-row ${selectedId === event.id ? 'active' : ''}`}
+                    className={`trace-row status-${traceSeverity(event)} ${selectedId === event.id ? 'active' : ''}`}
                     onClick={() => setSelectedId(event.id)}
                   >
                     <div className='trace-row-top'>
@@ -894,6 +1050,8 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                       <span className='t-time'>{formatTime(event.ts)}</span>
                     </div>
                     <div className='trace-row-meta'>
+                      <span>{traceSeverity(event)}</span>
+                      <span>{tracePhase(event)}</span>
                       <span>
                         pass{' '}
                         {typeof event.pass_index === 'number'
@@ -902,6 +1060,11 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                       </span>
                       <span>{formatBytes(event.size_bytes || 0)}</span>
                       <span>{event.payload_ref ? 'blob' : 'inline'}</span>
+                    </div>
+                    <div className='trace-row-meta related'>
+                      {relatedTraceIds(event).map((item) => (
+                        <span key={item}>{item}</span>
+                      ))}
                     </div>
                     <div className='trace-row-preview'>
                       {describeShovsTraceEvent(event)}
@@ -936,10 +1099,36 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             {selectedEvent && (
               <>
                 <div className='trace-detail-head'>
-                  <div className='trace-detail-title'>
-                    {humanizeShovsTraceEvent(selectedEvent.event_type)}
+                  <div className='trace-detail-main'>
+                    <div className='trace-detail-title'>
+                      {humanizeShovsTraceEvent(selectedEvent.event_type)}
+                    </div>
+                    <div className='trace-detail-actions'>
+                      <button
+                        className='trace-action'
+                        onClick={() => void copyText(selectedSummary)}
+                      >
+                        copy summary
+                      </button>
+                      <button
+                        className='trace-action'
+                        onClick={() => void copyText(eventJson || '{}')}
+                      >
+                        copy JSON
+                      </button>
+                      {selectedEvent.run_id ? (
+                        <button
+                          className='trace-action'
+                          onClick={() => setSearch(selectedEvent.run_id || '')}
+                        >
+                          jump to run
+                        </button>
+                      ) : null}
+                    </div>
                   </div>
                   <div className='trace-detail-meta'>
+                    <span>status: {traceSeverity(selectedEvent)}</span>
+                    <span>phase: {tracePhase(selectedEvent)}</span>
                     <span>session: {selectedEvent.session_id}</span>
                     <span>run: {selectedEvent.run_id || '--'}</span>
                     <span>agent: {selectedEvent.agent_id}</span>

@@ -111,6 +111,14 @@ const LEVEL_GLYPH: Record<string, string> = {
 
 const MAX_ENTRIES = 300;
 
+async function copyText(value: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(value);
+  } catch {
+    // Clipboard can be unavailable in sandboxed or insecure contexts.
+  }
+}
+
 function formatTime(ts: number): string {
   const d = new Date(ts * 1000);
   return (
@@ -265,6 +273,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({
     'overview',
   );
   const [filter, setFilter] = useState<string>('all');
+  const [levelFilter, setLevelFilter] = useState<string>('all');
   const [search, setSearch] = useState('');
   const [paused, setPaused] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -402,6 +411,7 @@ export const LogPanel: React.FC<LogPanelProps> = ({
 
   const filtered = entries.filter((entry) => {
     if (filter !== 'all' && entry.category !== filter) return false;
+    if (levelFilter !== 'all' && entry.level !== levelFilter) return false;
     if (!search) return true;
 
     const needle = search.toLowerCase();
@@ -524,6 +534,18 @@ export const LogPanel: React.FC<LogPanelProps> = ({
               onChange={(e) => setSearch(e.target.value)}
             />
           </div>
+          <select
+            className='log-level-select'
+            value={levelFilter}
+            onChange={(e) => setLevelFilter(e.target.value)}
+            aria-label='Filter logs by severity'
+          >
+            <option value='all'>all status</option>
+            <option value='info'>info</option>
+            <option value='ok'>success</option>
+            <option value='warn'>warning</option>
+            <option value='error'>error</option>
+          </select>
           <span className='log-count'>{filtered.length}</span>
         </div>
       ) : null}
@@ -709,9 +731,27 @@ const LogRow: React.FC<{ entry: LogEntry }> = React.memo(({ entry }) => {
           ›
         </div>
       )}
+      <button
+        className='log-row-copy'
+        onClick={(e) => {
+          e.stopPropagation();
+          void copyText(JSON.stringify(entry, null, 2));
+        }}
+        title='Copy log JSON'
+      >
+        copy
+      </button>
 
       {expanded && hasMeta && (
         <div className='log-meta' onClick={(e) => e.stopPropagation()}>
+          <div className='log-meta-actions'>
+            <button
+              className='log-btn'
+              onClick={() => void copyText(JSON.stringify(entry.meta, null, 2))}
+            >
+              copy meta
+            </button>
+          </div>
           {Object.entries(entry.meta).map(([key, value]) => (
             <div key={key} className='log-meta-row'>
               <span className='log-meta-key'>{key}</span>

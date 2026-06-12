@@ -16,6 +16,7 @@ Changes vs v1:
 import re
 from typing import Optional
 from llm.base_adapter import BaseLLMAdapter
+from llm.adapter_factory import create_adapter, strip_provider_prefix
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from engine.fact_guard import is_grounded_fact_record
 from config.config import cfg
@@ -133,9 +134,13 @@ class ContextEngine:
         use_model = model or self.compression_model
         cleaned_response = self._clean_response(assistant_response)
 
-        from llm.adapter_factory import create_adapter, strip_provider_prefix
-        current_adapter = create_adapter(provider=use_model) if ":" in use_model else self.adapter
-        clean_model = strip_provider_prefix(use_model)
+        if ":" in use_model:
+            provider_prefix = use_model.split(":", 1)[0].lower()
+            current_adapter = create_adapter(provider=provider_prefix)
+            clean_model = strip_provider_prefix(use_model)
+        else:
+            current_adapter = self.adapter
+            clean_model = use_model
 
         prompt = COMPRESSION_PROMPT.format(
             existing_context=current_context or "(empty — first exchange)",
@@ -268,9 +273,13 @@ class ContextEngine:
         return "\n".join(merged), keyed_facts, voids
 
     async def _recompress(self, context: str, model: str) -> list[str]:
-        from llm.adapter_factory import create_adapter, strip_provider_prefix
-        current_adapter = create_adapter(provider=model) if ":" in model else self.adapter
-        clean_model = strip_provider_prefix(model)
+        if ":" in model:
+            provider_prefix = model.split(":", 1)[0].lower()
+            current_adapter = create_adapter(provider=provider_prefix)
+            clean_model = strip_provider_prefix(model)
+        else:
+            current_adapter = self.adapter
+            clean_model = model
 
         try:
             result = await current_adapter.complete(

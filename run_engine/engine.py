@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import inspect
+import asyncio
 import json
 import re
 from typing import Any, AsyncIterator, Optional
 
 from config.logger import log
 from engine.candidate_signals import extract_stance_signals
-from engine.conversation_tension import analyze_conversation_tension
+from engine.conversation_tension import analyze_conversation_tension, conversation_tension_audit_payload
 from engine.tokenization import get_token_encoding as _get_token_encoding
 from engine.context_schema import ContextPhase
 from engine.context_governor import ContextGovernor
@@ -22,12 +23,13 @@ from engine.tool_contract import (
     enrich_tool_result_content,
     format_tool_result_line,
     is_retry_sensitive_tool,
+    shape_tool_result_for_actor,
     summarize_tool_results,
     tool_call_signature,
 )
 from llm.adapter_factory import create_adapter, strip_provider_prefix
 from plugins.hook_registry import hooks
-from llm.base_adapter import BaseLLMAdapter
+from llm.base_adapter import BaseLLMAdapter, RateLimitError
 from memory.semantic_graph import SemanticGraph
 from orchestration.orchestrator import AgenticOrchestrator
 from orchestration.run_store import RunStore
@@ -55,6 +57,29 @@ from run_engine.tool_selection import (
 from run_engine.types import CompiledPassPacket, RunEngineRequest
 
 
+async def _stream_with_rate_limit_retry(
+    adapter,
+    *,
+    model: str,
+    messages: list[dict],
+    **kwargs,
+) -> AsyncIterator[str | dict[str, Any]]:
+    try:
+        async for chunk in adapter.stream(model=model, messages=messages, **kwargs):
+            yield chunk
+    except RateLimitError as exc:
+        match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(exc), re.IGNORECASE)
+        wait = float(match.group(1)) if match else 10.0
+        wait = min(wait, 60.0)
+        yield {
+            "type": "activity_short",
+            "text": f"Rate limit hit, waiting {wait:.0f}s before retry...",
+        }
+        await asyncio.sleep(wait)
+        async for chunk in adapter.stream(model=model, messages=messages, **kwargs):
+            yield chunk
+
+
 TOOL_ACTOR_PROMPT = """\
 You are the Shovs Run Engine actor.
 
@@ -65,8 +90,8 @@ Rules:
 - The allowed tools are real and available in this runtime right now.
 - Prefer the smallest useful next action.
 - For current or time-sensitive requests such as latest, current, today, news, prices, or market data, use an allowed web_search tool instead of saying you cannot browse.
-- When the user says "search", "find", "look up", "fetch", "gather", or "investigate", always use a tool. Do not ask for clarification.
-- Do not ask clarifying questions. If the objective can be advanced by a tool call, make the call.
+- If the objective is ambiguous, underspecified, or contradicts existing memory, DO NOT guess. Stop calling tools so you can ask the user a clarifying question.
+- If the objective is clear and can be advanced by a tool call, make the call. Do not ask unnecessary questions.
 - Preserve exact user entities, domains, URLs, file names, and keywords.
 - If a direct URL already exists in the context or signals, use it exactly — do not invent a new one.
 - Use only the allowed tools.
@@ -110,7 +135,9 @@ FINAL_RESPONSE_PROMPT = """\
 You are Shovs, operating inside the canonical Run Engine.
 
 Rules:
-- Answer the user directly using the evidence gathered in this run.
+- Answer the user directly using the evidence gathered in this run and your active memory context.
+- Maintain a coherent, natural conversational flow. Acknowledge the user's intent, provide context for your answers, and demonstrate understanding of the ongoing dialogue.
+- If the objective is ambiguous, underspecified, or missing key details, ask clear, pointed questions to resolve the ambiguity before proceeding.
 - If tools were available earlier in this run, do not claim you lack browsing or tool access.
 - Do not mention hidden planning, phase names, checkpoints, or internal protocol.
 - Do not fabricate completed actions, tool results, URLs, or files.
@@ -121,6 +148,88 @@ Rules:
 
 
 _REDRAFT_ISSUE_THRESHOLD = 2
+
+
+def _should_finalize(
+    observation_status: str,
+    plan_steps: list[dict[str, Any]],
+    tool_turn: int,
+    max_tool_calls: Optional[int],
+    session_id: str,
+    task_tracker=None,
+) -> tuple[bool, str]:
+    """Decide whether the run should finalize this turn.
+
+    Returns ``(should_finalize, reason)`` — reason is always logged into
+    the trace and surfaced in the partial-completion event when finalize
+    is forced by a hard cap. Reasons follow a fixed vocabulary so callers
+    can route on ``startswith``:
+
+    * ``no_plan_steps`` — backward compatible path; observation alone decides
+    * ``clean_finalize`` — observation says finalize, no pending steps, no open todos
+    * ``observation_driven`` — fallback when plan_steps complete but observation drove the call
+    * ``pending_steps:[ids]`` — gate refuses finalize because steps remain
+    * ``open_todos`` — gate refuses finalize because TaskTracker has active tasks
+    * ``max_tool_calls_reached:N_steps_pending`` — hard cap forces finalize anyway
+    """
+    if not plan_steps:
+        return observation_status == "finalize", "no_plan_steps"
+
+    pending = [s for s in plan_steps if s.get("status") == "pending"]
+
+    # Hard cap reached — always finalize, but flag pending steps so the
+    # response phase can be honest about what was not completed.
+    if max_tool_calls is not None and tool_turn >= max_tool_calls:
+        return True, f"max_tool_calls_reached:{len(pending)}_steps_pending"
+
+    # Cross-turn TaskTracker open todos. Best-effort — treat tracker errors
+    # as "no open todos" so a misbehaving tracker can't deadlock the loop.
+    open_todos = False
+    if task_tracker is not None and session_id:
+        try:
+            open_todos = bool(task_tracker.has_active_tasks(session_id))
+        except Exception:
+            open_todos = False
+
+    if observation_status == "finalize" and not pending and not open_todos:
+        return True, "clean_finalize"
+
+    if pending:
+        ids = [str(s.get("id") or "") for s in pending][:6]
+        return False, f"pending_steps:{ids}"
+
+    if open_todos:
+        return False, "open_todos"
+
+    return observation_status == "finalize", "observation_driven"
+
+
+def _update_plan_step(
+    plan_steps: list[dict[str, Any]],
+    tool_name: str,
+    success: bool,
+    *,
+    hard_failure: bool = False,
+) -> Optional[str]:
+    """Match the next pending plan_step for ``tool_name`` and update status.
+
+    Returns the step id that was updated (for tracing) or None if no match.
+    The matcher takes the FIRST pending step whose tool field equals
+    ``tool_name`` — order of plan_steps is the planner's stated execution
+    order, so this preserves intent.
+    """
+    if not plan_steps or not tool_name:
+        return None
+    target_status = "failed" if (hard_failure or not success) else "done"
+    for step in plan_steps:
+        if (
+            isinstance(step, dict)
+            and step.get("tool") == tool_name
+            and step.get("status") == "pending"
+        ):
+            step["status"] = target_status
+            return str(step.get("id") or "")
+    return None
 # Confidence below this triggers a redraft even when issue count is sub-threshold.
 # Picked at 0.4 because the verifier defaults to 0.5 on parse-failure / no-info,
 # so we only redraft when it's actively expressing low trust in the answer.
@@ -147,6 +256,73 @@ def _build_redraft_constraints(*, issues: list[str], side_effect_tripped: bool) 
         "- Do not repeat the previous unsupported claims.\n"
         "- Be direct and concise."
     )
+
+
+def _build_continuation_state_payload(
+    *,
+    reason: str,
+    effective_objective: str,
+    run_id: str,
+    plan_steps: list[dict[str, Any]],
+    missing_slots: list[str],
+    strategy: str,
+    notes: str,
+    tool_results: list[dict[str, Any]],
+    issues: Optional[list[str]] = None,
+    target_state: str = "",
+) -> dict[str, Any]:
+    incomplete_steps = [
+        {
+            "id": str(step.get("id") or ""),
+            "description": str(step.get("description") or ""),
+            "tool": step.get("tool"),
+            "status": str(step.get("status") or "pending"),
+            "risk": str(step.get("risk") or "read_only"),
+        }
+        for step in (plan_steps or [])
+        if isinstance(step, dict)
+        and str(step.get("status") or "pending") not in {"done", "completed", "skipped"}
+    ][:6]
+    clean_missing = [str(item).strip() for item in (missing_slots or []) if str(item).strip()][:6]
+    clean_issues = [str(item).strip() for item in (issues or []) if str(item).strip()][:6]
+    if not incomplete_steps and not clean_missing and not clean_issues and not target_state:
+        return {}
+
+    next_action = ""
+    if clean_missing:
+        next_action = f"Gather missing data: {clean_missing[0]}"
+    elif incomplete_steps:
+        first = incomplete_steps[0]
+        desc = str(first.get("description") or "").strip()
+        tool = str(first.get("tool") or "").strip()
+        next_action = f"Run {tool}: {desc}" if tool else desc
+    elif clean_issues:
+        next_action = f"Resolve verification issue: {clean_issues[0]}"
+    elif target_state:
+        next_action = f"Replan toward target state: {target_state}"
+
+    evidence_summary = [
+        format_tool_result_line(item, preview_chars=140, include_status_label=True)
+        for item in select_working_evidence(
+            tool_results,
+            user_message=effective_objective,
+            max_results=3,
+        )
+    ]
+
+    return {
+        "reason": str(reason or "unfinished_run"),
+        "objective": str(effective_objective or ""),
+        "run_id": str(run_id or ""),
+        "target_state": str(target_state or ""),
+        "next_action": next_action,
+        "pending_steps": incomplete_steps,
+        "missing_slots": clean_missing,
+        "strategy": str(strategy or ""),
+        "notes": str(notes or ""),
+        "issues": clean_issues,
+        "evidence_summary": evidence_summary,
+    }
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -391,6 +567,13 @@ class RunEngine:
             request.user_message,
             list(getattr(session, "sliding_window", []) or []),
         )
+        continuation_state = getattr(session, "continuation_state", {}) or {}
+        if (
+            isinstance(continuation_state, dict)
+            and continuation_state.get("objective")
+            and self._is_ambiguous_followup(request.user_message)
+        ):
+            effective_objective = str(continuation_state.get("objective") or "").strip() or effective_objective
 
         try:
             tool_results: list[dict[str, Any]] = []
@@ -453,6 +636,11 @@ class RunEngine:
                 candidate_signals=list(getattr(session, "candidate_signals", []) or []),
                 current_stance_signals=stance_signals,
             )
+            # Slice 3: tag each extracted fact with source="user_direct" in
+            # the trace event so the evidence ledger (Slice 7) and operator
+            # views can distinguish direct user assertions from compression-
+            # side proposals. The source label lives in the trace; the
+            # semantic_graph schema is not changed (per convergence rule).
             self._trace(
                 request=request,
                 run_id=run.run_id,
@@ -465,10 +653,14 @@ class RunEngine:
                             "subject": item.get("subject"),
                             "predicate": item.get("predicate"),
                             "object": item.get("object"),
+                            "source": "user_direct",
                         }
                         for item in deterministic_keyed_facts
                     ],
-                    "voids": list(deterministic_voids),
+                    "voids": [
+                        {**v, "source": "user_direct"} if isinstance(v, dict) else v
+                        for v in deterministic_voids
+                    ],
                 },
             )
             if conversation_tension.summary or conversation_tension.conflicting_facts:
@@ -604,10 +796,71 @@ class RunEngine:
             planned_argument_clues: dict[str, str] = {}
             # Full structured plan — populated by planner, used by verify skip logic.
             structured_plan: dict[str, Any] = {}
+            # Per-turn plan_steps spine — initialized empty so all code paths
+            # (including the no-plan / fast-path return) can reference it
+            # safely. Populated by planner output below; mutated in place by
+            # _update_plan_step after each tool turn.
+            plan_steps_state: list[dict[str, Any]] = []
+            planned_risk_tier: str = "read_only"
             # Route resolved from plan (used by hooks and verify skip).
             _plan_route: str = ""
 
             if not selected_tools and not direct_fact_memory_only and planner_enabled and self.orchestrator is not None:
+                # Slice 5: spatial-aware planning. Pre-fetch the drawer of any
+                # locus the user message targets (token-overlap detection),
+                # plus 1-hop neighbors with score decay. The planner then sees
+                # the actual workspace context — what facts are filed where —
+                # before deciding what tools to use. Without this the planner
+                # only sees a flat list of locus IDs and can't reason about
+                # which one matches the question's substance.
+                _spatial_drawers: list[dict[str, Any]] = []
+                try:
+                    if available_loci and self.graph is not None:
+                        from memory.retrieval import detect_locus_by_overlap
+                        _detected_locus = detect_locus_by_overlap(
+                            request.user_message or "", list(available_loci)
+                        )
+                        if _detected_locus:
+                            _primary = self.graph.get_compiled_drawer(_detected_locus)
+                            if _primary:
+                                _spatial_drawers.append({
+                                    "locus_id": _detected_locus,
+                                    "hop": 0,
+                                    "score": 1.0,
+                                    "content": _primary,
+                                })
+                            # 1-hop neighbors with score decay; cap fanout to
+                            # keep the planning packet tight.
+                            try:
+                                _neighbors = self.graph.get_locus_neighbors(
+                                    _detected_locus, max_depth=1, max_fanout=3,
+                                )
+                            except Exception:
+                                _neighbors = []
+                            for nbr_id, _depth, nbr_score in _neighbors:
+                                nbr_drawer = self.graph.get_compiled_drawer(nbr_id)
+                                if not nbr_drawer:
+                                    continue
+                                _spatial_drawers.append({
+                                    "locus_id": nbr_id,
+                                    "hop": 1,
+                                    "score": float(nbr_score),
+                                    "content": nbr_drawer,
+                                })
+                            if _spatial_drawers:
+                                self._trace(
+                                    request=request,
+                                    run_id=run.run_id,
+                                    event_type="spatial_drawers_loaded",
+                                    data={
+                                        "primary_locus": _detected_locus,
+                                        "drawer_count": len(_spatial_drawers),
+                                        "neighbor_ids": [d["locus_id"] for d in _spatial_drawers if d["hop"] > 0],
+                                    },
+                                )
+                except Exception:
+                    _spatial_drawers = []
+
                 planning_packet = self._compile_phase_packet(
                     context_engine=active_context_engine,
                     run_id=run.run_id,
@@ -626,6 +879,7 @@ class RunEngine:
                     code_intent_note=code_intent_note,
                     execution_risk_tier=execution_risk_tier,
                     available_loci=available_loci if available_loci else None,
+                    spatial_drawers=_spatial_drawers if _spatial_drawers else None,
                 )
                 _planner_model = (
                     request.planner_model
@@ -669,6 +923,30 @@ class RunEngine:
                         run_id=run.run_id,
                         event_type="locus_targeted",
                         data={"locus_id": planned_locus_id},
+                    )
+
+                # ── Capture plan_steps spine (Slice 1) ──
+                # Mutable per-turn list; runtime updates statuses as tools complete.
+                # Copied so updates don't leak back into structured_plan if the
+                # planner result is reused elsewhere (defensive).
+                plan_steps_state = [
+                    dict(step) for step in (structured_plan.get("plan_steps") or [])
+                    if isinstance(step, dict)
+                ]
+                planned_risk_tier = str(structured_plan.get("risk_tier", "read_only")).strip().lower() or "read_only"
+                if plan_steps_state:
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="plan_steps",
+                        data={
+                            "step_count": len(plan_steps_state),
+                            "risk_tier": planned_risk_tier,
+                            "steps": [
+                                {"id": s.get("id"), "tool": s.get("tool"), "risk": s.get("risk")}
+                                for s in plan_steps_state
+                            ],
+                        },
                     )
 
                 # ── Load selected skill ──
@@ -739,6 +1017,48 @@ class RunEngine:
                             "declared_risk_tier": execution_risk_tier or "",
                         },
                     )
+
+                # Slice 6: dispatch gate. Promote the advisory to a real gate
+                # for the highest-risk tier ONLY: when the plan picked
+                # destructive tools AND the user message has no authorization
+                # verb, refuse dispatch and ask for explicit confirmation
+                # instead. Write/read_only plans pass through with the trace
+                # advisory only — over-blocking would break legitimate
+                # implicit-write turns ("fix the auth bug" + file_str_replace).
+                _destructive_no_auth = (
+                    _plan_advisory["max_tier"] == "destructive"
+                    and not _plan_advisory["clear"]
+                )
+                if _destructive_no_auth:
+                    _risky_tools = [
+                        name for name in selected_tools
+                        if name in {"bash"}  # only true-destructive surfaces
+                    ]
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="dispatch_gate_blocked",
+                        data={
+                            "reason": "destructive_plan_requires_explicit_auth",
+                            "risky_tools": _risky_tools,
+                            "user_message_preview": (request.user_message or "")[:160],
+                        },
+                    )
+                    yield {
+                        "type": "clarification_needed",
+                        "reason": "destructive_plan_requires_explicit_auth",
+                        "risky_tools": _risky_tools,
+                        "question": (
+                            "I planned a destructive action ("
+                            + ", ".join(_risky_tools)
+                            + ") but your message has no explicit authorization verb. "
+                            "Should I proceed? (Reply with an action verb like 'run', "
+                            "'install', or 'delete' to confirm.)"
+                        ),
+                    }
+                    selected_tools = []
+                    plan_steps_state = []  # don't carry the destructive plan forward
+
                 _plan_route = str(structured_plan.get("route", "")).strip()
                 if structured_plan.get("strategy"):
                     strategy = str(structured_plan.get("strategy"))
@@ -892,6 +1212,7 @@ class RunEngine:
                     execution_risk_tier=execution_risk_tier,
                     available_loci=available_loci if available_loci else None,
                     planned_locus_id=planned_locus_id,
+                    plan_steps=plan_steps_state,
                 )
                 tool_call = await self._select_tool_call(
                     adapter=current_adapter,
@@ -947,6 +1268,7 @@ class RunEngine:
                         success=False,
                         error_kind="validation_error",
                     )
+                    _update_plan_step(plan_steps_state, tool_call.tool_name, success=False)
                     self.run_store.save_checkpoint(
                         run_id=run.run_id,
                         phase="acting",
@@ -1003,6 +1325,7 @@ class RunEngine:
                             success=False,
                             error_kind="duplicate_suppressed",
                         )
+                        _update_plan_step(plan_steps_state, tool_call.tool_name, success=False)
                         self.run_store.save_checkpoint(
                             run_id=run.run_id,
                             phase="acting",
@@ -1193,10 +1516,21 @@ class RunEngine:
                     else:
                         _enriched_content = _raw_content
 
+                # Slice 4: shape the tool output for the actor — KEY_LINES on
+                # long bash, SUMMARY on web_search, HARD_FAILURE preservation,
+                # plus a one-line actor_summary for the working_evidence
+                # cross-tool accumulator. Shaping never raises; on failure
+                # the original content is kept verbatim.
+                _shaped_content, _actor_summary = shape_tool_result_for_actor(
+                    tool_result.tool_name,
+                    _enriched_content,
+                    success=bool(tool_result.success),
+                )
                 result_payload = {
                     "tool_name": tool_result.tool_name,
                     "success": tool_result.success,
-                    "content": _enriched_content,
+                    "content": _shaped_content,
+                    "actor_summary": _actor_summary,
                     "arguments": dict(tool_call.arguments or {}),
                 }
                 tool_results.append(result_payload)
@@ -1207,6 +1541,12 @@ class RunEngine:
                     tool_name=tool_result.tool_name,
                     success=bool(tool_result.success),
                     error_kind=("hard_failure" if (not tool_result.success and "HARD_FAILURE" in (tool_result.content or "")) else ""),
+                )
+                _update_plan_step(
+                    plan_steps_state,
+                    tool_result.tool_name,
+                    success=bool(tool_result.success),
+                    hard_failure=("HARD_FAILURE" in (tool_result.content or "")),
                 )
 
                 # ── Hook: tool_completed ──
@@ -1281,6 +1621,7 @@ class RunEngine:
                         success=False,
                         error_kind="logical_stall",
                     )
+                    _update_plan_step(plan_steps_state, alert_tool_name, success=False)
                     self.run_store.save_checkpoint(
                         run_id=run.run_id,
                         phase="acting",
@@ -1402,7 +1743,104 @@ class RunEngine:
                     tool_results=tool_results[-3:],
                     packet=observation_packet,
                 )
-                if normalized_observation["should_continue"]:
+                # ── Slice 2: finalize gate ──────────────────────────────
+                # Cross-check the observation's status against plan_steps and
+                # the cross-session TaskTracker. The observation alone is no
+                # longer authoritative — finalize requires (status == finalize)
+                # AND (all plan_steps done) AND (no open todos). If the gate
+                # refuses, override `selected_tools` with the next pending
+                # step's tool so the actor loop continues against that step.
+                from memory.task_tracker import get_session_task_tracker as _get_tt
+                _tracker_for_gate = None
+                try:
+                    _tracker_for_gate = _get_tt()
+                except Exception:
+                    _tracker_for_gate = None
+                _gate_finalize, _gate_reason = _should_finalize(
+                    observation_status=normalized_observation["status"],
+                    plan_steps=plan_steps_state,
+                    tool_turn=tool_turn,
+                    max_tool_calls=normalized_max_tool_calls,
+                    session_id=session.id,
+                    task_tracker=_tracker_for_gate,
+                )
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="finalize_gate",
+                    data={
+                        "should_finalize": _gate_finalize,
+                        "reason": _gate_reason,
+                        "tool_turn": tool_turn,
+                        "pending_step_count": sum(
+                            1 for s in plan_steps_state if s.get("status") == "pending"
+                        ),
+                    },
+                )
+
+                if not _gate_finalize and _gate_reason.startswith("pending_steps"):
+                    # Force one more actor turn against the first pending step.
+                    next_step = next(
+                        (s for s in plan_steps_state if s.get("status") == "pending"), None
+                    )
+                    if next_step and next_step.get("tool"):
+                        selected_tools = [next_step["tool"]]
+                        latest_notes = (
+                            f"{latest_notes}\nNext required: {next_step.get('description', '')}"
+                            if latest_notes else
+                            f"Next required: {next_step.get('description', '')}"
+                        )
+                    elif not selected_tools:
+                        # No tool to drive the step — let observation decide,
+                        # but don't deadlock.
+                        _gate_finalize = True
+
+                # Partial-completion event when the hard cap forces finalize
+                # while plan_steps remain. This must be emitted before the
+                # response phase so the response generator can read it via
+                # the injected `latest_notes` and never claim full success.
+                if _gate_finalize and _gate_reason.startswith("max_tool_calls_reached"):
+                    completed = [
+                        s.get("id") for s in plan_steps_state
+                        if s.get("status") in {"done", "skipped"}
+                    ]
+                    incomplete = [
+                        s.get("id") for s in plan_steps_state
+                        if s.get("status") == "pending"
+                    ]
+                    incomplete_descs = [
+                        s.get("description", "") for s in plan_steps_state
+                        if s.get("status") == "pending"
+                    ]
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="partial_completion",
+                        data={
+                            "completed_steps": completed,
+                            "incomplete_steps": incomplete,
+                            "reason": "max_tool_calls_reached",
+                        },
+                    )
+                    yield {
+                        "type": "partial_completion",
+                        "completed_steps": completed,
+                        "incomplete_steps": incomplete,
+                        "reason": "max_tool_calls_reached",
+                    }
+                    if incomplete_descs:
+                        latest_notes = (
+                            f"{latest_notes}\nNote: {len(incomplete_descs)} planned step(s) "
+                            f"could not be completed: {'; '.join(incomplete_descs[:3])}. "
+                            "Report exactly what was done and what wasn't."
+                        )
+
+                _effective_should_continue = (
+                    normalized_observation["should_continue"]
+                    and not _gate_finalize
+                ) or (not _gate_finalize and bool(selected_tools))
+
+                if _effective_should_continue:
                     strategy = str(normalized_observation["strategy"] or "Manager selected follow-up tools.")
                     self._trace(
                         request=request,
@@ -1416,7 +1854,7 @@ class RunEngine:
                         "tools": selected_tools,
                         "confidence": normalized_observation["confidence"],
                     }
-                if not normalized_observation["should_continue"]:
+                else:
                     selected_tools = []
 
             final_response = ""
@@ -1438,6 +1876,7 @@ class RunEngine:
                 observation_tools=latest_observation_tools,
                 current_facts=current_facts,
                 conversation_tension=conversation_tension,
+                plan_steps=plan_steps_state,
             )
             final_messages = self._build_final_messages(
                 session=session,
@@ -1483,13 +1922,17 @@ class RunEngine:
             stream_kwargs: dict[str, Any] = {}
             if request.reasoning_enabled is not None:
                 stream_kwargs["reasoning_enabled"] = request.reasoning_enabled
-            async for token in current_adapter.stream(
+            async for token in _stream_with_rate_limit_retry(
+                current_adapter,
                 model=clean_model,
                 messages=final_messages,
                 temperature=0.2,
                 images=request.images,
                 **stream_kwargs,
             ):
+                if isinstance(token, dict):
+                    yield token
+                    continue
                 final_response += token
                 yield {"type": "token", "content": token}
 
@@ -1626,10 +2069,51 @@ class RunEngine:
                     "side_effect_guard": "tripped",
                 }
 
+            # Slice 4: 3-way verifier verdict routing.
+            # The verifier now returns one of: supported | needs_redraft | needs_replan.
+            # - supported   → COMMIT (handled by the post-redraft fall-through path)
+            # - needs_redraft → REDRAFT (legacy path, evidence is sufficient)
+            # - needs_replan → emit replan_recommended event + inject honest
+            #   "missing evidence" note into the response. We do NOT re-enter the
+            #   tool loop here (that's the caller's next-turn responsibility);
+            #   we surface the signal so a managing orchestrator or the user can
+            #   trigger the next plan with the missing evidence as the objective.
+            _verifier_verdict = str(verification.get("verdict", "")).strip().lower()
+            if _verifier_verdict == "needs_replan":
+                _missing_evidence = list(verification.get("missing_evidence") or [])
+                _target_state = str(verification.get("target_state") or "gather").strip().lower()
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="replan_recommended",
+                    data={
+                        "target_state": _target_state,
+                        "missing_evidence": _missing_evidence,
+                        "issues": list(verification.get("issues") or [])[:5],
+                        "confidence": verification.get("confidence"),
+                    },
+                )
+                yield {
+                    "type": "replan_recommended",
+                    "target_state": _target_state,
+                    "missing_evidence": _missing_evidence,
+                    "issues": list(verification.get("issues") or [])[:5],
+                    "confidence": verification.get("confidence"),
+                }
+                # Skip the redraft loop — redrafting can't produce missing
+                # evidence. Continue to the standard "ship with warning" path
+                # below, which will surface the warning to the user.
+
             # Re-draft once when verification fails with high severity.
             # Triggered by side-effect guard tripping OR multiple verification issues.
             # Bound to a single attempt — if the redraft also fails, we ship with a warning.
-            if not bool(verification.get("supported", True)):
+            # Only fires for verdict=needs_redraft (legacy unsupported case);
+            # needs_replan is handled above without redraft.
+            _redraft_eligible = (
+                not bool(verification.get("supported", True))
+                and _verifier_verdict != "needs_replan"
+            )
+            if _redraft_eligible:
                 _initial_issues = list(verification.get("issues") or [])
                 _side_effect_tripped = bool(verification.get("side_effect_guard") == "tripped")
                 try:
@@ -1669,13 +2153,17 @@ class RunEngine:
                         {"role": "system", "content": constraints_msg}
                     ]
                     final_response = ""
-                    async for token in current_adapter.stream(
+                    async for token in _stream_with_rate_limit_retry(
+                        current_adapter,
                         model=clean_model,
                         messages=redraft_messages,
                         temperature=0.1,
                         images=request.images,
                         **stream_kwargs,
                     ):
+                        if isinstance(token, dict):
+                            yield token
+                            continue
                         final_response += token
                         yield {"type": "token", "content": token}
 
@@ -1793,6 +2281,71 @@ class RunEngine:
                     "confidence": verification.get("confidence"),
                 }
 
+            pending_or_failed_steps = [
+                step for step in plan_steps_state
+                if isinstance(step, dict)
+                and str(step.get("status") or "pending") not in {"done", "completed", "skipped"}
+            ]
+            verification_missing_evidence = [
+                str(item).strip()
+                for item in (verification.get("missing_evidence") or [])
+                if str(item).strip()
+            ]
+            continuation_missing_slots = list(dict.fromkeys(
+                [str(item).strip() for item in latest_missing_slots if str(item).strip()]
+                + verification_missing_evidence
+            ))
+            continuation_reason = ""
+            if str(verification.get("verdict", "")).strip().lower() == "needs_replan":
+                continuation_reason = "verification_needs_replan"
+            elif pending_or_failed_steps:
+                continuation_reason = "pending_plan_steps"
+            elif continuation_missing_slots:
+                continuation_reason = "missing_evidence_slots"
+            elif not verification_supported:
+                continuation_reason = "verification_unsupported"
+
+            if continuation_reason:
+                continuation_state = _build_continuation_state_payload(
+                    reason=continuation_reason,
+                    effective_objective=effective_objective,
+                    run_id=run.run_id,
+                    plan_steps=plan_steps_state,
+                    missing_slots=continuation_missing_slots,
+                    strategy=latest_strategy,
+                    notes=latest_notes,
+                    tool_results=tool_results,
+                    issues=list(verification.get("issues") or []),
+                    target_state=str(verification.get("target_state") or ""),
+                )
+                if continuation_state and hasattr(self.sessions, "update_continuation_state"):
+                    self.sessions.update_continuation_state(
+                        session.id,
+                        continuation_state,
+                        owner_id=request.owner_id,
+                    )
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="continuation_state_updated",
+                        data={
+                            "reason": continuation_reason,
+                            "pending_step_count": len(continuation_state.get("pending_steps") or []),
+                            "missing_slot_count": len(continuation_state.get("missing_slots") or []),
+                            "target_state": continuation_state.get("target_state") or "",
+                        },
+                    )
+            elif hasattr(self.sessions, "clear_continuation_state"):
+                prior_continuation = bool(getattr(session, "continuation_state", {}) or {})
+                self.sessions.clear_continuation_state(session.id, owner_id=request.owner_id)
+                if prior_continuation:
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="continuation_state_cleared",
+                        data={"reason": "run_closed"},
+                    )
+
             self.sessions.append_message(session.id, "assistant", final_response)
             if verification_supported:
                 await self._commit_context(
@@ -1803,12 +2356,13 @@ class RunEngine:
                     current_context=session.compressed_context,
                     is_first_exchange=is_first_exchange,
                     tool_results=tool_results,
-                    model=request.context_model or clean_model,
+                    model=request.context_model or session_model,
                     run_id=run.run_id,
                     deterministic_keyed_facts=deterministic_keyed_facts,
                     deterministic_voids=deterministic_voids,
                     current_facts=current_facts,
                     stance_signals=stance_signals,
+                    conversation_tension=conversation_tension,
                     planned_locus_id=planned_locus_id,
                 )
             else:
@@ -1856,7 +2410,7 @@ class RunEngine:
 
     def _resolve_adapter(self, model: str) -> BaseLLMAdapter:
         if model and ":" in model:
-            return create_adapter(provider=model)
+            return create_adapter(provider=model.split(":", 1)[0].lower())
         return self.adapter
 
     def _list_allowed_tools(self, allowed_tools: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1958,10 +2512,18 @@ class RunEngine:
             else:
                 return call
         fallback_ranked = self._rank_fallback_tool_candidates(effective_objective, available_names)
+        if "web_fetch" in available_names and "web_fetch" not in fallback_ranked:
+            if re.search(r"https?://[^\s\"'<>),]+", context_block or ""):
+                fallback_ranked.insert(0, "web_fetch")
         for name in fallback_ranked:
             if name not in available_names:
                 continue
-            fallback = fallback_tool_call(name, effective_objective)
+            fallback_objective = effective_objective
+            if name == "web_fetch" and not re.search(r"https?://\S+", fallback_objective or ""):
+                context_url = re.search(r"https?://[^\s\"'<>),]+", context_block or "")
+                if context_url:
+                    fallback_objective = context_url.group(0)
+            fallback = fallback_tool_call(name, fallback_objective)
             if fallback is not None:
                 return fallback
         return None
@@ -2144,11 +2706,33 @@ class RunEngine:
         deterministic_voids: list[dict[str, Any]],
         current_facts: list[tuple[str, str, str]],
         stance_signals: list[dict[str, Any]],
+        conversation_tension=None,
         planned_locus_id: str = "",
     ) -> None:
         session = self.sessions.get(session_id, owner_id=request.owner_id)
         existing_candidate_signals = list(getattr(session, "candidate_signals", []) or [])
         existing_candidate_context = getattr(session, "candidate_context", "") if session is not None else ""
+        memory_packet = None
+        if session is not None:
+            memory_packet = self._compile_phase_packet(
+                context_engine=context_engine,
+                run_id=run_id,
+                request=request,
+                session=session,
+                phase=ContextPhase.MEMORY_COMMIT,
+                system_prompt=request.system_prompt,
+                effective_objective=request.user_message,
+                current_context=current_context,
+                allowed_tools=[],
+                tool_results=tool_results,
+                tool_turn=0,
+                strategy="Commit only verified durable facts, voids, and candidate signals.",
+                notes="Storage must preserve contradiction state and avoid committing unsupported tool or meta claims.",
+                final_response=assistant_response,
+                current_facts=current_facts,
+                conversation_tension=conversation_tension,
+                planned_locus_id=planned_locus_id,
+            )
 
         if context_engine is None or not hasattr(context_engine, "compress_exchange"):
             commit_plan = self._context_governor.build_memory_commit_plan(
@@ -2161,6 +2745,14 @@ class RunEngine:
                 existing_candidate_context=existing_candidate_context,
                 new_candidate_signals=stance_signals,
                 current_turn=self._message_count(session_id, request.owner_id),
+            )
+            self._trace_memory_commit_plan(
+                request=request,
+                run_id=run_id,
+                plan=commit_plan,
+                conversation_tension=conversation_tension,
+                memory_packet=memory_packet,
+                path="deterministic_governor",
             )
             outcome = await self._context_governor.apply_memory_commit(
                 sessions=self.sessions,
@@ -2205,6 +2797,14 @@ class RunEngine:
                 new_candidate_signals=stance_signals,
                 current_turn=self._message_count(session_id, request.owner_id),
             )
+            self._trace_memory_commit_plan(
+                request=request,
+                run_id=run_id,
+                plan=commit_plan,
+                conversation_tension=conversation_tension,
+                memory_packet=memory_packet,
+                path="compression_empty_governor",
+            )
             outcome = await self._context_governor.apply_memory_commit(
                 sessions=self.sessions,
                 session_id=session_id,
@@ -2237,6 +2837,14 @@ class RunEngine:
             existing_candidate_context=existing_candidate_context,
             new_candidate_signals=stance_signals,
             current_turn=self._message_count(session_id, request.owner_id),
+        )
+        self._trace_memory_commit_plan(
+            request=request,
+            run_id=run_id,
+            plan=commit_plan,
+            conversation_tension=conversation_tension,
+            memory_packet=memory_packet,
+            path="compression_plus_governor",
         )
         outcome = await self._context_governor.apply_memory_commit(
             sessions=self.sessions,
@@ -2295,6 +2903,73 @@ class RunEngine:
             ],
         )
 
+    def _trace_memory_commit_plan(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        plan,
+        conversation_tension=None,
+        memory_packet: Optional[CompiledPassPacket] = None,
+        path: str = "",
+    ) -> None:
+        merged_facts = list(getattr(plan, "merged_facts", None) or [])
+        merged_voids = list(getattr(plan, "merged_voids", None) or [])
+        blocked_keyed_facts = list(getattr(plan, "blocked_keyed_facts", None) or [])
+        candidate_signals = list(getattr(plan, "candidate_signals", None) or [])
+        data = {
+            "path": path,
+            "fact_count": len(merged_facts),
+            "void_count": len(merged_voids),
+            "blocked_count": len(blocked_keyed_facts),
+            "candidate_signal_count": len(candidate_signals),
+            "candidate_context_lines": len(
+                [line for line in str(getattr(plan, "candidate_context", "") or "").splitlines() if line.strip()]
+            ),
+            "facts": [
+                {
+                    "subject": item.get("subject"),
+                    "predicate": item.get("predicate"),
+                    "object": item.get("object"),
+                    "key": item.get("key") or item.get("fact"),
+                }
+                for item in merged_facts[:10]
+            ],
+            "voids": [
+                {
+                    "subject": item.get("subject"),
+                    "predicate": item.get("predicate"),
+                    "reason": item.get("reason") or item.get("source") or "",
+                }
+                for item in merged_voids[:10]
+            ],
+            "blocked": [
+                {
+                    "subject": item.get("subject"),
+                    "predicate": item.get("predicate"),
+                    "object": item.get("object"),
+                    "reason": item.get("grounding_reason"),
+                }
+                for item in blocked_keyed_facts[:10]
+            ],
+            "conversation_tension": conversation_tension_audit_payload(conversation_tension),
+        }
+        if memory_packet is not None:
+            data["phase_packet"] = {
+                "phase": memory_packet.phase.value,
+                "included_ids": [
+                    item.get("item_id")
+                    for item in memory_packet.trace.get("included", [])
+                    if item.get("item_id")
+                ],
+                "excluded_ids": [
+                    item.get("item_id")
+                    for item in memory_packet.trace.get("excluded", [])
+                    if item.get("item_id")
+                ],
+            }
+        self._trace(request=request, run_id=run_id, event_type="memory_commit_plan", data=data)
+
     def _build_context_block(self, context: str) -> str:
         if self.context_engine is None or not hasattr(self.context_engine, "build_context_block"):
             return ""
@@ -2333,6 +3008,8 @@ class RunEngine:
         direct_fact_memory_only: bool = False,
         available_loci: Optional[list[dict[str, str]]] = None,
         planned_locus_id: str = "",
+        plan_steps: Optional[list[dict[str, Any]]] = None,
+        spatial_drawers: Optional[list[dict[str, Any]]] = None,
     ) -> CompiledPassPacket:
         inferred_correction_turn = correction_turn or bool(
             re.search(r"\b(actually|instead|correction|updated|changed|not .* anymore|moved to|call me)\b", request.user_message or "", re.IGNORECASE)
@@ -2369,6 +3046,8 @@ class RunEngine:
                 direct_fact_memory_only=inferred_direct_fact_memory_only,
                 available_loci=available_loci,
                 planned_locus_id=planned_locus_id,
+                plan_steps=plan_steps,
+                spatial_drawers=spatial_drawers,
             ),
         )
         phase_trace = dict(packet.trace)

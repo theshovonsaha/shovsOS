@@ -50,6 +50,34 @@ def test_update_candidate_context_backfills_structured_signals(tmp_path):
     ]
 
 
+def test_session_manager_persists_continuation_state(tmp_path):
+    db_path = tmp_path / "sessions.db"
+    manager = SessionManager(db_path=str(db_path))
+    session = manager.create(model="llama3.2", system_prompt="", agent_id="default", owner_id="owner-1")
+
+    manager.update_continuation_state(
+        session.id,
+        {
+            "reason": "pending_plan_steps",
+            "objective": "Research example.com pricing.",
+            "pending_steps": [{"id": "step_2", "description": "Fetch pricing", "tool": "web_fetch"}],
+            "missing_slots": ["pricing page"],
+        },
+        owner_id="owner-1",
+    )
+
+    reloaded = SessionManager(db_path=str(db_path)).get(session.id, owner_id="owner-1")
+
+    assert reloaded is not None
+    assert reloaded.continuation_state["reason"] == "pending_plan_steps"
+    assert reloaded.continuation_state["missing_slots"] == ["pricing page"]
+
+    manager.clear_continuation_state(session.id, owner_id="owner-1")
+    cleared = manager.get(session.id, owner_id="owner-1")
+    assert cleared is not None
+    assert cleared.continuation_state == {}
+
+
 def test_extract_stance_signals_builds_structured_stance_candidates():
     signals = extract_stance_signals(
         "I think explicit challenge mode should stay on by default.",

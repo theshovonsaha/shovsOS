@@ -18,7 +18,11 @@ from engine.context_item_builders import (
     build_session_anchor_item,
     build_working_evidence_item,
 )
-from engine.conversation_tension import ConversationTension, render_conversation_tension
+from engine.conversation_tension import (
+    ConversationTension,
+    conversation_tension_audit_payload,
+    render_conversation_tension,
+)
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from run_engine.evidence_lane import build_working_evidence_block, build_working_evidence_snapshot
 from run_engine.meta_context import build_meta_context_block, build_meta_context_snapshot
@@ -28,11 +32,11 @@ from memory.task_tracker import get_session_task_tracker
 
 
 DEFAULT_PHASE_CHAR_BUDGETS: dict[ContextPhase, int] = {
-    ContextPhase.PLANNING: 4200,
-    ContextPhase.ACTING: 5600,
-    ContextPhase.RESPONSE: 6200,
-    ContextPhase.VERIFICATION: 5400,
-    ContextPhase.MEMORY_COMMIT: 3200,
+    ContextPhase.PLANNING: 21000,
+    ContextPhase.ACTING: 28000,
+    ContextPhase.RESPONSE: 31000,
+    ContextPhase.VERIFICATION: 27000,
+    ContextPhase.MEMORY_COMMIT: 16000,
 }
 
 
@@ -62,6 +66,15 @@ class PacketBuildInputs:
     direct_fact_memory_only: bool = False
     available_loci: Optional[list[dict[str, str]]] = None
     planned_locus_id: str = ""
+    # Per-turn plan_steps from the planner. Updated in place by the runtime
+    # as tools complete. Visible to ACTING/RESPONSE so the actor can see
+    # remaining work and the response phase can flag partial completion.
+    plan_steps: Optional[list[dict[str, Any]]] = None
+    # Spatial drawers (Slice 5): pre-fetched locus drawers (primary + 1-hop
+    # neighbors) for the planning phase. Each entry: {locus_id, hop, score,
+    # content}. Visible to PLANNING only — planner reads them to decide
+    # which loci to query; actor uses tools, not raw drawer dumps.
+    spatial_drawers: Optional[list[dict[str, Any]]] = None
 
 
 def build_phase_packet(
@@ -245,7 +258,6 @@ def build_phase_packet(
                     ContextPhase.ACTING,
                     ContextPhase.RESPONSE,
                     ContextPhase.VERIFICATION,
-                    ContextPhase.MEMORY_COMMIT,
                 }),
             )
         )
@@ -392,8 +404,36 @@ def build_phase_packet(
                     ContextPhase.VERIFICATION,
                     ContextPhase.MEMORY_COMMIT,
                 }),
+                )
             )
-        )
+
+    continuation_state = getattr(session, "continuation_state", {}) or {}
+    if isinstance(continuation_state, dict) and continuation_state:
+        continuation_content = _build_continuation_state(continuation_state)
+        if continuation_content:
+            items.append(
+                ContextItem(
+                    item_id="continuation_state",
+                    kind=ContextKind.WORKING,
+                    title="Continuation State",
+                    content=continuation_content,
+                    source="session_manager",
+                    priority=33,
+                    max_chars=1400,
+                    trace_id="run_engine:continuation_state",
+                    provenance={
+                        "reason": str(continuation_state.get("reason") or ""),
+                        "pending_step_count": len(continuation_state.get("pending_steps") or []),
+                        "missing_slot_count": len(continuation_state.get("missing_slots") or []),
+                        "source_run_id": str(continuation_state.get("run_id") or ""),
+                    },
+                    phase_visibility=frozenset({
+                        ContextPhase.PLANNING,
+                        ContextPhase.ACTING,
+                        ContextPhase.RESPONSE,
+                    }),
+                )
+            )
 
     code_intent_note = (inputs.code_intent_note or "").strip()
     if code_intent_note:
@@ -472,6 +512,91 @@ def build_phase_packet(
                 )
             )
 
+    # ── Spatial drawers (PLANNING only) ─────────────────────────────────────
+    # Pre-fetched locus drawers for the targeted locus + 1-hop neighbors.
+    # Lets the planner reason about workspace context before tool selection.
+    # Planning-only on purpose: the actor uses tools (shovs_memory_query) to
+    # query specific drawers rather than getting raw drawer dumps in the
+    # acting context.
+    if inputs.spatial_drawers:
+        drawer_lines: list[str] = []
+        primary_id = ""
+        for entry in inputs.spatial_drawers[:4]:
+            lid = str(entry.get("locus_id", "")).strip()
+            hop = int(entry.get("hop", 0))
+            content = str(entry.get("content", "")).strip()
+            if not lid or not content:
+                continue
+            if hop == 0:
+                primary_id = lid
+            label = f"## Locus: {lid}" if hop == 0 else f"## Neighbor (hop {hop}): {lid}"
+            # Cap each drawer to keep total budget bounded.
+            snippet = content[:1200]
+            if len(content) > 1200:
+                snippet = snippet.rstrip() + "\n…(truncated; use shovs_memory_query for full)"
+            drawer_lines.append(f"{label}\n{snippet}")
+        if drawer_lines:
+            spatial_content = (
+                "Pre-fetched workspace drawers for this query. The targeted locus and its "
+                "neighbors. Use shovs_memory_query with locus_id when you need specific facts.\n\n"
+                + "\n\n".join(drawer_lines)
+            )
+            items.append(
+                ContextItem(
+                    item_id="spatial_drawers",
+                    kind=ContextKind.MEMORY,
+                    title="Spatial Drawers (planning hint)",
+                    content=spatial_content,
+                    source="semantic_graph",
+                    priority=37,
+                    max_chars=4800,
+                    trace_id="run_engine:spatial_drawers",
+                    provenance={
+                        "primary_locus": primary_id,
+                        "drawer_count": len(drawer_lines),
+                    },
+                    phase_visibility=frozenset({ContextPhase.PLANNING}),
+                )
+            )
+
+    # ── Plan steps lane (ACTING + RESPONSE) ─────────────────────────────────
+    # Per-turn plan_steps from the planner. The runtime updates statuses
+    # in-place after each tool turn. Visible to ACTING so the actor sees
+    # remaining work, and RESPONSE so the response phase can flag partial
+    # completion honestly when steps remain pending.
+    if inputs.plan_steps:
+        plan_lines = []
+        for step in inputs.plan_steps:
+            sid = str(step.get("id", "")).strip()
+            sdesc = str(step.get("description", "")).strip()
+            sstatus = str(step.get("status", "pending")).strip()
+            stool = str(step.get("tool") or "").strip()
+            tool_part = f" [{stool}]" if stool else ""
+            plan_lines.append(f"- {sid} ({sstatus}){tool_part}: {sdesc}")
+        if plan_lines:
+            items.append(
+                ContextItem(
+                    item_id="plan_steps",
+                    kind=ContextKind.WORKING,
+                    title="Plan Steps",
+                    content="Per-turn plan (status reflects current run progress):\n" + "\n".join(plan_lines),
+                    source="planner",
+                    priority=39,
+                    max_chars=900,
+                    trace_id="run_engine:plan_steps",
+                    provenance={
+                        "step_count": len(plan_lines),
+                        "pending": sum(1 for s in inputs.plan_steps if s.get("status") == "pending"),
+                        "done": sum(1 for s in inputs.plan_steps if s.get("status") == "done"),
+                        "failed": sum(1 for s in inputs.plan_steps if s.get("status") == "failed"),
+                    },
+                    phase_visibility=frozenset({
+                        ContextPhase.ACTING,
+                        ContextPhase.RESPONSE,
+                    }),
+                )
+            )
+
     # ── Active task list injection (ACTING + RESPONSE only) ──────────────────
     # When the agent wrote a todo_write plan, surface the current task state
     # in the acting context so the actor knows to call todo_update as tasks
@@ -511,6 +636,7 @@ def build_phase_packet(
         content=tension_content,
         source="run_engine",
         trace_id="run_engine:conversation_tension",
+        provenance=conversation_tension_audit_payload(inputs.conversation_tension),
     )
     if tension_item is not None:
         items.append(tension_item)
@@ -672,6 +798,56 @@ def _build_working_state(inputs: PacketBuildInputs) -> str:
     return "\n\n".join(blocks)
 
 
+def _build_continuation_state(state: dict[str, Any]) -> str:
+    objective = str(state.get("objective") or "").strip()
+    reason = str(state.get("reason") or "").strip()
+    next_action = str(state.get("next_action") or "").strip()
+    strategy = str(state.get("strategy") or "").strip()
+    notes = str(state.get("notes") or "").strip()
+    pending_steps = [item for item in (state.get("pending_steps") or []) if isinstance(item, dict)]
+    missing_slots = [str(item).strip() for item in (state.get("missing_slots") or []) if str(item).strip()]
+    evidence = [str(item).strip() for item in (state.get("evidence_summary") or []) if str(item).strip()]
+    issues = [str(item).strip() for item in (state.get("issues") or []) if str(item).strip()]
+
+    lines = [
+        "Prior run did not fully close. Treat this as the durable handoff for resuming the workflow.",
+    ]
+    if reason:
+        lines.append(f"Reason: {reason}")
+    if objective:
+        lines.append(f"Unfinished objective: {objective}")
+    if next_action:
+        lines.append(f"Next required action: {next_action}")
+    if strategy:
+        lines.append(f"Prior strategy: {strategy}")
+    if notes:
+        lines.append(f"Prior notes: {notes}")
+    if missing_slots:
+        lines.append("Missing data:")
+        lines.extend(f"- {item}" for item in missing_slots[:6])
+    if pending_steps:
+        lines.append("Pending steps:")
+        for step in pending_steps[:6]:
+            sid = str(step.get("id") or "").strip()
+            desc = str(step.get("description") or "").strip()
+            tool = str(step.get("tool") or "").strip()
+            label = f"- {sid}: " if sid else "- "
+            if tool:
+                label += f"[{tool}] "
+            label += desc
+            lines.append(label.rstrip())
+    if evidence:
+        lines.append("Evidence already gathered:")
+        lines.extend(f"- {item}" for item in evidence[:4])
+    if issues:
+        lines.append("Prior verification issues:")
+        lines.extend(f"- {item}" for item in issues[:4])
+    lines.append(
+        "Resume from the smallest missing step. Do not repeat completed tools unless the prior evidence is stale or contradictory."
+    )
+    return "\n".join(line for line in lines if line.strip())
+
+
 def _build_observation_state(inputs: PacketBuildInputs) -> str:
     lines: list[str] = []
     observation_status = str(inputs.observation_status or "").strip()
@@ -717,7 +893,7 @@ def _build_historical_context(inputs: PacketBuildInputs) -> str:
         role = str(entry.get("role") or "")
         content = str(entry.get("content") or "").strip()
         if role in {"user", "assistant"} and content:
-            segments.append(f"{role.upper()}: {_clip(content, 260)}")
+            segments.append(f"{role.upper()}: {_clip(content, 800)}")
 
     return "\n\n---\n".join(segments)
 

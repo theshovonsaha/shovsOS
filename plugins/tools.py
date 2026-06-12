@@ -126,84 +126,26 @@ def _format_search_results(
 
 async def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
     """Compatibility fallback used by tools_web when DuckDuckGo is requested directly."""
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120 Safari/537.36"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-    results: list[dict] = []
-
+    loop = asyncio.get_running_loop()
     try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.get(
-                "https://api.duckduckgo.com/",
-                params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
-                headers=headers,
-            )
-            data = resp.json()
+        def sync_search():
+            from ddgs import DDGS
+            with DDGS() as ddgs:
+                return list(ddgs.text(query, max_results=num_results))
+        raw_results = await loop.run_in_executor(None, sync_search)
+        results = []
+        for r in raw_results:
+            results.append({
+                "title": r.get("title", ""),
+                "url": r.get("href", ""),
+                "snippet": r.get("body", ""),
+                "source": "duckduckgo",
+            })
+        return results
+    except Exception as e:
+        print(f"[_search_duckduckgo] Error: {e}")
+        return []
 
-        if data.get("AbstractText"):
-            results.append(
-                {
-                    "title": data.get("Heading", "Answer"),
-                    "url": data.get("AbstractURL", ""),
-                    "snippet": data["AbstractText"],
-                    "source": "duckduckgo",
-                }
-            )
-
-        for topic in data.get("RelatedTopics", []):
-            if len(results) >= num_results:
-                break
-            if isinstance(topic, dict) and "Text" in topic:
-                results.append(
-                    {
-                        "title": topic.get("Text", "")[:80],
-                        "url": topic.get("FirstURL", ""),
-                        "snippet": topic.get("Text", ""),
-                        "source": "duckduckgo",
-                    }
-                )
-        if results:
-            return results[:num_results]
-    except Exception:
-        pass
-
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=True) as client:
-            resp = await client.post(
-                "https://html.duckduckgo.com/html/",
-                data={"q": query},
-                headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
-            )
-            html = resp.text
-
-        block_re = re.compile(
-            r'class="result__title".*?href="([^"]+)"[^>]*>(.*?)</a>.*?'
-            r'class="result__snippet"[^>]*>(.*?)</span>',
-            re.DOTALL,
-        )
-        for match in block_re.finditer(html):
-            if len(results) >= num_results:
-                break
-            url = match.group(1).strip()
-            title = re.sub(r"<[^>]+>", "", match.group(2)).strip()
-            snippet = re.sub(r"<[^>]+>", "", match.group(3)).strip()
-            if url and title:
-                results.append(
-                    {
-                        "title": title,
-                        "url": url,
-                        "snippet": snippet,
-                        "source": "duckduckgo",
-                    }
-                )
-    except Exception:
-        pass
-
-    return results[:num_results]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

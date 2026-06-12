@@ -52,6 +52,19 @@ _FALLBACK_CHAIN: list[str] = [
 ]
 
 
+def _apply_gemini_cleanup_patch() -> None:
+    try:
+        from llm.gemini_adapter import GeminiAdapter
+        instance = object.__new__(GeminiAdapter)
+        instance._patched_async_wrapper = False
+        instance._patch_async_httpx_wrapper_close()
+    except Exception:
+        pass
+
+
+_apply_gemini_cleanup_patch()
+
+
 def record_provider_failure(provider: str) -> None:
     """
     Record a failure for a provider. After _FAILOVER_THRESHOLD consecutive

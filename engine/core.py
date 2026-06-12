@@ -1647,10 +1647,7 @@ class AgentCore:
             clean_model = strip_provider_prefix(resolved_model)
             self.adapter = current_use_adapter
             
-            # ── CRITICAL: Propagate dynamic adapter to subsystems ─────────
-            # Without this, ContextEngine and Orchestrator remain stuck on 
-            # the original OllamaAdapter even when user selects Groq/Claude/Gemini.
-            ctx_eng.set_adapter(current_use_adapter)
+            self._context_governor.set_adapter(current_use_adapter)
             if self.orch:
                 self.orch.set_adapter(current_use_adapter)
             

@@ -51,6 +51,7 @@ import asyncio
 import json
 from typing import Optional
 from llm.base_adapter import BaseLLMAdapter
+from llm.adapter_factory import create_adapter, strip_provider_prefix
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
@@ -516,10 +517,13 @@ class ContextEngineV2:
         model: str,
     ) -> tuple[list[str], list[dict], list[str]]:
         """Run goal + module extraction concurrently."""
-        from llm.adapter_factory import create_adapter, strip_provider_prefix
-
-        current_adapter = create_adapter(provider=model) if ":" in model else self.adapter
-        clean_model = strip_provider_prefix(model)
+        if ":" in model:
+            provider_prefix = model.split(":", 1)[0].lower()
+            current_adapter = create_adapter(provider=provider_prefix)
+            clean_model = strip_provider_prefix(model)
+        else:
+            current_adapter = self.adapter
+            clean_model = model
 
         # Truncate long responses before sending to extractor
         assistant_short = assistant_response
@@ -605,9 +609,13 @@ class ContextEngineV2:
 
     async def _prune_modules(self, model: str):
         """Ask the LLM to select which modules to keep. Falls back to recency."""
-        from llm.adapter_factory import create_adapter, strip_provider_prefix
-        current_adapter = create_adapter(provider=model) if ":" in model else self.adapter
-        clean_model = strip_provider_prefix(model)
+        if ":" in model:
+            provider_prefix = model.split(":", 1)[0].lower()
+            current_adapter = create_adapter(provider=provider_prefix)
+            clean_model = strip_provider_prefix(model)
+        else:
+            current_adapter = self.adapter
+            clean_model = model
 
         modules_summary = [
             {"key": k, "content": v["content"][:100], "hits": v["hit_count"]}

@@ -21,6 +21,12 @@ WRITE_TOOLS: frozenset[str] = frozenset({
     "file_create",
     "file_str_replace",
 })
+READ_TOOLS: frozenset[str] = frozenset({
+    "web_search",
+    "web_fetch",
+    "query_memory",
+    "shovs_memory_query",
+})
 
 # Per-tool execution risk tier. Read by ``check_plan_for_side_effects`` so the
 # planner's tool selection can be cross-checked against the user's intent
@@ -38,12 +44,35 @@ TOOL_RISK_TIERS: dict[str, str] = {
     # Arbitrary code execution
     "bash": "destructive",
 }
+_DESTRUCTIVE_TOOL_NAME_RE = re.compile(
+    r"\b(send|sent|book|booking|purchase|buy|charge|pay|payment|transfer|"
+    r"cancel|refund|delete|deploy|release)\b",
+    re.IGNORECASE,
+)
+_WRITE_TOOL_NAME_RE = re.compile(
+    r"\b(draft|create|write|update|edit|patch|save|store|upload|post)\b",
+    re.IGNORECASE,
+)
+_READ_TOOL_NAME_RE = re.compile(
+    r"\b(read|get|fetch|search|query|list|check|lookup|look_up|retrieve|find)\b",
+    re.IGNORECASE,
+)
 
 
 def tool_risk_tier(tool_name: str) -> str:
     """Return the risk tier for a tool. Unknown tools default to ``read_only``
     so we don't block on tools the registry didn't explicitly classify."""
-    return TOOL_RISK_TIERS.get(str(tool_name or "").lower(), "read_only")
+    name = str(tool_name or "").lower()
+    if name in TOOL_RISK_TIERS:
+        return TOOL_RISK_TIERS[name]
+    normalized = re.sub(r"[^a-z0-9]+", " ", name).strip()
+    if _DESTRUCTIVE_TOOL_NAME_RE.search(normalized):
+        return "destructive"
+    if _WRITE_TOOL_NAME_RE.search(normalized):
+        return "write"
+    if _READ_TOOL_NAME_RE.search(normalized):
+        return "read_only"
+    return "read_only"
 
 
 # User-message phrases that authorize a write/destructive plan. Conservative
@@ -122,7 +151,7 @@ def check_plan_for_side_effects(
 # First-person assertion patterns — past/perfect tense claims about side-effects.
 # Kept narrow on purpose: only fires on direct claims of completed action,
 # not on plans ("I will create…") or descriptions ("the file contains…").
-_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+CORE_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("file_write", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?(?:created|wrote|written|saved|generated|added|made)\b[^.]*\b(?:file|script|module|component|page|folder|directory)\b", re.IGNORECASE)),
     ("file_write", re.compile(r"\b(?:created|wrote|written|saved|generated)\s+(?:the\s+|a\s+|an\s+)?(?:file|script|module|component|page)\b", re.IGNORECASE)),
     ("file_write", re.compile(r"\bfile\s+(?:has\s+been|was)\s+(?:created|written|saved|generated)\b", re.IGNORECASE)),
@@ -131,7 +160,19 @@ _CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("bash_exec", re.compile(r"\binstalled\s+(?:the\s+)?(?:package|dependency|dependencies|module)\b", re.IGNORECASE)),
     ("bash_exec", re.compile(r"\b(?:command|script)\s+(?:has\s+been|was)\s+(?:run|executed|completed)\b", re.IGNORECASE)),
     ("file_edit", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?(?:updated|modified|edited|patched|replaced)\b[^.]*\b(?:file|line|function|method|variable)\b", re.IGNORECASE)),
+    ("web_search", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?(?:searched|looked\s+up|researched|checked)\b[^.]*\b(?:web|internet|online|search|results?|sources?)\b", re.IGNORECASE)),
+    ("web_search", re.compile(r"\b(?:searched|looked\s+up|researched|checked)\s+(?:the\s+)?(?:web|internet|online|search results?|sources?)\b", re.IGNORECASE)),
+    ("web_fetch", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?(?:fetched|opened|visited|read)\b[^.]*\b(?:url|page|site|website|link)\b", re.IGNORECASE)),
+    ("web_fetch", re.compile(r"\b(?:fetched|opened|visited|read)\s+(?:the\s+)?(?:url|page|site|website|link)\b", re.IGNORECASE)),
+    ("memory_query", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?(?:checked|queried|searched|looked\s+up)\b[^.]*\b(?:memory|memories|stored context|past sessions?)\b", re.IGNORECASE)),
 )
+EXTENDED_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("email_draft", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?(?:drafted|wrote|prepared|generated)\b[^.]*\b(?:email|reply|message|draft)\b", re.IGNORECASE)),
+    ("email_send", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?sent\b[^.]*\b(?:email|reply|message)\b", re.IGNORECASE)),
+    ("external_booking", re.compile(r"\bI\s+(?:have\s+)?(?:just\s+)?(?:booked|purchased|bought|ordered|reserved|charged|paid)\b", re.IGNORECASE)),
+    ("external_booking", re.compile(r"\b(?:flight|hotel|booking|reservation|card|payment)\s+(?:has\s+been|was)\s+(?:booked|purchased|reserved|charged|paid|confirmed)\b", re.IGNORECASE)),
+)
+_CLAIM_PATTERNS = CORE_CLAIM_PATTERNS + EXTENDED_CLAIM_PATTERNS
 
 # Negation patterns — if the response itself flags failure, skip the guard
 # (the response is being honest about the failure already).
@@ -176,6 +217,18 @@ def _has_supporting_evidence(claim_kind: str, tool_results: list[dict[str, Any]]
             return True
         if claim_kind == "bash_exec" and tool_name == "bash":
             return True
+        if claim_kind == "web_search" and tool_name == "web_search":
+            return True
+        if claim_kind == "web_fetch" and tool_name == "web_fetch":
+            return True
+        if claim_kind == "memory_query" and tool_name in {"query_memory", "shovs_memory_query"}:
+            return True
+        if claim_kind == "email_draft" and tool_name in {"draft_email", "email_draft", "create_draft", "ms_graph_create_draft"}:
+            return True
+        if claim_kind == "email_send" and tool_name in {"send_email", "email_send", "ms_graph_send_mail"}:
+            return True
+        if claim_kind == "external_booking" and tool_risk_tier(tool_name) == "destructive":
+            return True
     return False
 
 
@@ -190,6 +243,23 @@ def _has_hard_failure(tool_results: Iterable[dict[str, Any]]) -> tuple[bool, lis
             name = str(result.get("tool_name") or "tool")
             failed.append(f"{name}:{status}")
     return bool(failed), failed
+
+
+def _should_scan_extended_patterns(tool_results: list[dict[str, Any]]) -> bool:
+    for result in tool_results or []:
+        if not isinstance(result, dict):
+            continue
+        tool_name = str(result.get("tool_name") or "").lower()
+        if not tool_name:
+            continue
+        if (
+            "email" in tool_name
+            or "mail" in tool_name
+            or "draft" in tool_name
+            or tool_risk_tier(tool_name) == "destructive"
+        ):
+            return True
+    return False
 
 
 def check_side_effect_claims(
@@ -214,7 +284,10 @@ def check_side_effect_claims(
     has_failure, failure_names = _has_hard_failure(tool_results)
 
     # Detect first-person past-tense claims of completed action.
-    for kind, pattern in _CLAIM_PATTERNS:
+    patterns = list(CORE_CLAIM_PATTERNS)
+    if _should_scan_extended_patterns(tool_results):
+        patterns.extend(EXTENDED_CLAIM_PATTERNS)
+    for kind, pattern in patterns:
         if pattern.search(text):
             if kind not in claims:
                 claims.append(kind)
@@ -257,9 +330,22 @@ def check_side_effect_claims(
     # Claim made — must have at least one supporting successful tool result.
     for kind in claims:
         if not _has_supporting_evidence(kind, tool_results):
+            expected_tools = sorted(WRITE_TOOLS)
+            if kind == "web_search":
+                expected_tools = ["web_search"]
+            elif kind == "web_fetch":
+                expected_tools = ["web_fetch"]
+            elif kind == "memory_query":
+                expected_tools = ["query_memory", "shovs_memory_query"]
+            elif kind == "email_draft":
+                expected_tools = ["draft_email", "create_draft"]
+            elif kind == "email_send":
+                expected_tools = ["send_email"]
+            elif kind == "external_booking":
+                expected_tools = ["book_flight", "book_hotel", "purchase", "charge"]
             issues.append(
                 f"Response claims '{kind}' completed but no successful tool "
-                f"result supports it (no successful {', '.join(sorted(WRITE_TOOLS))} call)."
+                f"result supports it (no successful {', '.join(expected_tools)} call)."
             )
 
     return {

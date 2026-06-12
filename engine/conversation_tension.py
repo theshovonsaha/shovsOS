@@ -31,6 +31,8 @@ class ConversationTension:
     conflicting_facts: tuple[dict[str, str], ...] = ()
     stance_drifts: tuple[dict[str, str], ...] = ()
     unacknowledged_drift: bool = False
+    storage_action: str = "none"
+    resolution_policy: str = "none"
 
 
 def analyze_conversation_tension(
@@ -86,11 +88,15 @@ def analyze_conversation_tension(
         notes = "Acknowledge the revision, state what changed, and use the new fact as authoritative going forward."
         challenge_level = "medium"
         should_challenge = True
+        storage_action = "void_previous_store_current"
+        resolution_policy = "latest_explicit_correction_wins"
     elif conflicts:
         summary = "Current turn conflicts with earlier user-stated facts. Do not assume both are true at once."
         notes = "Surface the contradiction plainly and ask the user to reconcile it if the answer depends on that fact."
         challenge_level = "high" if not hedged else "medium"
         should_challenge = True
+        storage_action = "store_current_with_conflict_trace"
+        resolution_policy = "do_not_present_both_as_current"
     elif stance_drifts and unacknowledged_drift:
         summary = "User's current position diverges from an earlier stated stance without explicit acknowledgment."
         drift = stance_drifts[0]
@@ -100,6 +106,8 @@ def analyze_conversation_tension(
         )
         challenge_level = "medium" if not hedged else "low"
         should_challenge = True
+        storage_action = "keep_prior_and_current_stance_pending"
+        resolution_policy = "ask_if_answer_depends_on_active_stance"
     elif stance_drifts:
         summary = "Current turn explicitly revises an earlier stated stance. Preserve the new stance and avoid treating both positions as active."
         drift = stance_drifts[0]
@@ -108,21 +116,29 @@ def analyze_conversation_tension(
         )
         challenge_level = "low"
         should_challenge = False
+        storage_action = "supersede_prior_stance"
+        resolution_policy = "latest_explicit_revision_wins"
     elif direct_push_request:
         summary = "User explicitly wants pushback instead of comfort or agreement."
         notes = "Challenge weak assumptions, point out drift, and prefer precision over reassurance."
         challenge_level = "medium"
         should_challenge = True
+        storage_action = "none"
+        resolution_policy = "challenge_weak_assumptions"
     elif recent_user_messages and not hedged:
         summary = "Track the user's trajectory across the conversation and preserve any meaningful drift in position or constraints."
         notes = "If the current answer depends on a changed premise, make that change explicit instead of flattening the conversation into the last message only."
         challenge_level = "low"
         should_challenge = False
+        storage_action = "none"
+        resolution_policy = "track_trajectory"
     else:
         summary = ""
         notes = ""
         challenge_level = "low"
         should_challenge = False
+        storage_action = "none"
+        resolution_policy = "none"
 
     return ConversationTension(
         summary=summary,
@@ -133,6 +149,8 @@ def analyze_conversation_tension(
         conflicting_facts=tuple(conflicts),
         stance_drifts=tuple(stance_drifts),
         unacknowledged_drift=unacknowledged_drift,
+        storage_action=storage_action,
+        resolution_policy=resolution_policy,
     )
 
 
@@ -145,6 +163,10 @@ def render_conversation_tension(tension: ConversationTension) -> str:
         lines.append(f"Notes: {tension.notes}")
     lines.append(f"Challenge Level: {tension.challenge_level}")
     lines.append(f"Should Challenge: {'yes' if tension.should_challenge else 'no'}")
+    if tension.resolution_policy and tension.resolution_policy != "none":
+        lines.append(f"Resolution Policy: {tension.resolution_policy}")
+    if tension.storage_action and tension.storage_action != "none":
+        lines.append(f"Storage Impact: {tension.storage_action}")
     for conflict in tension.conflicting_facts[:4]:
         lines.append(
             "- Drift: "
@@ -158,6 +180,25 @@ def render_conversation_tension(tension: ConversationTension) -> str:
             f"but current turn implies '{drift.get('current')}'"
         )
     return "\n".join(lines)
+
+
+def conversation_tension_audit_payload(tension: Optional[ConversationTension]) -> dict:
+    tension = tension or ConversationTension()
+    return {
+        "dynamic": True,
+        "summary": tension.summary,
+        "notes": tension.notes,
+        "challenge_level": tension.challenge_level,
+        "should_challenge": bool(tension.should_challenge),
+        "drift_detected": bool(tension.drift_detected),
+        "unacknowledged_drift": bool(tension.unacknowledged_drift),
+        "conflict_count": len(tension.conflicting_facts),
+        "stance_drift_count": len(tension.stance_drifts),
+        "conflicting_facts": [dict(item) for item in tension.conflicting_facts],
+        "stance_drifts": [dict(item) for item in tension.stance_drifts],
+        "resolution_policy": tension.resolution_policy,
+        "storage_action": tension.storage_action,
+    }
 
 
 def detect_stance_drifts(

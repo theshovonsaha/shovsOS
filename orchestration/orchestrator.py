@@ -5,6 +5,50 @@ from llm.base_adapter import BaseLLMAdapter
 from config.logger import log
 
 
+def normalize_plan_steps(
+    entries: List[Any],
+    tools: List[Dict[str, str]],
+) -> List[Dict[str, Any]]:
+    """Validate planner-emitted plan_steps. Cap at 6, drop malformed.
+
+    Always emits status='pending' regardless of what the planner sent — the
+    runtime owns status transitions, not the planner. Tool names that
+    don't appear in the planner's selected tools list are kept (the planner
+    may reference a tool the runtime later resolves), but the field is
+    None when the planner explicitly says null.
+    """
+    allowed_status = {"pending"}
+    allowed_risk = {"read_only", "write", "destructive"}
+    normalized: List[Dict[str, Any]] = []
+    for idx, entry in enumerate(entries or []):
+        if not isinstance(entry, dict):
+            continue
+        desc = str(entry.get("description", "")).strip()
+        if not desc:
+            continue
+        step_id = str(entry.get("id") or f"step_{idx + 1}").strip()
+        raw_tool = entry.get("tool")
+        tool_val: Optional[str] = None
+        if isinstance(raw_tool, str) and raw_tool.strip():
+            tool_val = raw_tool.strip()
+        risk = str(entry.get("risk", "read_only")).strip().lower()
+        if risk not in allowed_risk:
+            risk = "read_only"
+        status = str(entry.get("status", "pending")).strip().lower()
+        if status not in allowed_status:
+            status = "pending"
+        normalized.append({
+            "id": step_id,
+            "description": desc[:240],
+            "tool": tool_val,
+            "status": status,
+            "risk": risk,
+        })
+        if len(normalized) >= 6:
+            break
+    return normalized
+
+
 _TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9\-]{2,}")
 _VERIFIER_STOPWORDS = frozenset({
     "the", "and", "for", "are", "was", "were", "but", "not", "you", "all",
@@ -135,13 +179,24 @@ Return ONLY JSON (no markdown). Preferred format:
   "tools": [
     {{"name": "tool_name", "priority": "high|medium|low", "reason": "short reason", "target_argument_clue": "specific clue for the executor to use (e.g. exact URL or search terms)"}}
   ],
+  "plan_steps": [
+    {{"id": "step_1", "description": "what this step does", "tool": "tool_name or null", "status": "pending", "risk": "read_only|write|destructive"}}
+  ],
   "force_memory": true/false,
   "memory_topic": "topic or empty",
   "locus_id": "locus_id if spatial memory is targeted or empty",
+  "risk_tier": "read_only|write|destructive",
   "confidence": 0.0-1.0
 }}
 
-Legacy fallback format allowed: ["web_search", "web_fetch"]
+plan_steps rules:
+- Maximum 6 steps. If the task needs more, decompose into the most important 6 that guarantee completion.
+- Each step's `tool` must match a tool name in `tools` (or null for steps the actor handles without a tool).
+- The runtime updates `status` after each tool turn. Always emit `pending` from the planner.
+- `risk` per step lets the dispatch gate refuse destructive steps without explicit user authorization.
+
+Legacy fallback format allowed: ["web_search", "web_fetch"] — when used, plan_steps defaults to []
+and risk_tier defaults to read_only.
 
 User Query: "{query}"
 """
@@ -210,12 +265,28 @@ Rules:
 - Be strict about mutated domains, renamed products, and widened search targets that are not supported by evidence.
 - Mark supported=false if the phase context shows a material contradiction in the user's own stated facts and the answer hides that contradiction instead of naming it.
 
+Verdict vocabulary (3-way):
+- "supported": the response is grounded; commit and ship.
+- "needs_redraft": the response shape is wrong (style, missing caveat, claim hidden) but the evidence is sufficient. A redraft with constraints can fix it.
+- "needs_replan": the evidence itself is insufficient or misaligned with the objective. No redraft will fix this — the runtime should re-plan with target_state hint.
+   - target_state="gather" when more evidence is needed
+   - target_state="clarify" when the user's question is ambiguous
+   - target_state="recall" when memory was the missing piece
+
 Return ONLY JSON:
 {{
   "supported": true/false,
+  "verdict": "supported|needs_redraft|needs_replan",
+  "target_state": "gather|clarify|recall|build|verify|respond" (only when verdict=needs_replan),
   "issues": ["short issue", "short issue"],
+  "missing_evidence": ["short description of what's missing"] (only when verdict=needs_replan),
   "confidence": 0.0-1.0
 }}
+
+Backwards compatibility:
+- If the verifier model only emits "supported", the runtime infers verdict:
+  - supported=true → verdict="supported"
+  - supported=false → verdict="needs_redraft" (the safe legacy default)
 """
 
 MEMORY_SIGNAL = re.compile(
@@ -575,6 +646,8 @@ class AgenticOrchestrator:
                 "confidence": 0.98,
                 "route_type": route_type,
                 "should_plan": False,
+                "plan_steps": [],
+                "risk_tier": "read_only",
             }
         if route_type == "url_fetch" and "web_fetch" in known_tools and "web_fetch" not in failed_set:
             deterministic_tools.append({"name": "web_fetch", "priority": "high", "reason": "Direct URL detected."})
@@ -590,6 +663,18 @@ class AgenticOrchestrator:
             deterministic_tools.append({"name": "web_search", "priority": "high", "reason": "Deterministic factual/current query route."})
 
         if deterministic_tools and route_type in {"url_fetch", "direct_fact", "memory_recall"}:
+            # Synthesize plan_steps from the deterministic tools so the
+            # finalize gate can track them just like a planner-emitted plan.
+            det_steps = [
+                {
+                    "id": f"step_{i + 1}",
+                    "description": entry.get("reason", entry["name"]),
+                    "tool": entry["name"],
+                    "status": "pending",
+                    "risk": "read_only",
+                }
+                for i, entry in enumerate(deterministic_tools)
+            ]
             return {
                 "strategy": "Use deterministic route-selected tools before final answer.",
                 "tools": deterministic_tools,
@@ -600,6 +685,8 @@ class AgenticOrchestrator:
                 "confidence": 0.9,
                 "route_type": route_type,
                 "should_plan": False,
+                "plan_steps": det_steps,
+                "risk_tier": "read_only",
             }
 
         # Compose failed_tools slot. The base value lists tools that failed
@@ -633,8 +720,13 @@ class AgenticOrchestrator:
         )
         
         from llm.adapter_factory import create_adapter, strip_provider_prefix
-        current_adapter = create_adapter(provider=model) if ":" in model else self.adapter
-        clean_model = strip_provider_prefix(model)
+        if ":" in model:
+            provider_prefix = model.split(":", 1)[0].lower()
+            current_adapter = create_adapter(provider=provider_prefix)
+            clean_model = strip_provider_prefix(model)
+        else:
+            current_adapter = self.adapter
+            clean_model = model
         
         try:
             response = await current_adapter.complete(
@@ -737,6 +829,18 @@ class AgenticOrchestrator:
             # If planner targeted a locus, use it; otherwise fall back to spatial scan result.
             planned_locus_id = str(payload.get("locus_id", "")).strip() or _spatial_locus_id
 
+            plan_steps = normalize_plan_steps(payload.get("plan_steps", []), tools)
+            risk_tier_out = str(payload.get("risk_tier", "")).strip().lower()
+            if risk_tier_out not in {"read_only", "write", "destructive"}:
+                # Derive from plan_steps if planner didn't supply.
+                step_risks = {s["risk"] for s in plan_steps}
+                if "destructive" in step_risks:
+                    risk_tier_out = "destructive"
+                elif "write" in step_risks:
+                    risk_tier_out = "write"
+                else:
+                    risk_tier_out = "read_only"
+
             structured = {
                 "strategy": str(payload.get("strategy", "Use selected tools to gather evidence before final answer.")),
                 "tools": tools,
@@ -747,6 +851,8 @@ class AgenticOrchestrator:
                 "confidence": float(payload.get("confidence", 0.5)),
                 "route_type": route_type,
                 "should_plan": True,
+                "plan_steps": plan_steps,
+                "risk_tier": risk_tier_out,
             }
             log("orch", "plan", f"Orchestrator strategy: {[t['name'] for t in tools]}")
             return structured
@@ -762,6 +868,8 @@ class AgenticOrchestrator:
                 "confidence": 0.0,
                 "route_type": route_type,
                 "should_plan": False,
+                "plan_steps": [],
+                "risk_tier": "read_only",
             }
 
     async def plan(self, query: str, tools_list: List[Dict], model: str = "llama3.1:8b") -> List[str]:
@@ -857,8 +965,13 @@ class AgenticOrchestrator:
         )
 
         from llm.adapter_factory import create_adapter, strip_provider_prefix
-        current_adapter = create_adapter(provider=model) if ":" in model else self.adapter
-        clean_model = strip_provider_prefix(model)
+        if ":" in model:
+            provider_prefix = model.split(":", 1)[0].lower()
+            current_adapter = create_adapter(provider=provider_prefix)
+            clean_model = strip_provider_prefix(model)
+        else:
+            current_adapter = self.adapter
+            clean_model = model
 
         try:
             response = await current_adapter.complete(
@@ -935,7 +1048,13 @@ class AgenticOrchestrator:
         # url_fetch with no tool results: nothing was fetched.
         _skip_routes = {"trivial_chat", "memory_recall"}
         if route_type in _skip_routes:
-            return {"supported": True, "issues": [], "confidence": 1.0, "skipped": True}
+            return {
+                "supported": True,
+                "verdict": "supported",
+                "issues": [],
+                "confidence": 1.0,
+                "skipped": True,
+            }
 
         # Claim-aligned previews: pull spans of each tool result that
         # overlap most with the response under verification. Costs ~2x what
@@ -975,16 +1094,28 @@ class AgenticOrchestrator:
         _grounded_routes = {"direct_fact", "url_fetch", "web_research", "code_execution"}
         if not formatted_results:
             if route_type in _grounded_routes:
+                # No evidence on a grounded route → re-plan, not redraft.
+                # Redrafting can't manufacture evidence that was never gathered.
                 return {
                     "supported": False,
+                    "verdict": "needs_replan",
+                    "target_state": "gather",
                     "issues": [
                         "No tool results were captured to ground the response on a "
                         f"route ({route_type}) that requires external evidence."
                     ],
+                    "missing_evidence": [
+                        f"At least one successful tool call relevant to the {route_type} objective"
+                    ],
                     "confidence": 0.1,
                     "fail_closed": True,
                 }
-            return {"supported": True, "issues": [], "confidence": 0.3}
+            return {
+                "supported": True,
+                "verdict": "supported",
+                "issues": [],
+                "confidence": 0.3,
+            }
 
         prompt = VERIFICATION_PROMPT.format(
             query=query,
@@ -994,8 +1125,13 @@ class AgenticOrchestrator:
         )
 
         from llm.adapter_factory import create_adapter, strip_provider_prefix
-        current_adapter = create_adapter(provider=model) if ":" in model else self.adapter
-        clean_model = strip_provider_prefix(model)
+        if ":" in model:
+            provider_prefix = model.split(":", 1)[0].lower()
+            current_adapter = create_adapter(provider=provider_prefix)
+            clean_model = strip_provider_prefix(model)
+        else:
+            current_adapter = self.adapter
+            clean_model = model
 
         parse_failed = False
         try:
@@ -1033,8 +1169,52 @@ class AgenticOrchestrator:
             confidence = 0.5
         if parse_failed:
             confidence = min(confidence, 0.3)
+
+        # Slice 4: 3-way verdict. The verifier may emit a "verdict" field
+        # directly; if not, we infer from supported. needs_replan is reserved
+        # for cases where evidence itself is missing/misaligned (a redraft
+        # can't fix that). Other unsupported cases default to needs_redraft.
+        raw_verdict = str(payload.get("verdict", "")).strip().lower()
+        valid_verdicts = {"supported", "needs_redraft", "needs_replan"}
+        if raw_verdict in valid_verdicts:
+            verdict = raw_verdict
+        elif supported:
+            verdict = "supported"
+        else:
+            verdict = "needs_redraft"  # safe legacy default
+
+        target_state = ""
+        missing_evidence: list[str] = []
+        if verdict == "needs_replan":
+            raw_target = str(payload.get("target_state", "")).strip().lower()
+            valid_targets = {"gather", "clarify", "recall", "build", "verify", "respond"}
+            target_state = raw_target if raw_target in valid_targets else "gather"
+            raw_missing = payload.get("missing_evidence", [])
+            if isinstance(raw_missing, list):
+                missing_evidence = [
+                    str(m).strip() for m in raw_missing[:5] if str(m).strip()
+                ]
+
+        # Cross-check: if confidence is very low and verdict is needs_redraft
+        # on a grounded route, escalate to needs_replan — low confidence
+        # usually means the evidence didn't actually support the answer.
+        if (
+            verdict == "needs_redraft"
+            and route_type in _grounded_routes
+            and confidence < 0.3
+        ):
+            verdict = "needs_replan"
+            target_state = target_state or "gather"
+            if not missing_evidence:
+                missing_evidence = [
+                    "Verifier reports low confidence; evidence likely insufficient for the claims made."
+                ]
+
         return {
             "supported": supported,
+            "verdict": verdict,
+            "target_state": target_state,
+            "missing_evidence": missing_evidence,
             "issues": [str(item) for item in issues[:5] if str(item).strip()],
             "confidence": confidence,
             "parse_failed": parse_failed,

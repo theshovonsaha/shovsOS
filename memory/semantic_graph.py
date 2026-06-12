@@ -31,6 +31,8 @@ class SemanticGraph:
         self.embedding_timeout = float(getattr(cfg, "EMBEDDING_HTTP_TIMEOUT", 20.0))
         self.embedding_retries = max(0, int(getattr(cfg, "EMBEDDING_HTTP_RETRIES", 2)))
         self.embedding_cache_size = max(64, int(getattr(cfg, "EMBEDDING_CACHE_SIZE", 512)))
+        self._embed_available: bool = True
+        self._embed_failure_count: int = 0
         self._init_db()
 
     @staticmethod
@@ -180,9 +182,47 @@ class SemanticGraph:
                     PRIMARY KEY (src_id, dst_id)
                 )
             ''')
+            # M1: hot-path indexes on facts. Every context build calls
+            # get_current_facts (session-scoped) and get_owner_current_facts
+            # (cross-session). Without these, a 50-turn session does N full
+            # table scans. The predicate-history index also covers M3's
+            # get_predicate_history reader.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_owner_session_valid "
+                "ON facts(owner_id, session_id, valid_to)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_owner_predicate "
+                "ON facts(owner_id, subject, predicate, valid_to)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_owner_valid_from "
+                "ON facts(owner_id, valid_from DESC)"
+            )
             conn.commit()
 
+    def _record_embedding_failure(self, exc: Exception) -> List[float]:
+        self._embed_failure_count += 1
+        if self._embed_failure_count >= 2:
+            if self._embed_available:
+                print(f"[SemanticGraph] Embedding disabled after repeated failures: {exc}")
+            self._embed_available = False
+        elif self._embed_failure_count == 1:
+            print(f"[SemanticGraph] Embedding failed: {exc}")
+        return []
+
     async def _get_embedding(self, text: str) -> List[float]:
+        if not self._embed_available:
+            return []
+        try:
+            embedding = await self._get_embedding_uncached(text)
+            self._embed_failure_count = 0
+            self._embed_available = True
+            return embedding
+        except Exception as exc:
+            return self._record_embedding_failure(exc)
+
+    async def _get_embedding_uncached(self, text: str) -> List[float]:
         """Fetch an embedding from the provider."""
         normalized = self._normalize_text(text)
         model_name = str(self.embedding_model or cfg.EMBED_MODEL).strip()
@@ -287,10 +327,9 @@ class SemanticGraph:
         We embed the string: "subject predicate object"
         """
         text_to_embed = f"search_document: {subject} {predicate} {object_}"
-        try:
-            vector = await self._get_embedding(text_to_embed)
-        except Exception as e:
-            raise Exception(f"Failed to generate embedding: {e}")
+        vector = await self._get_embedding(text_to_embed)
+        if not vector:
+            return -1
 
         now = datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
@@ -316,12 +355,10 @@ class SemanticGraph:
         2. Calculate cosine similarity against all stored memories in memory.
         3. Return the top_k matching relationships.
         """
-        try:
-            # For retrieval, we use 'search_query: ' prefix
-            query_to_embed = f"search_query: {query}" if query else "search_query: "
-            query_vector = await self._get_embedding(query_to_embed)
-        except Exception as e:
-            print(f"[SemanticGraph] Embedding error: {e}")
+        # For retrieval, we use 'search_query: ' prefix
+        query_to_embed = f"search_query: {query}" if query else "search_query: "
+        query_vector = await self._get_embedding(query_to_embed)
+        if not query_vector:
             return []
 
         results = []
@@ -549,6 +586,62 @@ class SemanticGraph:
                 out.append((subject, predicate, obj))
                 if len(out) >= safe_limit:
                     break
+            return out
+
+    def get_predicate_history(
+        self,
+        owner_id: Optional[str],
+        subject: str,
+        predicate: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return the full timeline for one (subject, predicate) pair across
+        all sessions for this owner — including superseded (voided) facts.
+
+        This is the **archaeology** reader. It answers questions like
+        "what did I originally say about Berlin?" or "when did I correct my
+        budget?". The 50-turn shovs scenario (turns 36, 38, 41, 50) requires
+        this surface; without it the agent can only see current facts and
+        will give half-answers to history questions.
+
+        Returns rows ordered by ``valid_from DESC`` (most recent first):
+
+            [
+              {subject, predicate, object, valid_from, valid_to, created_at,
+               run_id, status: "current"|"superseded"},
+              ...
+            ]
+
+        Status is derived (``"current"`` when ``valid_to IS NULL``,
+        ``"superseded"`` otherwise) so callers don't need to interpret the
+        raw column.
+        """
+        safe_limit = max(1, int(limit))
+        clean_subject = (subject or "").strip()
+        clean_predicate = (predicate or "").strip()
+        if not clean_subject or not clean_predicate:
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT subject, predicate, object, valid_from, valid_to,
+                       created_at, run_id, session_id
+                FROM facts
+                WHERE COALESCE(owner_id, '') = COALESCE(?, '')
+                  AND lower(subject) = lower(?)
+                  AND lower(predicate) = lower(?)
+                ORDER BY valid_from DESC, id DESC
+                LIMIT ?
+                ''',
+                (owner_id, clean_subject, clean_predicate, safe_limit),
+            )
+            out: List[Dict[str, Optional[str]]] = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                d["status"] = "current" if d.get("valid_to") is None else "superseded"
+                out.append(d)
             return out
 
     def get_current_facts(self, session_id: str, owner_id: Optional[str] = None) -> List[Tuple[str, str, str]]:

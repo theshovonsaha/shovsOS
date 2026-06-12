@@ -48,7 +48,33 @@ def tool_result_matches_exact_target(item: dict[str, Any], exact_targets: list[s
 
 def is_substantive_tool_result(item: dict[str, Any]) -> bool:
     tool_name = str(item.get("tool_name") or "")
-    return tool_name not in {"todo_write", "todo_update", "query_memory", "store_memory"}
+    if tool_name in {"todo_write", "todo_update", "query_memory", "store_memory"}:
+        return False
+    if not bool(item.get("success")):
+        return False
+
+    content = str(item.get("content") or "").strip()
+    if not content:
+        return False
+    if "[NO_RESULTS]" in content:
+        return False
+
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return True
+    if not isinstance(payload, dict):
+        return True
+
+    payload_type = str(payload.get("type") or "").lower()
+    if payload_type.endswith("_error"):
+        return False
+    if payload_type in {"web_search_results", "search_results"}:
+        results = payload.get("results") or payload.get("organic_results") or []
+        return bool(results)
+    if payload_type in {"bank_balance", "balance"} and payload.get("fresh") is False:
+        return False
+    return True
 
 
 def tool_kind_priority(tool_name: str) -> int:
@@ -171,7 +197,13 @@ def build_working_evidence_block(
         label = f"- {summary['tool_name']} [{summary['status']}]"
         if tags:
             label += f" ({', '.join(tags)})"
-        lines.append(f"{label}: {summary['preview']}")
+        # Prefer the per-tool actor_summary (Slice 4 shaping) when present —
+        # it's a single curated line that captures the meaningful signal
+        # without re-rendering raw output. Falls back to the canonical
+        # preview when the tool ran before the shaping pass landed.
+        actor_summary = str(item.get("actor_summary") or "").strip()
+        body = actor_summary or summary["preview"]
+        lines.append(f"{label}: {body}")
     return "\n".join(lines)
 
 

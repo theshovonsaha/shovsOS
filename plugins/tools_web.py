@@ -667,6 +667,7 @@ async def _web_search(query: str, num_results: int = 8, backend: str = "auto", s
             ("tavily",  _search_tavily),
             ("exa",     _search_exa),
             ("groq",    _search_groq),
+            ("duckduckgo", _search_duckduckgo),
         ]
         for name, fn in backends:
             print(f"[INTERNAL DETECTION] Trying search backend: {name}")
@@ -709,7 +710,7 @@ async def _web_search(query: str, num_results: int = 8, backend: str = "auto", s
                 query=query,
                 backend=backend,
             )
-        configured = []
+        configured = ["duckduckgo"]
         if SEARXNG_URL: configured.append("searxng")
         if BRAVE_KEY:   configured.append("brave")
         if TAVILY_KEY:  configured.append("tavily")
