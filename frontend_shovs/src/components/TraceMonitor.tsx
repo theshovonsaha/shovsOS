@@ -111,6 +111,31 @@ interface RunReplayEvidence {
   provenance?: Record<string, unknown>;
 }
 
+interface OperatorStoryLane {
+  id: string;
+  label: string;
+  status: 'idle' | 'done' | 'attention' | string;
+  count: number;
+  event_id?: string | null;
+  event_type?: string | null;
+  phase?: string;
+  summary: string;
+}
+
+interface OperatorStory {
+  status: string;
+  objective: string;
+  next_best_action?: string;
+  artifact_count?: number;
+  cost?: {
+    input_tokens: number;
+    output_tokens: number;
+    total_tokens: number;
+    estimated_cost_usd: number;
+  };
+  lanes: OperatorStoryLane[];
+}
+
 interface RunReplayResponse {
   found: boolean;
   run: {
@@ -141,6 +166,7 @@ interface RunReplayResponse {
   passes?: RunReplayPass[];
   artifacts?: RunReplayArtifact[];
   evidence?: RunReplayEvidence[];
+  operator_story?: OperatorStory;
 }
 
 interface TraceMonitorProps {
@@ -184,6 +210,8 @@ const BASE_EVENT_TYPES = [
   'all',
   'conversation_tension',
   'stance_signals_extracted',
+  'run_ledger',
+  'phase_packet',
   'phase_context',
   'compiled_context',
   'llm_pass_start',
@@ -237,6 +265,7 @@ function tracePhase(event: TraceEventSummary): string {
     case 'plan':
       return 'planning';
     case 'phase_context':
+    case 'phase_packet':
     case 'compiled_context':
     case 'prompt_components':
     case 'llm_prompt':
@@ -247,6 +276,8 @@ function tracePhase(event: TraceEventSummary): string {
     case 'tool_call':
     case 'tool_result':
       return 'tool';
+    case 'run_ledger':
+      return 'ledger';
     case 'verification_result':
     case 'verification_warning':
       return 'verification';
@@ -308,6 +339,31 @@ function relatedTraceIds(event: TraceEventSummary): string[] {
     String(data.tool_name || data.tool || ''),
     String(data.model || ''),
   ].filter(Boolean) as string[];
+}
+
+function extractRunLedger(data: unknown): Record<string, unknown> | null {
+  if (!data || typeof data !== 'object') return null;
+  const record = data as Record<string, unknown>;
+  const nested = record.run_ledger;
+  if (nested && typeof nested === 'object') return nested as Record<string, unknown>;
+  if (record.version === 'run-ledger-v1' || record.ledger_mode) return record;
+  return null;
+}
+
+function ledgerList(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter(
+        (item): item is Record<string, unknown> =>
+          typeof item === 'object' && item !== null,
+      )
+    : [];
+}
+
+function eventStatusClass(status?: string): string {
+  const normalized = String(status || 'idle').toLowerCase();
+  if (normalized.includes('attention') || normalized.includes('warn')) return 'attention';
+  if (normalized.includes('done') || normalized.includes('success') || normalized.includes('complete')) return 'done';
+  return 'idle';
 }
 
 async function copyText(value: string): Promise<void> {
@@ -496,6 +552,32 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     }
     return items.slice(0, 6);
   }, [recentTimelineEntries, runReplay]);
+
+  const operatorStory = runReplay?.operator_story;
+  const fallbackLanes = useMemo<OperatorStoryLane[]>(() => {
+    const stageMap: Array<{ id: string; label: string; types: string[] }> = [
+      { id: 'plan', label: 'Plan', types: ['plan', 'plan_steps', 'continuation_gate'] },
+      { id: 'context', label: 'Context', types: ['phase_packet', 'phase_context', 'compiled_context'] },
+      { id: 'tool', label: 'Tools', types: ['tool_call', 'tool_result'] },
+      { id: 'verify', label: 'Verify', types: ['verification_result', 'verification_warning'] },
+      { id: 'response', label: 'Response', types: ['assistant_response'] },
+    ];
+    return stageMap.map((stage) => {
+      const stageEvents = events.filter((event) => stage.types.includes(event.event_type));
+      const latest = stageEvents[0];
+      return {
+        id: stage.id,
+        label: stage.label,
+        status: latest ? (traceSeverity(latest) === 'error' || traceSeverity(latest) === 'warning' ? 'attention' : 'done') : 'idle',
+        count: stageEvents.length,
+        event_id: latest?.id,
+        event_type: latest?.event_type,
+        phase: latest ? tracePhase(latest) : '',
+        summary: latest ? describeShovsTraceEvent(latest) : 'Not recorded yet.',
+      };
+    });
+  }, [events]);
+  const storyLanes = operatorStory?.lanes?.length ? operatorStory.lanes : fallbackLanes;
 
   const fetchRecent = useCallback(
     async (opts?: { append?: boolean; beforeTs?: number }) => {
@@ -700,10 +782,15 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     () => (selectedEvent ? describeShovsTraceEvent(selectedEvent) : ''),
     [selectedEvent],
   );
+  const selectedRunLedger = useMemo(
+    () => extractRunLedger(selectedEvent?.data),
+    [selectedEvent],
+  );
   const selectedPacketSections = useMemo(() => {
     if (!selectedEvent) return [] as PacketSection[];
     if (
       selectedEvent.event_type !== 'phase_context' &&
+      selectedEvent.event_type !== 'phase_packet' &&
       selectedEvent.event_type !== 'compiled_context'
     ) {
       return [] as PacketSection[];
@@ -728,6 +815,88 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
     () => [...(runReplay?.checkpoints || [])].slice(-4).reverse(),
     [runReplay],
   );
+
+  const renderRunMap = (ledger: Record<string, unknown>) => {
+    const summary =
+      ledger.summary && typeof ledger.summary === 'object'
+        ? (ledger.summary as Record<string, unknown>)
+        : {};
+    const planSteps = ledgerList(ledger.plan_steps);
+    const pendingSteps = ledgerList(ledger.pending_steps);
+    const toolCalls = ledgerList(ledger.tool_calls);
+    const toolResults = ledgerList(ledger.tool_results);
+    const evidenceItems = ledgerList(ledger.evidence_items);
+    const memoryWrites = ledgerList(ledger.memory_writes);
+    const missing = Array.isArray(ledger.missing_requirements)
+      ? ledger.missing_requirements.map(String)
+      : [];
+    const verification =
+      ledger.verification && typeof ledger.verification === 'object'
+        ? (ledger.verification as Record<string, unknown>)
+        : null;
+
+    return (
+      <div className='run-map'>
+        <div className='run-map-head'>
+          <div>
+            <div className='run-map-title'>Run Map</div>
+            <div className='run-map-subtitle'>
+              {String(ledger.objective || 'objective not recorded')}
+            </div>
+          </div>
+          <div className='run-map-pills'>
+            <span>{String(ledger.ledger_mode || 'shadow')}</span>
+            <span>{String(ledger.phase || 'phase')}</span>
+            <span>{Number(summary.event_count || 0)} events</span>
+          </div>
+        </div>
+        <div className='run-map-grid'>
+          <div className='run-map-card'>
+            <span>Plan</span>
+            <strong>{planSteps.length} steps</strong>
+            <small>{pendingSteps.length} pending</small>
+          </div>
+          <div className='run-map-card'>
+            <span>Tools</span>
+            <strong>{toolCalls.length} calls</strong>
+            <small>{toolResults.length} results</small>
+          </div>
+          <div className='run-map-card'>
+            <span>Evidence</span>
+            <strong>{evidenceItems.length} selected</strong>
+            <small>{missing.length ? `${missing.length} missing` : 'complete enough'}</small>
+          </div>
+          <div className='run-map-card'>
+            <span>Memory</span>
+            <strong>{memoryWrites.length} writes</strong>
+            <small>{memoryWrites[0]?.status ? String(memoryWrites[0].status) : 'not committed'}</small>
+          </div>
+          <div className='run-map-card'>
+            <span>Verification</span>
+            <strong>{verification ? String(verification.status || 'recorded') : 'not recorded'}</strong>
+            <small>{verification ? String(verification.verdict || '') : 'awaiting response'}</small>
+          </div>
+        </div>
+        {toolResults.length > 0 && (
+          <div className='run-map-list'>
+            <div className='run-map-list-title'>Linked Tool Results</div>
+            {toolResults.slice(-4).map((item) => (
+              <div key={String(item.id)} className='run-map-row'>
+                <span>{String(item.tool_name || 'tool')}</span>
+                <strong>{String(item.status || 'status')}</strong>
+                <small>{String(item.summary || '').slice(0, 160)}</small>
+              </div>
+            ))}
+          </div>
+        )}
+        {missing.length > 0 && (
+          <div className='run-map-missing'>
+            missing: {missing.join(', ')}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   return (
     <div className='trace-monitor-shell'>
@@ -883,83 +1052,99 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
 
       {error && <div className='trace-error'>{error}</div>}
       {focusMode === 'story' ? (
-        <div className='trace-overview-shell'>
-          <section className='trace-overview-section'>
-            <div className='trace-section-head'>
-              <div className='trace-section-title'>Overview</div>
-              <div className='trace-section-subtitle'>
-                Current run state in operator language
+        <div className='trace-operator-view'>
+          <section className='trace-operator-hero'>
+            <div className='trace-operator-main'>
+              <div className='trace-operator-kicker'>Operator View</div>
+              <h2>{operatorStory?.objective || overview.primary[0]?.summary || 'Waiting for run objective.'}</h2>
+              <p>
+                {operatorStory?.next_best_action ||
+                  overview.primary[1]?.summary ||
+                  'No next action has been recorded yet.'}
+              </p>
+            </div>
+            <div className='trace-operator-metrics'>
+              <div>
+                <span>Status</span>
+                <strong>{operatorStory?.status || runReplay?.run?.status || 'idle'}</strong>
+              </div>
+              <div>
+                <span>Tokens</span>
+                <strong>{formatTokens(operatorStory?.cost?.total_tokens ?? runReplay?.summary?.total_tokens ?? 0)}</strong>
+              </div>
+              <div>
+                <span>Cost</span>
+                <strong>{formatCurrency(operatorStory?.cost?.estimated_cost_usd ?? runReplay?.summary?.estimated_cost_usd ?? 0)}</strong>
               </div>
             </div>
-            <div className='trace-overview-grid primary'>
-              {overview.primary.map((card) => (
-                <div
-                  key={card.id}
-                  className={`trace-overview-card tone-${card.tone}`}
-                >
-                  <div className='trace-overview-eyebrow'>
-                    {card.eyebrow || card.title}
-                  </div>
-                  <div className='trace-overview-title'>{card.title}</div>
-                  <div className='trace-overview-summary'>{card.summary}</div>
-                  {card.detail ? (
-                    <div className='trace-overview-detail'>{card.detail}</div>
-                  ) : null}
-                </div>
-              ))}
-            </div>
-            {overview.secondary.length > 0 ? (
-              <div className='trace-overview-grid secondary'>
-                {overview.secondary.map((card) => (
-                  <div
-                    key={card.id}
-                    className={`trace-overview-card tone-${card.tone}`}
-                  >
-                    <div className='trace-overview-eyebrow'>
-                      {card.eyebrow || card.title}
-                    </div>
-                    <div className='trace-overview-title'>{card.title}</div>
-                    <div className='trace-overview-summary'>{card.summary}</div>
-                  </div>
-                ))}
-              </div>
-            ) : null}
           </section>
 
-          <section className='trace-overview-section'>
-            <div className='trace-section-head'>
-              <div className='trace-section-title'>Run Story</div>
-              <div className='trace-section-subtitle'>
-                One condensed path through what happened, when, and why
+          <section className='trace-lane-rail' aria-label='Run workflow lanes'>
+            {storyLanes.map((lane, index) => (
+              <button
+                key={lane.id}
+                className={`trace-lane-card state-${eventStatusClass(lane.status)}`}
+                onClick={() => {
+                  if (lane.event_id) {
+                    setSelectedId(lane.event_id);
+                    setFocusMode('inspect');
+                  }
+                }}
+                disabled={!lane.event_id}
+              >
+                <div className='trace-lane-index'>{String(index + 1).padStart(2, '0')}</div>
+                <div className='trace-lane-body'>
+                  <div className='trace-lane-title'>
+                    <span>{lane.label}</span>
+                    <small>{lane.count || 0}</small>
+                  </div>
+                  <div className='trace-lane-summary'>{lane.summary || 'Not recorded yet.'}</div>
+                  <div className='trace-lane-meta'>
+                    <span>{lane.status || 'idle'}</span>
+                    {lane.event_type ? <span>{humanizeShovsTraceEvent(lane.event_type)}</span> : null}
+                  </div>
+                </div>
+              </button>
+            ))}
+          </section>
+
+          <section className='trace-operator-bottom'>
+            <div className='trace-operator-panel'>
+              <div className='trace-section-head compact'>
+                <div className='trace-section-title'>Latest Decisions</div>
+                <button className='trace-action' onClick={() => setFocusMode('inspect')}>
+                  inspect all
+                </button>
+              </div>
+              <div className='trace-decision-list'>
+                {runStoryCards.length === 0 ? (
+                  <div className='trace-empty'>No readable decisions yet.</div>
+                ) : (
+                  runStoryCards.slice(0, 5).map((card) => (
+                    <div key={card.id} className='trace-decision-row'>
+                      <span>{card.eyebrow}</span>
+                      <strong>{card.title}</strong>
+                      <p>{card.summary}</p>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
-            <div className='trace-replay-grid'>
-              {runStoryCards.length === 0 ? (
-                <div className='trace-empty'>No run story available yet.</div>
-              ) : (
-                runStoryCards.map((card) => (
-                  <div key={card.id} className='trace-replay-panel'>
-                    <div className='trace-replay-panel-title'>
-                      {card.eyebrow}
+            <div className='trace-operator-panel narrow'>
+              <div className='trace-section-title'>Signal</div>
+              <div className='trace-signal-stack'>
+                {overview.secondary.length === 0 ? (
+                  <div className='trace-empty'>No warnings or interventions.</div>
+                ) : (
+                  overview.secondary.slice(0, 3).map((card) => (
+                    <div key={card.id} className={`trace-signal-card tone-${card.tone}`}>
+                      <span>{card.eyebrow || card.title}</span>
+                      <strong>{card.title}</strong>
+                      <p>{card.summary}</p>
                     </div>
-                    <div className='trace-replay-panel-list'>
-                      <div className='trace-replay-card tone-neutral'>
-                        <div className='trace-replay-card-top'>
-                          <span>{card.title}</span>
-                        </div>
-                        <div className='trace-replay-card-summary'>
-                          {card.summary}
-                        </div>
-                        {card.detail ? (
-                          <div className='trace-replay-card-detail'>
-                            {card.detail}
-                          </div>
-                        ) : null}
-                      </div>
-                    </div>
-                  </div>
-                ))
-              )}
+                  ))
+                )}
+              </div>
             </div>
           </section>
         </div>
@@ -1146,6 +1331,12 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                   <div className='trace-json-head'>Readable Summary</div>
                   <pre className='trace-json'>{selectedSummary}</pre>
                 </div>
+
+                {selectedRunLedger && (
+                  <div className='trace-run-map-wrap'>
+                    {renderRunMap(selectedRunLedger)}
+                  </div>
+                )}
 
                 {selectedPacketSections.length > 0 && (
                   <div className='trace-packet-wrap'>

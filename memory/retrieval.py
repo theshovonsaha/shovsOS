@@ -402,6 +402,28 @@ async def unified_memory_search(
         owner_id=owner_scope,
         locus_id=locus_id,
     )
+    if not semantic_hits and locus_id and hasattr(graph, "list_triplets"):
+        try:
+            fallback_triplets = graph.list_triplets(
+                owner_id=owner_scope,
+                locus_id=locus_id,
+                limit=search_limit,
+            )
+        except Exception:
+            fallback_triplets = []
+        semantic_hits = [
+            {
+                **item,
+                "similarity": max(
+                    0.31,
+                    _lexical_overlap_score(
+                        query,
+                        f"{item.get('subject', '')} {item.get('predicate', '')} {item.get('object', '')}",
+                    ),
+                ),
+            }
+            for item in fallback_triplets
+        ]
     for item in semantic_hits:
         subject = str(item.get("subject") or "").strip()
         predicate = str(item.get("predicate") or "").strip()

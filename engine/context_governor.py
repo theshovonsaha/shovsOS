@@ -146,6 +146,77 @@ class ContextGovernor:
             formatted=True,
         )
 
+    def _build_exact_memory_lane(
+        self,
+        *,
+        session: Optional[object],
+        owner_id: Optional[str],
+        trace_prefix: str,
+    ) -> Optional[ContextItem]:
+        """Render exact policy/preference memory before semantic recall.
+
+        Policies and preferences are precision lanes: they should be injected
+        directly when present, not rediscovered through vector similarity.
+        """
+        if self.graph is None or session is None or not hasattr(self.graph, "get_current_fact_records"):
+            return None
+        session_id = str(getattr(session, "id", "") or "").strip()
+        if not session_id:
+            return None
+        try:
+            records = list(
+                self.graph.get_current_fact_records(
+                    session_id,
+                    owner_id=owner_id,
+                    memory_types=["policy", "preference"],
+                    limit=16,
+                )
+                or []
+            )
+        except Exception:
+            return None
+        if not records:
+            return None
+
+        grouped: dict[str, list[str]] = {"policy": [], "preference": []}
+        for record in records:
+            memory_type = str(record.get("memory_type") or "fact").strip().lower()
+            if memory_type not in grouped:
+                continue
+            subject = str(record.get("subject") or "").strip()
+            predicate = str(record.get("predicate") or "").strip()
+            object_ = str(record.get("object") or "").strip()
+            if not (subject and predicate and object_):
+                continue
+            confidence = record.get("confidence")
+            suffix = f" (confidence={confidence})" if confidence is not None else ""
+            grouped[memory_type].append(f"- {subject} {predicate}: {object_}{suffix}")
+
+        lines = [
+            "Exact memory lane. Use these directly; do not rely on semantic recall for policy/preference facts."
+        ]
+        if grouped["policy"]:
+            lines.append("Policy:")
+            lines.extend(grouped["policy"][:8])
+        if grouped["preference"]:
+            lines.append("Preference:")
+            lines.extend(grouped["preference"][:8])
+        if len(lines) == 1:
+            return None
+        return self._build_standard_memory_item(
+            item_id="context_governor_exact_memory",
+            title="Exact Policy and Preference Memory",
+            content="\n".join(lines),
+            trace_id=f"{trace_prefix}:governor:exact",
+            provenance={
+                "profile": "exact",
+                "memory_types": ["policy", "preference"],
+                "record_count": sum(len(values) for values in grouped.values()),
+            },
+            priority=61,
+            max_chars=1200,
+        )
+
     def _pattern_cues(
         self,
         *,
@@ -352,6 +423,14 @@ class ContextGovernor:
             current_facts=current_facts,
             trace_prefix=trace_prefix,
         )
+        owner_id = getattr(session, "owner_id", None) if session is not None else None
+        exact_lane = self._build_exact_memory_lane(
+            session=session,
+            owner_id=owner_id,
+            trace_prefix=trace_prefix,
+        )
+        if exact_lane is not None:
+            memory_items = [exact_lane, *memory_items]
         return GovernedMemorySurface(
             candidate_context=candidate_context,
             historical_context=historical_context,

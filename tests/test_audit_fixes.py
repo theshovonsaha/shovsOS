@@ -15,13 +15,36 @@ from httpx import AsyncClient, ASGITransport
 
 @pytest.mark.asyncio
 async def test_gemini_adapter_patches_async_httpx_wrapper_state_cleanup(monkeypatch):
+    """
+    Regression test for the ``AsyncHttpxClientWrapper object has no attribute '_state'``
+    noise emitted from background GC tasks.
+
+    The patch must silence the error in three places:
+      1. aclose()  – the background coroutine httpx schedules via create_task
+      2. is_closed – the @property __del__ checks BEFORE scheduling aclose()
+      3. __del__   – belt-and-suspenders guard on the del method itself
+    """
     from llm.gemini_adapter import GeminiAdapter
 
     class BrokenAsyncHttpxClientWrapper:
+        """Simulates an AsyncHttpxClientWrapper whose httpx internals were never initialised."""
         _shovs_safe_aclose = False
 
         async def aclose(self):
             raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
+
+        @property
+        def is_closed(self):
+            raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
+
+        def __del__(self):
+            if self.is_closed:  # triggers is_closed AttributeError
+                return
+            try:
+                import asyncio
+                asyncio.get_running_loop().create_task(self.aclose())
+            except Exception:
+                pass
 
     import sys
     from types import ModuleType
@@ -40,13 +63,26 @@ async def test_gemini_adapter_patches_async_httpx_wrapper_state_cleanup(monkeypa
     adapter = GeminiAdapter(api_key="test")
     adapter._patch_async_httpx_wrapper_close()
 
-    await BrokenAsyncHttpxClientWrapper().aclose()
     assert BrokenAsyncHttpxClientWrapper._shovs_safe_aclose is True
+
+    # 1. aclose() must not raise
+    await BrokenAsyncHttpxClientWrapper().aclose()
+
+    # 2. is_closed must return True (treats uninitialised as closed) without raising
+    w = BrokenAsyncHttpxClientWrapper()
+    assert w.is_closed is True
+
+    # 3. __del__ must not raise (is_closed returns True → returns early without scheduling)
+    BrokenAsyncHttpxClientWrapper().__del__()
 
     class FactoryBrokenAsyncHttpxClientWrapper:
         _shovs_safe_aclose = False
 
         async def aclose(self):
+            raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
+
+        @property
+        def is_closed(self):
             raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
 
     base_client_mod.AsyncHttpxClientWrapper = FactoryBrokenAsyncHttpxClientWrapper
@@ -56,6 +92,15 @@ async def test_gemini_adapter_patches_async_httpx_wrapper_state_cleanup(monkeypa
 
     await FactoryBrokenAsyncHttpxClientWrapper().aclose()
     assert FactoryBrokenAsyncHttpxClientWrapper._shovs_safe_aclose is True
+    assert FactoryBrokenAsyncHttpxClientWrapper().is_closed is True
+
+    import httpx
+
+    class AsyncHttpxClientWrapper(httpx.AsyncClient):
+        pass
+
+    inherited_wrapper = object.__new__(AsyncHttpxClientWrapper)
+    await inherited_wrapper.aclose()
 
 
 @pytest.mark.asyncio

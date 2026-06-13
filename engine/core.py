@@ -1648,6 +1648,11 @@ class AgentCore:
             self.adapter = current_use_adapter
             
             self._context_governor.set_adapter(current_use_adapter)
+            if hasattr(ctx_eng, "set_adapter"):
+                try:
+                    ctx_eng.set_adapter(current_use_adapter)
+                except Exception:
+                    pass
             if self.orch:
                 self.orch.set_adapter(current_use_adapter)
             

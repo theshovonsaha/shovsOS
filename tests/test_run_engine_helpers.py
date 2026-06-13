@@ -18,6 +18,56 @@ from run_engine.memory_pipeline import (
 from run_engine.tool_selection import build_actor_request_content, extract_tool_call, fallback_tool_call, summarize_arguments
 
 
+def test_continuation_gate_resumes_ambiguous_followup():
+    from run_engine.engine import _assess_continuation_state
+
+    decision = _assess_continuation_state(
+        user_message="continue",
+        continuation_state={
+            "objective": "Find a storage bin under $20 near Toronto.",
+            "pending_steps": [{"id": "s1", "tool": "shopping_advice", "status": "pending"}],
+        },
+        ambiguous_followup=True,
+    )
+
+    assert decision["action"] == "resume"
+    assert decision["effective_objective"] == "Find a storage bin under $20 near Toronto."
+    assert decision["pending_step_count"] == 1
+
+
+def test_continuation_gate_extends_related_additive_turn():
+    from run_engine.engine import _assess_continuation_state
+
+    decision = _assess_continuation_state(
+        user_message="also check Walmart for the storage bin",
+        continuation_state={
+            "objective": "Find a storage bin under $20 near Toronto at Canadian Tire.",
+            "pending_steps": [{"id": "s1", "tool": "shopping_advice", "status": "pending"}],
+        },
+        ambiguous_followup=False,
+    )
+
+    assert decision["action"] == "resume_with_update"
+    assert "Current turn update" in decision["effective_objective"]
+    assert decision["overlap"] > 0
+
+
+def test_continuation_gate_supersedes_unrelated_new_task():
+    from run_engine.engine import _assess_continuation_state
+
+    decision = _assess_continuation_state(
+        user_message="Write a Python script to rename files.",
+        continuation_state={
+            "objective": "Find a storage bin under $20 near Toronto.",
+            "pending_steps": [{"id": "s1", "tool": "shopping_advice", "status": "pending"}],
+        },
+        ambiguous_followup=False,
+    )
+
+    assert decision["action"] == "supersede"
+    assert decision["effective_objective"] == "Write a Python script to rename files."
+
+
 def test_extract_tool_call_parses_tool_calls_payload():
     registry = ToolRegistry()
     raw = '{"tool_calls": [{"function": {"name": "web_search", "arguments": "{\\"query\\": \\"run engine\\"}"}}]}'
@@ -56,6 +106,23 @@ def test_build_actor_request_content_includes_recent_result_previews():
     assert "Allowed tools: web_search" in content
     assert "Found documentation." in content
     assert "Context block:\nworking context" in content
+
+
+def test_build_actor_request_content_includes_capability_cards():
+    content = build_actor_request_content(
+        user_message="Find a storage bin near Toronto.",
+        effective_objective="Find a storage bin near Toronto.",
+        session_first_message="",
+        allowed_tools=["shopping_advice"],
+        tool_results=[],
+        context_block="",
+        clip_text=lambda text, _: text,
+        capability_context="Capability: Local Store Shopping Advisor\nOutput:\n- answer_patch.comparison_table",
+    )
+
+    assert "Capability cards for available workflows:" in content
+    assert "Local Store Shopping Advisor" in content
+    assert "answer_patch.comparison_table" in content
 
 
 def test_summarize_arguments_clips_long_values():
@@ -322,6 +389,41 @@ def test_build_phase_packet_can_include_conversation_tension():
     assert "Conversation Tension" in memory_packet.content
     assert "Storage Impact: void_previous_store_current" in memory_packet.content
     assert "Meta Context" not in memory_packet.content
+
+
+def test_build_phase_packet_includes_capability_cards():
+    from types import SimpleNamespace
+
+    from engine.context_schema import ContextPhase
+    from run_engine.context_packets import PacketBuildInputs, build_phase_packet
+    from run_engine.types import RunEngineRequest
+
+    packet = build_phase_packet(
+        context_engine=None,
+        inputs=PacketBuildInputs(
+            request=RunEngineRequest(
+                session_id="packet-capability",
+                owner_id="owner-1",
+                agent_id="shopping-advisor",
+                user_message="Find a storage bin near Toronto.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+            ),
+            session=SimpleNamespace(first_message="", sliding_window=[]),
+            phase=ContextPhase.ACTING,
+            system_prompt="You are Shovs.",
+            effective_objective="Find a storage bin near Toronto.",
+            current_context="",
+            allowed_tools=[{"name": "shopping_advice", "description": "Verified shopping advice."}],
+            tool_results=[],
+            capability_context="Capability: Local Store Shopping Advisor\nOutput:\n- answer_patch.comparison_table",
+        ),
+    )
+
+    assert "Capability Cards" in packet.content
+    assert "Local Store Shopping Advisor" in packet.content
+    item = next(item for item in packet.trace["included"] if item["item_id"] == "capability_cards")
+    assert item["source"] == "capability_registry"
 
 
 def test_build_phase_packet_can_include_shared_session_and_memory_lanes():

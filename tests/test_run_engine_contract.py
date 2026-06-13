@@ -225,6 +225,11 @@ async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
     assert "tool_result" in event_types
     assert "done" in event_types
     assert "".join(event.get("content", "") for event in events if event["type"] == "token") == "Final answer."
+    streamed_tool_call = next(event for event in events if event["type"] == "tool_call")
+    streamed_tool_result = next(event for event in events if event["type"] == "tool_result")
+    assert streamed_tool_call["tool_call_id"]
+    assert streamed_tool_result["tool_call_id"] == streamed_tool_call["tool_call_id"]
+    assert streamed_tool_result["tool_result_id"]
 
     run_id = next(event["run_id"] for event in events if event["type"] == "session")
     checkpoint = runs.latest_checkpoint(run_id)
@@ -283,11 +288,20 @@ async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
 
     assert any(event["event_type"] == "tool_result" for event in traces.events)
     assert any(event["event_type"] == "tool_call" for event in traces.events)
+    assert any(event["event_type"] == "run_ledger" for event in traces.events)
+    assert any(event["event_type"] == "phase_packet" for event in traces.events)
     tool_result_events = [event for event in traces.events if event["event_type"] == "tool_result"]
     assert any(event["data"].get("status") == "ok" for event in tool_result_events)
+    assert any(event["data"].get("tool_call_id") == streamed_tool_call["tool_call_id"] for event in tool_result_events)
     tool_call_events = [event for event in traces.events if event["event_type"] == "tool_call"]
     assert any(event["data"].get("arguments_summary") for event in tool_call_events)
     assert any(event["data"].get("tool") == "web_search" for event in tool_call_events)
+    assert any(event["data"].get("tool_call_id") == streamed_tool_call["tool_call_id"] for event in tool_call_events)
+    run_ledger_events = [event for event in traces.events if event["event_type"] == "run_ledger"]
+    assert any(event["data"]["summary"]["tool_calls"] >= 1 for event in run_ledger_events)
+    assert any(event["data"]["summary"]["tool_results"] >= 1 for event in run_ledger_events)
+    phase_packet_events = [event for event in traces.events if event["event_type"] == "phase_packet"]
+    assert any(event["data"].get("run_ledger", {}).get("version") == "run-ledger-v1" for event in phase_packet_events)
     assert any(event["event_type"] == "deterministic_fact_extractor" for event in traces.events)
     assert any(event["event_type"] == "conversation_tension" for event in traces.events)
     assert any(event["event_type"] == "phase_context" for event in traces.events)

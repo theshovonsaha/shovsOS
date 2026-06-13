@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Optional, List
 from pydantic import BaseModel, Field
 from config.config import cfg
+from orchestration.workflow_templates import get_workflow_template
 
 DB_PATH = "agents.db"
 DEFAULT_RUNTIME_KIND = "managed"
@@ -153,6 +154,10 @@ class AgentProfile(BaseModel):
     default_loop_mode: str = "auto"
     default_context_mode: str = "v3"
     unified_model_mode: bool = True
+    workflow_template: str = "general_operator_v1"
+    prompt_version: str = "role_contracts_v1"
+    risk_policy: str = "standard"
+    ledger_mode: str = "shadow"
     revision:      int = 1
     created_at:    str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     updated_at:    str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
@@ -184,6 +189,10 @@ class ProfileManager:
                     default_loop_mode TEXT DEFAULT 'auto',
                     default_context_mode TEXT DEFAULT 'v2',
                     unified_model_mode INTEGER DEFAULT 1,
+                    workflow_template TEXT DEFAULT 'general_operator_v1',
+                    prompt_version TEXT DEFAULT 'role_contracts_v1',
+                    risk_policy TEXT DEFAULT 'standard',
+                    ledger_mode TEXT DEFAULT 'shadow',
                     revision INTEGER DEFAULT 1,
                     created_at TEXT,
                     updated_at TEXT
@@ -239,6 +248,22 @@ class ProfileManager:
             except sqlite3.OperationalError:
                 pass
             try:
+                conn.execute("ALTER TABLE agent_profiles ADD COLUMN workflow_template TEXT DEFAULT 'general_operator_v1'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE agent_profiles ADD COLUMN prompt_version TEXT DEFAULT 'role_contracts_v1'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE agent_profiles ADD COLUMN risk_policy TEXT DEFAULT 'standard'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE agent_profiles ADD COLUMN ledger_mode TEXT DEFAULT 'shadow'")
+            except sqlite3.OperationalError:
+                pass
+            try:
                 conn.execute(
                     "UPDATE agent_profiles SET runtime_kind = ? WHERE runtime_kind IS NULL OR TRIM(runtime_kind) = ''",
                     (DEFAULT_RUNTIME_KIND,),
@@ -257,7 +282,7 @@ class ProfileManager:
                 id="default",
                 name="Shovs OS",
                 description="Runtime-native agent. Uses memory, loci, tool signals, and skills.",
-                system_prompt=SHOVS_OS_SYSTEM_PROMPT,
+                system_prompt=GENERAL_SYSTEM_PROMPT,
                 tools=DEFAULT_AGENT_TOOLS,
                 skills=DEFAULT_SKILLS,
             ))
@@ -282,7 +307,6 @@ class ProfileManager:
                 "",
                 "You are a specialized AI assistant.",
                 PLATINUM_SYSTEM_PROMPT,
-                GENERAL_SYSTEM_PROMPT,
             }
             prompt_needs_reset = existing_default.system_prompt in _stale_prompts
             if tools_changed:
@@ -290,7 +314,7 @@ class ProfileManager:
             if skills_changed:
                 existing_default.skills = merged_skills
             if prompt_needs_reset:
-                existing_default.system_prompt = SHOVS_OS_SYSTEM_PROMPT
+                existing_default.system_prompt = GENERAL_SYSTEM_PROMPT
                 existing_default.name = "Shovs OS"
                 existing_default.description = "Runtime-native agent. Uses memory, loci, tool signals, and skills."
             runtime_kind_changed = existing_default.runtime_kind != DEFAULT_RUNTIME_KIND
@@ -356,10 +380,14 @@ class ProfileManager:
                     "bootstrap_files",
                     "bootstrap_max_chars",
                     "default_use_planner",
-                    "default_loop_mode",
-                    "default_context_mode",
-                    "unified_model_mode",
-                )
+                "default_loop_mode",
+                "default_context_mode",
+                "unified_model_mode",
+                "workflow_template",
+                "prompt_version",
+                "risk_policy",
+                "ledger_mode",
+            )
             )
             if changed and p.revision <= existing.revision:
                 p.revision = existing.revision + 1
@@ -368,13 +396,14 @@ class ProfileManager:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 INSERT OR REPLACE INTO agent_profiles
-                (id, owner_id, name, description, runtime_kind, model, embed_model, system_prompt, tools, skills, avatar_url, workspace_path, bootstrap_files, bootstrap_max_chars, default_use_planner, default_loop_mode, default_context_mode, unified_model_mode, revision, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, owner_id, name, description, runtime_kind, model, embed_model, system_prompt, tools, skills, avatar_url, workspace_path, bootstrap_files, bootstrap_max_chars, default_use_planner, default_loop_mode, default_context_mode, unified_model_mode, workflow_template, prompt_version, risk_policy, ledger_mode, revision, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 p.id, p.owner_id, p.name, p.description, p.runtime_kind, p.model, p.embed_model, p.system_prompt,
                 json.dumps(p.tools), json.dumps(p.skills), p.avatar_url, p.workspace_path, json.dumps(p.bootstrap_files), p.bootstrap_max_chars,
                 1 if p.default_use_planner else 0, p.default_loop_mode, p.default_context_mode,
                 1 if p.unified_model_mode else 0,
+                p.workflow_template, p.prompt_version, p.risk_policy, p.ledger_mode,
                 p.revision, p.created_at, p.updated_at
             ))
             conn.commit()
@@ -434,6 +463,12 @@ class ProfileManager:
 
         raw_system_prompt = p.system_prompt if isinstance(p.system_prompt, str) else ""
         system_prompt = raw_system_prompt if raw_system_prompt.strip() else GENERAL_SYSTEM_PROMPT
+        template = get_workflow_template(getattr(p, "workflow_template", None))
+        prompt_version = str(getattr(p, "prompt_version", "") or template.prompt_version).strip() or template.prompt_version
+        risk_policy = str(getattr(p, "risk_policy", "") or template.risk_policy).strip() or template.risk_policy
+        ledger_mode = str(getattr(p, "ledger_mode", "") or template.ledger_mode).strip().lower()
+        if ledger_mode not in {"shadow", "ledger_enforced"}:
+            ledger_mode = "shadow"
 
         return p.model_copy(update={
             "name": str(p.name or "").strip(),
@@ -448,6 +483,10 @@ class ProfileManager:
             "default_use_planner": bool(p.default_use_planner),
             "default_loop_mode": default_loop_mode,
             "default_context_mode": default_context_mode,
+            "workflow_template": template.id,
+            "prompt_version": prompt_version,
+            "risk_policy": risk_policy,
+            "ledger_mode": ledger_mode,
         })
 
     def get(self, profile_id: str, owner_id: Optional[str] = None) -> Optional[AgentProfile]:
@@ -539,6 +578,10 @@ class ProfileManager:
             default_loop_mode=r["default_loop_mode"] if "default_loop_mode" in r.keys() and r["default_loop_mode"] else "auto",
             default_context_mode=r["default_context_mode"] if "default_context_mode" in r.keys() and r["default_context_mode"] else "v2",
             unified_model_mode=bool(r["unified_model_mode"]) if "unified_model_mode" in r.keys() and r["unified_model_mode"] is not None else True,
+            workflow_template=r["workflow_template"] if "workflow_template" in r.keys() and r["workflow_template"] else "general_operator_v1",
+            prompt_version=r["prompt_version"] if "prompt_version" in r.keys() and r["prompt_version"] else "role_contracts_v1",
+            risk_policy=r["risk_policy"] if "risk_policy" in r.keys() and r["risk_policy"] else "standard",
+            ledger_mode=r["ledger_mode"] if "ledger_mode" in r.keys() and r["ledger_mode"] else "shadow",
             revision=r["revision"] if "revision" in r.keys() else 1,
             created_at=r["created_at"],
             updated_at=r["updated_at"]

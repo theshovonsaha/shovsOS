@@ -91,6 +91,11 @@ def _drain_thought_buffer(
                 buffer = buffer[idx + len(_THINK_CLOSE):]
                 in_thought = False
                 continue
+            if "<" not in buffer:
+                if buffer:
+                    chunks.append(buffer)
+                    buffer = ""
+                break
             if len(buffer) > _TAG_HOLDBACK:
                 chunks.append(buffer[:-_TAG_HOLDBACK])
                 buffer = buffer[-_TAG_HOLDBACK:]
@@ -107,6 +112,11 @@ def _drain_thought_buffer(
                 buffer = buffer[idx + len(_THINK_OPEN):]
                 in_thought = True
                 continue
+            if "<" not in buffer:
+                if buffer:
+                    chunks.append(buffer)
+                    buffer = ""
+                break
             if len(buffer) > _TAG_HOLDBACK:
                 chunks.append(buffer[:-_TAG_HOLDBACK])
                 buffer = buffer[-_TAG_HOLDBACK:]

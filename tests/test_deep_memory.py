@@ -157,23 +157,22 @@ async def test_update_memory_supersedes_existing_session_fact_and_indexes_semant
         )
 
         assert "Successfully updated memory" in res_update
-        mock_instance.void_temporal_fact.assert_called_once_with(
+        mock_instance.replace_temporal_facts.assert_called_once_with(
             "session-1",
-            "User",
-            "location",
-            7,
+            facts=[
+                {
+                    "subject": "User",
+                    "predicate": "location",
+                    "object": "Toronto",
+                    "run_id": "run-1",
+                    "locus_id": None,
+                }
+            ],
+            voids=[{"subject": "User", "predicate": "location"}],
+            turn=7,
             owner_id="owner-1",
         )
-        mock_instance.add_temporal_fact.assert_called_once_with(
-            "session-1",
-            "User",
-            "location",
-            "Toronto",
-            7,
-            owner_id="owner-1",
-            run_id="run-1",
-            locus_id=None,
-        )
+        mock_instance.add_temporal_fact.assert_not_called()
         mock_instance.add_triplet.assert_called_once_with(
             "User",
             "location",

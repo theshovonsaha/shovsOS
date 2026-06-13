@@ -35,6 +35,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from orchestration.agent_profiles import ProfileManager, AgentProfile
+from orchestration.workflow_templates import list_workflow_templates
 from orchestration.orchestrator import AgenticOrchestrator
 from llm.llm_adapter import OllamaAdapter
 from engine.context_engine import ContextEngine
@@ -239,8 +240,29 @@ def _seed_standard_profiles():
             ),
             default_use_planner=True,
             default_loop_mode="auto",
-            default_context_mode="v3",
+            default_context_mode="v2",
             bootstrap_files=["IDENTITY.md", "SOUL.md"],
+        ),
+        AgentProfile(
+            id="shopping-advisor",
+            name="Shopping Advisor",
+            description="Verifies product pages, prices, and tradeoffs before recommending.",
+            model=cfg.DEFAULT_MODEL,
+            tools=["shopping_advice", "web_search", "web_fetch", "query_memory", "store_memory"],
+            system_prompt=(
+                "You are a practical shopping advisor for normal consumers. Use shopping_advice for buying questions. "
+                "When location matters, compare relevant nearby Canadian retailers such as Costco, Canadian Tire, "
+                "Shoppers, Metro, Dollarama, Walmart, and Best Buy. Give short recommendations based on verified URLs, "
+                "observed prices, ratings, and concrete tradeoffs. If a price, product page, or availability was not "
+                "verified, say that plainly."
+            ),
+            default_use_planner=True,
+            default_loop_mode="managed",
+            default_context_mode="v3",
+            workflow_template="shopping_advisor_v1",
+            prompt_version="shopping_patch_v1",
+            risk_policy="consumer_verified",
+            ledger_mode="shadow",
         ),
     ]
     for p in standard:
@@ -530,6 +552,10 @@ async def chat_stream(
                 search_backend=search_backend,
                 search_engine=search_engine,
                 agent_revision=getattr(profile, "revision", None),
+                workflow_template=getattr(profile, "workflow_template", "general_operator_v1"),
+                prompt_version=getattr(profile, "prompt_version", "role_contracts_v1"),
+                risk_policy=getattr(profile, "risk_policy", "standard"),
+                ledger_mode=getattr(profile, "ledger_mode", "shadow"),
                 forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
                 workspace_path=getattr(profile, "workspace_path", None),
                 reasoning_enabled=reasoning_enabled,
@@ -877,6 +903,10 @@ async def list_agents(owner_id: Optional[str] = None):
     owner_id = _require_owner_id(owner_id)
     return {"agents": profile_manager.list_all(owner_id=owner_id)}
 
+@app.get("/agent-templates")
+async def list_agent_templates():
+    return {"templates": list_workflow_templates()}
+
 @app.post("/agents")
 async def create_agent(profile: AgentProfile):
     profile.owner_id = _require_owner_id(profile.owner_id)
@@ -914,6 +944,10 @@ async def update_agent(agent_id: str, payload: dict):
         "default_loop_mode",
         "default_context_mode",
         "unified_model_mode",
+        "workflow_template",
+        "prompt_version",
+        "risk_policy",
+        "ledger_mode",
     }
     if "embed_model" in payload and payload["embed_model"] != p.embed_model:
         raise HTTPException(

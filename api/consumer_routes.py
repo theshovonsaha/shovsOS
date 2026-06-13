@@ -21,6 +21,21 @@ from services.consumer_store import ConsumerStoreService, ConsumerStoreSelection
 CONSUMER_AGENT_ID = "consumer"
 
 
+def _consumer_context_mode(profile, explicit: Optional[str] = None) -> str:
+    """Consumer chat keeps the stable v2 context contract by default.
+
+    The full OS/default agent may use v3, but the consumer surface is optimized
+    for plain-language continuity and has tests around the v2 contract.
+    """
+    if explicit:
+        mode = str(explicit).strip().lower()
+    elif getattr(profile, "id", "") == CONSUMER_AGENT_ID:
+        mode = "v2"
+    else:
+        mode = str(getattr(profile, "default_context_mode", "v2") or "v2").strip().lower()
+    return mode if mode in {"v1", "v2", "v3"} else "v2"
+
+
 class ConsumerOptionsPayload(BaseModel):
     model: str
 
@@ -121,9 +136,7 @@ def make_consumer_router(
             owner_id=owner_id,
         )
         model = payload.get("model") or options.get("model") or getattr(profile, "model", None)
-        context_mode = payload.get("context_mode") or getattr(profile, "default_context_mode", "v3")
-        if context_mode not in {"v1", "v2", "v3"}:
-            context_mode = "v3"
+        context_mode = _consumer_context_mode(profile, payload.get("context_mode"))
         s = sessions.create(
             model=model,
             system_prompt=getattr(profile, "system_prompt", "") or "",
@@ -183,9 +196,7 @@ def make_consumer_router(
 
             tool_events = 0
             sid = session_id
-            resolved_context_mode = getattr(profile, "default_context_mode", "v3")
-            if resolved_context_mode not in {"v1", "v2", "v3"}:
-                resolved_context_mode = "v3"
+            resolved_context_mode = _consumer_context_mode(profile)
             if not sid:
                 created = sessions.create(
                     model=active_model,
@@ -222,6 +233,10 @@ def make_consumer_router(
                 embed_model=getattr(profile, "embed_model", None),
                 images=image_b64s or None,
                 agent_revision=getattr(profile, "revision", None),
+                workflow_template=getattr(profile, "workflow_template", "general_operator_v1"),
+                prompt_version=getattr(profile, "prompt_version", "role_contracts_v1"),
+                risk_policy=getattr(profile, "risk_policy", "standard"),
+                ledger_mode=getattr(profile, "ledger_mode", "shadow"),
                 workspace_path=getattr(profile, "workspace_path", None),
                 reasoning_enabled=reasoning_enabled,
             )

@@ -17,6 +17,10 @@ interface AgentProfile {
     default_use_planner?: boolean;
     default_context_mode?: 'v1' | 'v2' | 'v3';
     unified_model_mode?: boolean;
+    workflow_template?: string;
+    prompt_version?: string;
+    risk_policy?: string;
+    ledger_mode?: 'shadow' | 'ledger_enforced';
 }
 
 interface DashboardProps {
@@ -24,7 +28,34 @@ interface DashboardProps {
     embedModels: Record<string, string[]>;
 }
 
-type AgentPresetId = 'research' | 'coding' | 'operator' | 'consumer';
+interface WorkflowTemplate {
+    id: string;
+    label: string;
+    description: string;
+    system_prompt: string;
+    tools: string[];
+    default_loop_mode?: 'auto' | 'single' | 'managed';
+    default_context_mode?: 'v1' | 'v2' | 'v3';
+    default_use_planner?: boolean;
+    bootstrap_files?: string[];
+    prompt_version?: string;
+    risk_policy?: string;
+    ledger_mode?: 'shadow' | 'ledger_enforced';
+    test_scenarios?: string[];
+}
+
+type AgentPresetId = string;
+
+interface AgentSessionSummary {
+    agent_id?: string | null;
+    created_at?: string;
+    updated_at?: string;
+}
+
+interface ToolSummary {
+    name: string;
+    description?: string;
+}
 
 const AGENT_PRESETS: Record<AgentPresetId, {
     label: string;
@@ -78,6 +109,21 @@ const AGENT_PRESETS: Record<AgentPresetId, {
     },
 };
 
+const fallbackWorkflowTemplates = (): WorkflowTemplate[] => Object.entries(AGENT_PRESETS).map(([id, preset]) => ({
+    id,
+    label: preset.label,
+    description: preset.description,
+    system_prompt: preset.systemPrompt,
+    tools: preset.tools,
+    default_loop_mode: preset.defaultLoopMode,
+    default_context_mode: preset.defaultContextMode,
+    default_use_planner: preset.defaultUsePlanner,
+    bootstrap_files: preset.bootstrapFiles,
+    prompt_version: 'role_contracts_v1',
+    risk_policy: 'standard',
+    ledger_mode: 'shadow',
+}));
+
 
 export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels }) => {
     const [agents, setAgents] = useState<AgentProfile[]>([]);
@@ -87,13 +133,19 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
     const [loading, setLoading] = useState(true);
     const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({});
     const [savingModel, setSavingModel] = useState<string | null>(null);
-    const [agentSessions, setAgentSessions] = useState<Record<string, any[]>>({});
+    const [agentSessions, setAgentSessions] = useState<Record<string, AgentSessionSummary[]>>({});
     const [showWhyModal, setShowWhyModal] = useState(false);
+    const [workflowTemplates, setWorkflowTemplates] = useState<WorkflowTemplate[]>(fallbackWorkflowTemplates());
 
     useEffect(() => {
         fetchDashboardData();
         fetch('/api/models').then(r => r.json()).then(d => {
             if (d.models) setAvailableModels(d.models);
+        }).catch(() => { });
+        fetch('/api/agent-templates').then(r => r.json()).then(d => {
+            if (Array.isArray(d.templates) && d.templates.length) {
+                setWorkflowTemplates(d.templates);
+            }
         }).catch(() => { });
     }, []);
 
@@ -109,9 +161,9 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
             
             setAgents(agentsData.agents || []);
             
-            const sessionsByAgent: Record<string, any[]> = {};
+            const sessionsByAgent: Record<string, AgentSessionSummary[]> = {};
             if (sessionsData.sessions) {
-                sessionsData.sessions.forEach((s: any) => {
+                sessionsData.sessions.forEach((s: AgentSessionSummary) => {
                     const id = s.agent_id || 'default';
                     if (!sessionsByAgent[id]) sessionsByAgent[id] = [];
                     sessionsByAgent[id].push(s);
@@ -119,7 +171,11 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
             }
             
             for (const id in sessionsByAgent) {
-                sessionsByAgent[id].sort((a, b) => new Date(b.updated_at || b.created_at).getTime() - new Date(a.updated_at || a.created_at).getTime());
+                sessionsByAgent[id].sort((a, b) => {
+                    const bTime = new Date(b.updated_at || b.created_at || 0).getTime();
+                    const aTime = new Date(a.updated_at || a.created_at || 0).getTime();
+                    return bTime - aTime;
+                });
             }
             
             setAgentSessions(sessionsByAgent);
@@ -251,6 +307,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
             {showCreateModal && (
                 <CreateAgentModal
                     embedModels={embedModels}
+                    workflowTemplates={workflowTemplates}
                     onClose={() => setShowCreateModal(false)}
                     onCreated={() => { setShowCreateModal(false); fetchDashboardData(); }}
                 />
@@ -262,6 +319,7 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
                 <CreateAgentModal
                     initialAgent={agentToEdit}
                     embedModels={embedModels}
+                    workflowTemplates={workflowTemplates}
                     onClose={() => setAgentToEdit(null)}
                     onCreated={() => { setAgentToEdit(null); fetchDashboardData(); }}
                 />
@@ -278,9 +336,10 @@ export const Dashboard: React.FC<DashboardProps> = ({ onSelectAgent, embedModels
 };
 
 
-const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; embedModels: Record<string, string[]>; initialAgent?: AgentProfile | null }> = ({ onClose, onCreated, embedModels, initialAgent }) => {
+const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; embedModels: Record<string, string[]>; workflowTemplates: WorkflowTemplate[]; initialAgent?: AgentProfile | null }> = ({ onClose, onCreated, embedModels, workflowTemplates, initialAgent }) => {
     const isEdit = Boolean(initialAgent);
-    const [selectedPreset, setSelectedPreset] = useState<AgentPresetId | ''>('');
+    const [builderStep, setBuilderStep] = useState<'blueprint' | 'runtime' | 'capabilities' | 'memory'>('blueprint');
+    const [selectedPreset, setSelectedPreset] = useState<AgentPresetId | ''>(initialAgent?.workflow_template || '');
     const [name, setName] = useState(initialAgent?.name || '');
     const [description, setDescription] = useState(initialAgent?.description || '');
     const [model, setModel] = useState(initialAgent?.model || 'llama3.2');
@@ -292,8 +351,11 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
     const [defaultUsePlanner, setDefaultUsePlanner] = useState(initialAgent?.default_use_planner ?? true);
     const [defaultContextMode, setDefaultContextMode] = useState<'v1' | 'v2' | 'v3'>(initialAgent?.default_context_mode || 'v3');
     const [unifiedModelMode, setUnifiedModelMode] = useState<boolean>(initialAgent?.unified_model_mode ?? true);
+    const [promptVersion, setPromptVersion] = useState(initialAgent?.prompt_version || 'role_contracts_v1');
+    const [riskPolicy, setRiskPolicy] = useState(initialAgent?.risk_policy || 'standard');
+    const [ledgerMode, setLedgerMode] = useState<'shadow' | 'ledger_enforced'>(initialAgent?.ledger_mode || 'shadow');
     const [selectedTools, setSelectedTools] = useState<string[]>(initialAgent?.tools || ['web_search', 'web_fetch', 'query_memory', 'store_memory']);
-    const [availableTools, setAvailableTools] = useState<any[]>([]);
+    const [availableTools, setAvailableTools] = useState<ToolSummary[]>([]);
     const [availableModels, setAvailableModels] = useState<Record<string, string[]>>({ 'ollama': ['llama3.2'] });
     const [creating, setCreating] = useState(false);
 
@@ -315,16 +377,28 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
         : effectiveBootstrapBudget;
 
     const applyPreset = (presetId: AgentPresetId) => {
-        const preset = AGENT_PRESETS[presetId];
+        const preset = workflowTemplates.find(item => item.id === presetId);
+        if (!preset) return;
         setSelectedPreset(presetId);
         if (!name.trim()) setName(presetId);
         if (!description.trim() || !isEdit) setDescription(preset.description);
-        if (!systemPrompt.trim() || !isEdit) setSystemPrompt(preset.systemPrompt);
+        if (!systemPrompt.trim() || !isEdit) setSystemPrompt(preset.system_prompt);
         setSelectedTools(preset.tools);
-        setDefaultContextMode(preset.defaultContextMode);
-        setDefaultUsePlanner(preset.defaultUsePlanner);
-        setBootstrapFilesText(preset.bootstrapFiles.join(', '));
+        setDefaultContextMode(preset.default_context_mode || 'v3');
+        setDefaultUsePlanner(preset.default_use_planner ?? true);
+        setBootstrapFilesText((preset.bootstrap_files || ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md']).join(', '));
+        setPromptVersion(preset.prompt_version || 'role_contracts_v1');
+        setRiskPolicy(preset.risk_policy || 'standard');
+        setLedgerMode(preset.ledger_mode || 'shadow');
     };
+
+    const selectedTemplate = workflowTemplates.find(item => item.id === selectedPreset);
+    const builderSteps: Array<{ id: typeof builderStep; label: string; detail: string }> = [
+        { id: 'blueprint', label: 'Blueprint', detail: selectedTemplate?.label || 'Choose workflow' },
+        { id: 'runtime', label: 'Runtime', detail: model || 'Model' },
+        { id: 'capabilities', label: 'Capabilities', detail: `${selectedTools.length} tools` },
+        { id: 'memory', label: 'Memory', detail: `${parsedBootstrapFiles.length} docs` },
+    ];
 
     const toggleTool = (name: string) => setSelectedTools(prev =>
         prev.includes(name) ? prev.filter(n => n !== name) : [...prev, name]
@@ -349,6 +423,10 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                 default_use_planner: defaultUsePlanner,
                 default_context_mode: defaultContextMode,
                 unified_model_mode: unifiedModelMode,
+                workflow_template: selectedPreset || initialAgent?.workflow_template || 'general_operator_v1',
+                prompt_version: promptVersion,
+                risk_policy: riskPolicy,
+                ledger_mode: ledgerMode,
             };
             // embed_model is only sent on CREATE — it is immutable post-creation.
             if (!isEdit) {
@@ -367,26 +445,65 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
 
     return (
         <div className="modal-overlay" onClick={onClose}>
-            <div className="modal-content" onClick={e => e.stopPropagation()}>
-                <h2>{isEdit ? 'Edit Agent' : 'Initialize Agent'}</h2>
-
-                <div className="form-section">
-                    <div className="input-group">
-                        <label>Starting Templates</label>
-                        <div className="agent-preset-row">
-                            {(Object.keys(AGENT_PRESETS) as AgentPresetId[]).map((presetId) => (
+            <div className="modal-content agent-builder-modal" onClick={e => e.stopPropagation()}>
+                <div className="agent-builder-shell">
+                    <aside className="agent-builder-rail">
+                        <div>
+                            <div className="agent-builder-kicker">{isEdit ? 'Edit Agent' : 'New Agent'}</div>
+                            <h2>{isEdit ? 'Refine Runtime' : 'Build Runtime'}</h2>
+                            <p>Start with a workflow, then tune model, tools, memory, and ledger policy.</p>
+                        </div>
+                        <div className="agent-builder-steps">
+                            {builderSteps.map((step, index) => (
                                 <button
-                                    key={presetId}
+                                    key={step.id}
                                     type="button"
-                                    className={`agent-preset-btn ${selectedPreset === presetId ? 'active' : ''}`}
-                                    onClick={() => applyPreset(presetId)}
-                                    title={AGENT_PRESETS[presetId].description}
+                                    className={builderStep === step.id ? 'active' : ''}
+                                    onClick={() => setBuilderStep(step.id)}
                                 >
-                                    {AGENT_PRESETS[presetId].label}
+                                    <span>{String(index + 1).padStart(2, '0')}</span>
+                                    <strong>{step.label}</strong>
+                                    <small>{step.detail}</small>
                                 </button>
                             ))}
                         </div>
-                        <div className="agent-builder-note" style={{ marginTop: '8px' }}>
+                        <div className="agent-builder-side-summary">
+                            <span>Workflow</span>
+                            <strong>{selectedTemplate?.label || selectedPreset || 'General Operator'}</strong>
+                            <p>{selectedTemplate?.description || description || 'No workflow selected yet.'}</p>
+                        </div>
+                    </aside>
+
+                    <main className="agent-builder-main">
+                        <div className="agent-builder-topline">
+                            <div>
+                                <div className="agent-builder-kicker">Configuration</div>
+                                <h2>{builderSteps.find(step => step.id === builderStep)?.label}</h2>
+                            </div>
+                            <button className="btn-secondary" onClick={onClose}>CANCEL</button>
+                        </div>
+
+                <div className="form-section">
+                    {builderStep === 'blueprint' && (
+                    <>
+                    <div className="input-group">
+                        <label>Starting Templates</label>
+                        <div className="agent-template-field">
+                            {workflowTemplates.map((template) => (
+                                <button
+                                    key={template.id}
+                                    type="button"
+                                    className={`agent-template-option ${selectedPreset === template.id ? 'active' : ''}`}
+                                    onClick={() => applyPreset(template.id)}
+                                    title={template.description}
+                                >
+                                    <span>{template.label}</span>
+                                    <small>{template.description}</small>
+                                    <strong>{template.tools.length} tools</strong>
+                                </button>
+                            ))}
+                        </div>
+                        <div className="agent-builder-note">
                             Templates are only starting points. The agent can be steered and molded later through chat, prompt edits, and capability changes.
                         </div>
                     </div>
@@ -410,7 +527,11 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                             rows={3}
                         />
                     </div>
+                    </>
+                    )}
 
+                    {builderStep === 'runtime' && (
+                    <>
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px' }}>
                         <div className="input-group">
                             <PremiumSelect
@@ -462,6 +583,31 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                     </div>
 
                     <div className="input-group">
+                        <label>Workflow Contract</label>
+                        <div className="agent-contract-grid">
+                            <div>
+                                <span>Prompt Version</span>
+                                <strong>{promptVersion || 'not recorded'}</strong>
+                            </div>
+                            <div>
+                                <span>Risk Policy</span>
+                                <strong>{riskPolicy || 'standard'}</strong>
+                            </div>
+                            <div>
+                                <span>Ledger Mode</span>
+                                <select value={ledgerMode} onChange={e => setLedgerMode(e.target.value as 'shadow' | 'ledger_enforced')}>
+                                    <option value="shadow">shadow</option>
+                                    <option value="ledger_enforced">ledger_enforced</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    </>
+                    )}
+
+                    {builderStep === 'capabilities' && (
+                    <>
+                    <div className="input-group">
                         <label>Core Capabilities</label>
                         <div className="tool-selection">
                             <div className="tool-chips">
@@ -478,7 +624,22 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                             </div>
                         </div>
                     </div>
+                    <div className="agent-builder-summary">
+                        <div className="agent-builder-card">
+                            <div className="agent-builder-card-label">Capability Shape</div>
+                            <div className="agent-builder-metrics">
+                                <div><span>Selected Tools</span><strong>{selectedTools.length}</strong></div>
+                                <div><span>Planner</span><strong>{defaultUsePlanner ? 'on' : 'off'}</strong></div>
+                                <div><span>Risk Policy</span><strong>{riskPolicy}</strong></div>
+                                <div><span>Ledger</span><strong>{ledgerMode}</strong></div>
+                            </div>
+                        </div>
+                    </div>
+                    </>
+                    )}
 
+                    {builderStep === 'memory' && (
+                    <>
                     <div className="input-group">
                         <div
                             style={{
@@ -579,10 +740,31 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                             </div>
                         </div>
                     </div>
+                    </>
+                    )}
                 </div>
 
                 <div className="modal-actions">
-                    <button className="btn-secondary" onClick={onClose}>CANCEL</button>
+                    <button
+                        className="btn-secondary"
+                        onClick={() => {
+                            const order: Array<typeof builderStep> = ['blueprint', 'runtime', 'capabilities', 'memory'];
+                            const index = order.indexOf(builderStep);
+                            setBuilderStep(order[Math.max(0, index - 1)]);
+                        }}
+                    >
+                        BACK
+                    </button>
+                    <button
+                        className="btn-secondary"
+                        onClick={() => {
+                            const order: Array<typeof builderStep> = ['blueprint', 'runtime', 'capabilities', 'memory'];
+                            const index = order.indexOf(builderStep);
+                            setBuilderStep(order[Math.min(order.length - 1, index + 1)]);
+                        }}
+                    >
+                        NEXT
+                    </button>
                     <button
                         className="btn-primary"
                         onClick={handleCreate}
@@ -590,6 +772,8 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                     >
                         {creating ? (isEdit ? 'SAVING...' : 'INITIALIZING...') : (isEdit ? 'SAVE AGENT' : 'INITIALIZE AGENT')}
                     </button>
+                </div>
+                    </main>
                 </div>
             </div>
         </div>

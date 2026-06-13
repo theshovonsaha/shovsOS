@@ -26,6 +26,10 @@ class RunEngineRequest:
     search_backend: Optional[str] = None
     search_engine: Optional[str] = None
     agent_revision: Optional[int] = None
+    workflow_template: str = "general_operator_v1"
+    prompt_version: str = "role_contracts_v1"
+    risk_policy: str = "standard"
+    ledger_mode: str = "shadow"
     forced_tools: tuple[str, ...] = field(default_factory=tuple)
     workspace_path: Optional[str] = None
     # None = let the adapter decide (default for the model). True/False explicitly

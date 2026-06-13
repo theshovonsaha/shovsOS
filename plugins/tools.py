@@ -124,6 +124,243 @@ def _format_search_results(
     )
 
 
+def _json_loads_maybe(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _money_values(text: str) -> list[str]:
+    return list(dict.fromkeys(re.findall(r"(?:[$€£]\s?\d[\d,]*(?:\.\d{2})?|\d[\d,]*(?:\.\d{2})?\s?(?:USD|CAD|EUR|GBP))", text or "", flags=re.IGNORECASE)))
+
+
+def _rating_values(text: str) -> list[str]:
+    patterns = [
+        r"\b\d(?:\.\d)?\s?/\s?5\b",
+        r"(?<!/)\b\d(?:\.\d)?\s?stars?\b",
+        r"\b\d{2,3}%\s?(?:positive|recommended|recommend)\b",
+    ]
+    found: list[str] = []
+    for pattern in patterns:
+        found.extend(re.findall(pattern, text or "", flags=re.IGNORECASE))
+    return list(dict.fromkeys(found))
+
+
+def _extract_buying_signals(text: str, query: str) -> dict:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    lowered = cleaned.lower()
+    pros = []
+    cons = []
+    for word in ("return", "warranty", "shipping", "battery", "weight", "noise", "privacy", "subscription", "compatibility"):
+        idx = lowered.find(word)
+        if idx >= 0:
+            snippet = cleaned[max(0, idx - 90): idx + 160].strip()
+            if any(term in snippet.lower() for term in ("not", "limited", "issue", "complaint", "problem", "expensive", "short")):
+                cons.append(snippet)
+            else:
+                pros.append(snippet)
+    return {
+        "query": query,
+        "prices": _money_values(cleaned)[:6],
+        "ratings": _rating_values(cleaned)[:4],
+        "pros": pros[:3],
+        "cons": cons[:3],
+    }
+
+
+CANADIAN_STORE_PROFILES: dict[str, dict[str, str]] = {
+    "costco": {"label": "Costco", "domain": "costco.ca", "best_for": "bulk, household, groceries, electronics deals"},
+    "canadian_tire": {"label": "Canadian Tire", "domain": "canadiantire.ca", "best_for": "tools, automotive, home, seasonal, outdoor"},
+    "shoppers": {"label": "Shoppers Drug Mart", "domain": "shoppersdrugmart.ca", "best_for": "pharmacy, beauty, toiletries, convenience"},
+    "metro": {"label": "Metro", "domain": "metro.ca", "best_for": "groceries, fresh food, weekly flyer items"},
+    "dollarama": {"label": "Dollarama", "domain": "dollarama.com", "best_for": "cheap household, party, school, small essentials"},
+    "walmart": {"label": "Walmart Canada", "domain": "walmart.ca", "best_for": "general retail, groceries, baby, home, electronics"},
+    "bestbuy": {"label": "Best Buy Canada", "domain": "bestbuy.ca", "best_for": "electronics, appliances, computers, accessories"},
+}
+
+
+def _normalize_store_keys(stores: Optional[list[str]]) -> list[str]:
+    if not stores:
+        return ["walmart", "canadian_tire", "costco", "bestbuy", "shoppers", "metro", "dollarama"]
+    normalized: list[str] = []
+    aliases = {
+        "canadian tire": "canadian_tire",
+        "ct": "canadian_tire",
+        "shopper": "shoppers",
+        "shoppers drug mart": "shoppers",
+        "best buy": "bestbuy",
+        "best buy canada": "bestbuy",
+        "walmart canada": "walmart",
+    }
+    for store in stores:
+        raw = str(store or "").strip().lower().replace("-", " ").replace("_", " ")
+        key = aliases.get(raw, raw.replace(" ", "_"))
+        if key in CANADIAN_STORE_PROFILES and key not in normalized:
+            normalized.append(key)
+    return normalized or ["walmart", "canadian_tire", "costco", "bestbuy"]
+
+
+async def _shopping_advice(
+    query: str,
+    budget: str = "",
+    priorities: Optional[list[str]] = None,
+    region: str = "US",
+    location: str = "",
+    stores: Optional[list[str]] = None,
+    max_candidates: int = 4,
+) -> str:
+    """Deterministic buyer workflow: search, fetch top pages, extract facts, return a final-answer patch."""
+    priorities = priorities or []
+    max_candidates = max(1, min(int(max_candidates or 4), 6))
+    store_keys = _normalize_store_keys(stores)
+    region_hint = f" {region}" if region else ""
+    location_hint = f" near {location}" if location else ""
+    budget_hint = f" under {budget}" if budget else ""
+    priority_hint = f" best for {', '.join(priorities[:4])}" if priorities else ""
+    broad_query = f"{query}{budget_hint}{priority_hint}{location_hint}{region_hint} price review official store"
+    search_queries = [broad_query]
+    for key in store_keys[:6]:
+        profile = CANADIAN_STORE_PROFILES[key]
+        search_queries.append(f"site:{profile['domain']} {query}{budget_hint}{location_hint}{region_hint}")
+
+    candidates: list[dict] = []
+    verified_urls: list[str] = []
+    warnings: list[str] = []
+    seen_urls: set[str] = set()
+    store_coverage = {CANADIAN_STORE_PROFILES[key]["label"]: 0 for key in store_keys}
+    for search_query in search_queries:
+        if len(candidates) >= max_candidates:
+            break
+        search_payload = _json_loads_maybe(await _web_search(search_query, num_results=max_candidates + 2))
+        results = search_payload.get("results") if isinstance(search_payload.get("results"), list) else []
+        for item in results:
+            if len(candidates) >= max_candidates:
+                break
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get("url") or "").strip()
+            url_key = url.lower().rstrip("/")
+            if not url or url_key in seen_urls:
+                continue
+            seen_urls.add(url_key)
+            matched_store = ""
+            for key in store_keys:
+                profile = CANADIAN_STORE_PROFILES[key]
+                if profile["domain"] in url.lower() or profile["label"].lower().split()[0] in str(item.get("title") or "").lower():
+                    matched_store = profile["label"]
+                    store_coverage[matched_store] = store_coverage.get(matched_store, 0) + 1
+                    break
+            fetch_payload = _json_loads_maybe(await _web_fetch(url, max_chars=5000))
+            content = str(fetch_payload.get("content") or item.get("snippet") or "")
+            success = fetch_payload.get("type") == "web_fetch_result" and not fetch_payload.get("error")
+            if success:
+                verified_urls.append(url)
+            else:
+                warnings.append(f"Could not fully verify {url}")
+            signals = _extract_buying_signals(content, query)
+            title = str(fetch_payload.get("title") or item.get("title") or url).strip()
+            candidate = {
+                "title": title[:180],
+                "store": matched_store or "Unknown store",
+                "url": url,
+                "verified": bool(success),
+                "prices": signals["prices"],
+                "ratings": signals["ratings"],
+                "pros": signals["pros"],
+                "cons": signals["cons"],
+                "snippet": re.sub(r"\s+", " ", str(item.get("snippet") or ""))[:280],
+            }
+            candidates.append(candidate)
+
+    verified_candidates = [item for item in candidates if item.get("verified")]
+    best = verified_candidates[0] if verified_candidates else (candidates[0] if candidates else {})
+    patch_lines = []
+    if best:
+        patch_lines.append(f"Best verified lead: {best.get('title')}")
+        if best.get("prices"):
+            patch_lines.append(f"Observed price signal: {', '.join(best['prices'][:3])}")
+        if best.get("ratings"):
+            patch_lines.append(f"Rating signal: {', '.join(best['ratings'][:2])}")
+        patch_lines.append(f"Verified URL: {best.get('url')}")
+    if warnings:
+        patch_lines.append(f"Limits: {'; '.join(warnings[:2])}")
+
+    return json.dumps({
+        "type": "shopping_advice_result",
+        "success": bool(candidates),
+        "query": query,
+        "budget": budget,
+        "priorities": priorities,
+        "region": region,
+        "location": location,
+        "stores_requested": [CANADIAN_STORE_PROFILES[key]["label"] for key in store_keys],
+        "store_coverage": store_coverage,
+        "search_queries": search_queries,
+        "candidates": candidates,
+        "verified_urls": verified_urls,
+        "warnings": warnings,
+        "answer_patch": {
+            "format": "concise_buyer_advice_v1",
+            "recommendation": best,
+            "comparison_table": [
+                {
+                    "store": item.get("store"),
+                    "item": item.get("title"),
+                    "price": (item.get("prices") or ["not found"])[0],
+                    "rating": (item.get("ratings") or ["not found"])[0],
+                    "verified": item.get("verified"),
+                    "url": item.get("url"),
+                }
+                for item in candidates[:4]
+            ],
+            "must_say": patch_lines,
+            "do_not_claim": [
+                "Do not claim a product was purchased, reserved, or added to cart.",
+                "Do not state a precise current price unless it appears in candidate.prices.",
+                "Do not cite URLs outside verified_urls.",
+                "Do not claim local in-store availability unless fetched content explicitly says it.",
+            ],
+            "needs_user_choice": len(verified_candidates) < 2,
+        },
+    })
+
+
+SHOPPING_ADVICE_TOOL = Tool(
+    name="shopping_advice",
+    description=(
+        "Buyer workflow for consumer shopping questions. Searches, fetches candidate product/review pages, "
+        "extracts price/rating/pro/con signals, and returns a compact verified answer_patch. "
+        "Use this before broad web_search for product recommendations, buying decisions, and deal checks."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What the user wants to buy or compare."},
+            "budget": {"type": "string", "description": "Budget constraint such as '$900' or 'under 1000 CAD'."},
+            "priorities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "User priorities such as battery life, durability, privacy, return policy.",
+            },
+            "region": {"type": "string", "description": "Shopping region/country, default US.", "default": "US"},
+            "location": {"type": "string", "description": "City/neighbourhood/postal hint such as Toronto, ON or M5V."},
+            "stores": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Preferred stores, e.g. Costco, Canadian Tire, Shoppers, Metro, Dollarama, Walmart, Best Buy.",
+            },
+            "max_candidates": {"type": "integer", "description": "Candidate pages to verify, default 4.", "default": 4},
+        },
+        "required": ["query"],
+    },
+    handler=_shopping_advice,
+    tags=["shopping", "web", "buyer"],
+    response_format="json",
+)
+
+
 async def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
     """Compatibility fallback used by tools_web when DuckDuckGo is requested directly."""
     loop = asyncio.get_running_loop()
@@ -1105,23 +1342,32 @@ async def _update_memory(
         if session_id:
             turn = _resolve_runtime_turn(session_id, owner_id)
             if supersede_existing:
-                graph.void_temporal_fact(
+                graph.replace_temporal_facts(
+                    session_id,
+                    facts=[
+                        {
+                            "subject": normalized_subject,
+                            "predicate": normalized_predicate,
+                            "object": normalized_object,
+                            "run_id": run_id,
+                            "locus_id": locus_id,
+                        }
+                    ],
+                    voids=[{"subject": normalized_subject, "predicate": normalized_predicate}],
+                    turn=turn,
+                    owner_id=owner_id,
+                )
+            else:
+                graph.add_temporal_fact(
                     session_id,
                     normalized_subject,
                     normalized_predicate,
+                    normalized_object,
                     turn,
                     owner_id=owner_id,
+                    run_id=run_id,
+                    locus_id=locus_id,
                 )
-            graph.add_temporal_fact(
-                session_id,
-                normalized_subject,
-                normalized_predicate,
-                normalized_object,
-                turn,
-                owner_id=owner_id,
-                run_id=run_id,
-                locus_id=locus_id,
-            )
 
         await graph.add_triplet(
             normalized_subject,
@@ -1821,6 +2067,7 @@ RAG_SEARCH_TOOL = Tool(
 ALL_TOOLS = [
     WEB_SEARCH_TOOL,
     WEB_FETCH_TOOL,
+    SHOPPING_ADVICE_TOOL,
     IMAGE_SEARCH_TOOL,
     BASH_TOOL,
     FILE_CREATE_TOOL,

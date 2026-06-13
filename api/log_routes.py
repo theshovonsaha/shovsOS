@@ -69,6 +69,108 @@ def _collect_evidence_entries(
     return entries
 
 
+def _latest_event(trace_events: list[dict], event_types: set[str]) -> Optional[dict]:
+    for event in trace_events:
+        if event.get("event_type") in event_types:
+            return event
+    return None
+
+
+def _event_summary(event: Optional[dict], fallback: str = "not recorded") -> str:
+    if not event:
+        return fallback
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    preview = event.get("preview")
+    for key in ("strategy", "notes", "content_preview", "summary", "message", "reason"):
+        if data.get(key):
+            return _clip_text(data.get(key), 180)
+    if data.get("tool_name"):
+        status = "failed" if data.get("success") is False else "recorded"
+        return _clip_text(f"{data.get('tool_name')} {status}", 180)
+    return _clip_text(preview or event.get("event_type") or fallback, 180)
+
+
+def _build_operator_story(
+    *,
+    run,
+    checkpoints: list,
+    passes: list,
+    artifacts: list,
+    evals: list,
+    evidence: list[dict],
+    trace_events: list[dict],
+    usage: dict,
+) -> dict:
+    latest_plan = _latest_event(trace_events, {"plan", "plan_steps", "continuation_gate"})
+    latest_context = _latest_event(trace_events, {"phase_packet", "phase_context", "compiled_context"})
+    latest_tool_result = _latest_event(trace_events, {"tool_result"})
+    latest_tool_call = _latest_event(trace_events, {"tool_call"})
+    latest_verification = _latest_event(trace_events, {"verification_warning", "verification_result"})
+    latest_memory = _latest_event(trace_events, {"memory_commit_plan", "memory_write_policy", "memory_commit_skipped"})
+    latest_response = _latest_event(trace_events, {"assistant_response"})
+
+    def lane(
+        lane_id: str,
+        label: str,
+        event: Optional[dict],
+        *,
+        summary: str = "",
+        count: int = 0,
+        status: str = "idle",
+    ) -> dict:
+        event_data = event.get("data") if event and isinstance(event.get("data"), dict) else {}
+        lane_status = status
+        if event:
+            if event_data.get("success") is False or "warning" in str(event.get("event_type") or ""):
+                lane_status = "attention"
+            elif event_data.get("supported") is False:
+                lane_status = "attention"
+            else:
+                lane_status = "done"
+        return {
+            "id": lane_id,
+            "label": label,
+            "status": lane_status,
+            "count": count,
+            "event_id": event.get("id") if event else None,
+            "event_type": event.get("event_type") if event else None,
+            "phase": event_data.get("phase") or "",
+            "summary": summary or _event_summary(event),
+        }
+
+    return {
+        "status": run.status,
+        "objective": _clip_text(
+            getattr(passes[-1], "objective", "")
+            if passes
+            else getattr(checkpoints[-1], "strategy", "")
+            if checkpoints
+            else "",
+            260,
+        ),
+        "cost": {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "total_tokens": usage["total_tokens"],
+            "estimated_cost_usd": usage["estimated_cost_usd"],
+        },
+        "lanes": [
+            lane("plan", "Plan", latest_plan, count=len([p for p in passes if str(p.phase).lower() == "planning"])),
+            lane("context", "Context", latest_context, count=len([e for e in trace_events if e.get("event_type") in {"phase_packet", "phase_context", "compiled_context"}])),
+            lane("tool", "Tools", latest_tool_result or latest_tool_call, count=len([e for e in trace_events if e.get("event_type") in {"tool_call", "tool_result"}])),
+            lane("evidence", "Evidence", None, summary=(evidence[0].get("summary") if evidence else "No evidence selected yet."), count=len(evidence), status="done" if evidence else "idle"),
+            lane("memory", "Memory", latest_memory, count=len([e for e in trace_events if "memory" in str(e.get("event_type") or "")])),
+            lane("verify", "Verify", latest_verification, count=len(evals)),
+            lane("response", "Response", latest_response, count=len([e for e in trace_events if e.get("event_type") == "assistant_response"])),
+        ],
+        "next_best_action": _event_summary(
+            _latest_event(trace_events, {"continuation_state_updated", "replan_recommended", "verification_warning"}),
+            "No follow-up action recorded.",
+        ),
+        "artifact_count": len(artifacts),
+    }
+
+
 def _build_run_replay_payload(*, run_id: str, owner_id: str, trace_limit: int = 160) -> dict:
     run_store = get_run_store()
     trace_store = get_trace_store()
@@ -128,6 +230,17 @@ def _build_run_replay_payload(*, run_id: str, owner_id: str, trace_limit: int = 
         seen_evidence.add(key)
         deduped_evidence.append(entry)
 
+    operator_story = _build_operator_story(
+        run=run,
+        checkpoints=checkpoints,
+        passes=passes,
+        artifacts=artifacts,
+        evals=evals,
+        evidence=deduped_evidence,
+        trace_events=trace_events,
+        usage=usage,
+    )
+
     return {
         "found": True,
         "run": asdict(run),
@@ -151,6 +264,7 @@ def _build_run_replay_payload(*, run_id: str, owner_id: str, trace_limit: int = 
         "evals": [asdict(item) for item in evals],
         "evidence": deduped_evidence,
         "trace_events": trace_events,
+        "operator_story": operator_story,
     }
 
 

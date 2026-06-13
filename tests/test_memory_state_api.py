@@ -37,6 +37,14 @@ def test_session_memory_state_exposes_current_superseded_and_candidate_memory():
             [
                 {"text": "User prefers weekly summaries", "reason": "low_grounding"},
                 {
+                    "text": "User location may not be Toronto",
+                    "reason": "evidence_disputed",
+                    "signal_type": "disputed_fact",
+                    "subject": "User",
+                    "predicate": "location",
+                    "object": "Toronto",
+                },
+                {
                     "text": "Stance [direct contradiction polite smoothing]: direct contradiction over polite smoothing",
                     "reason": "stance_asserted",
                     "signal_type": "stance",
@@ -49,7 +57,17 @@ def test_session_memory_state_exposes_current_superseded_and_candidate_memory():
         graph.add_temporal_fact(session.id, "User", "preferred_name", "Shovon", turn=1, owner_id=owner_id)
         graph.add_temporal_fact(session.id, "User", "location", "Toronto", turn=2, owner_id=owner_id)
         graph.void_temporal_fact(session.id, "User", "location", turn=4, owner_id=owner_id)
-        graph.add_temporal_fact(session.id, "User", "location", "Berlin", turn=4, owner_id=owner_id)
+        graph.add_temporal_fact(
+            session.id,
+            "User",
+            "location",
+            "Berlin",
+            turn=4,
+            owner_id=owner_id,
+            conflict_trace=True,
+            prior_value_disputed=True,
+            conflict_reason="fresh evidence disputed prior location",
+        )
 
         trace_store = get_trace_store()
         trace_store.append_event(
@@ -97,13 +115,23 @@ def test_session_memory_state_exposes_current_superseded_and_candidate_memory():
         payload = response.json()
         assert payload["summary"]["deterministic_fact_count"] == 2
         assert payload["summary"]["superseded_fact_count"] == 1
-        assert payload["summary"]["candidate_signal_count"] == 2
+        assert payload["summary"]["candidate_signal_count"] == 3
         assert payload["summary"]["stance_signal_count"] == 1
+        assert payload["summary"]["disputed_fact_count"] == 1
+        assert payload["summary"]["conflict_traced_count"] == 1
         assert payload["summary"]["candidate_signal_source"] == "structured"
+        assert payload["summary"]["typed_memory_counts"]["fact"] == 2
+        assert payload["summary"]["policy_memory_count"] == 0
+        assert payload["summary"]["preference_memory_count"] == 0
+        assert payload["exact_policy_memory"] == []
+        assert payload["exact_preference_memory"] == []
         assert any(item["object"] == "Berlin" and item["status"] == "current" for item in payload["deterministic_facts"])
+        assert all(item.get("content_hash") for item in payload["deterministic_facts"])
         assert any(item["object"] == "Toronto" and item["status"] == "superseded" for item in payload["superseded_facts"])
         assert any(item["reason"] == "low_grounding" for item in payload["candidate_signals"])
         assert any(item["signal_type"] == "stance" for item in payload["stance_signals"])
+        assert any(item["reason"] == "evidence_disputed" for item in payload["disputed_facts"])
+        assert any(item["conflict_trace"] is True for item in payload["conflict_traced_facts"])
         assert "User prefers weekly summaries" in payload["candidate_context_preview"]
         assert any(item["label"] == "Deterministic extractor" for item in payload["recent_memory_signals"])
         assert any(item["label"] == "Stance extractor" for item in payload["recent_memory_signals"])

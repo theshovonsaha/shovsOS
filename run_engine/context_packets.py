@@ -60,6 +60,7 @@ class PacketBuildInputs:
     conversation_tension: Optional[ConversationTension] = None
     active_skill_context: str = ""
     active_skill_name: str = ""
+    capability_context: str = ""
     code_intent_note: str = ""
     execution_risk_tier: str = ""
     correction_turn: bool = False
@@ -75,6 +76,11 @@ class PacketBuildInputs:
     # content}. Visible to PLANNING only — planner reads them to decide
     # which loci to query; actor uses tools, not raw drawer dumps.
     spatial_drawers: Optional[list[dict[str, Any]]] = None
+    # Canonical run ledger snapshot. In shadow mode this is an additional
+    # consistency lane; in enforced mode it becomes the state contract phases
+    # must obey. Passed as an object to avoid serializing the full trace into
+    # every prompt.
+    run_ledger: Optional[Any] = None
 
 
 def build_phase_packet(
@@ -104,6 +110,42 @@ def build_phase_packet(
     )
     if instruction_item is not None:
         items.append(instruction_item)
+
+    if inputs.run_ledger is not None and hasattr(inputs.run_ledger, "render_for_phase"):
+        try:
+            ledger_content = str(inputs.run_ledger.render_for_phase(inputs.phase) or "").strip()
+            ledger_packet = inputs.run_ledger.to_phase_packet(inputs.phase) if hasattr(inputs.run_ledger, "to_phase_packet") else {}
+        except Exception:
+            ledger_content = ""
+            ledger_packet = {}
+        if ledger_content:
+            items.append(
+                ContextItem(
+                    item_id="canonical_run_ledger",
+                    kind=ContextKind.RUNTIME,
+                    title="Canonical Run Ledger",
+                    content=ledger_content,
+                    source="run_ledger",
+                    priority=18,
+                    max_chars=1800,
+                    trace_id="run_engine:run_ledger",
+                    provenance={
+                        "version": str(ledger_packet.get("version") or ""),
+                        "ledger_mode": str(ledger_packet.get("ledger_mode") or ""),
+                        "tool_call_count": int((ledger_packet.get("summary") or {}).get("tool_call_count") or 0),
+                        "tool_result_count": int((ledger_packet.get("summary") or {}).get("tool_result_count") or 0),
+                        "evidence_count": int((ledger_packet.get("summary") or {}).get("evidence_count") or 0),
+                        "pending_step_count": int((ledger_packet.get("summary") or {}).get("pending_step_count") or 0),
+                    },
+                    phase_visibility=frozenset({
+                        ContextPhase.PLANNING,
+                        ContextPhase.ACTING,
+                        ContextPhase.RESPONSE,
+                        ContextPhase.MEMORY_COMMIT,
+                        ContextPhase.VERIFICATION,
+                    }),
+                )
+            )
 
     items.append(
         ContextItem(
@@ -381,6 +423,27 @@ def build_phase_packet(
         )
         if available_tools_item is not None:
             items.append(available_tools_item)
+
+    if inputs.capability_context.strip():
+        items.append(
+            ContextItem(
+                item_id="capability_cards",
+                kind=ContextKind.RUNTIME,
+                title="Capability Cards",
+                content=inputs.capability_context.strip(),
+                source="capability_registry",
+                priority=24,
+                max_chars=1800,
+                trace_id="run_engine:capability_cards",
+                phase_visibility=frozenset({
+                    ContextPhase.PLANNING,
+                    ContextPhase.ACTING,
+                    ContextPhase.RESPONSE,
+                    ContextPhase.VERIFICATION,
+                }),
+                provenance={"chars": len(inputs.capability_context.strip())},
+            )
+        )
 
     if inputs.strategy.strip() or inputs.notes.strip():
         guidance_parts = []
