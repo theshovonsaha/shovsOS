@@ -12,6 +12,7 @@ import sqlite3
 import json
 import asyncio
 import threading
+import hashlib
 from collections import OrderedDict
 import numpy as np
 import httpx
@@ -31,11 +32,51 @@ class SemanticGraph:
         self.embedding_timeout = float(getattr(cfg, "EMBEDDING_HTTP_TIMEOUT", 20.0))
         self.embedding_retries = max(0, int(getattr(cfg, "EMBEDDING_HTTP_RETRIES", 2)))
         self.embedding_cache_size = max(64, int(getattr(cfg, "EMBEDDING_CACHE_SIZE", 512)))
+        self._embed_available: bool = True
+        self._embed_failure_count: int = 0
         self._init_db()
 
     @staticmethod
     def _normalize_text(text: str) -> str:
         return " ".join((text or "").strip().split())
+
+    @staticmethod
+    def _fact_memory_type(subject: str, predicate: str) -> str:
+        pred = (predicate or "").strip().lower()
+        if pred in {
+            "preferred_name",
+            "location",
+            "timezone",
+            "preferred_editor",
+            "package_manager",
+            "primary_language",
+            "response_verbosity",
+            "operating_system",
+            "pronouns",
+        }:
+            return "preference" if pred in {"preferred_editor", "package_manager", "response_verbosity"} else "fact"
+        if pred in {
+            "environment_mode",
+            "scope_boundary",
+            "budget_limit",
+            "task_constraint",
+            "followup_directive",
+        }:
+            return "policy" if pred in {"task_constraint", "scope_boundary", "budget_limit"} else "episodic"
+        if (subject or "").strip().lower() in {"policy", "rule", "constraint"}:
+            return "policy"
+        return "fact"
+
+    @staticmethod
+    def _content_hash(subject: str, predicate: str, object_: str, owner_id: Optional[str], session_id: str) -> str:
+        payload = "\x1f".join([
+            str(owner_id or ""),
+            str(session_id or ""),
+            (subject or "").strip().lower(),
+            (predicate or "").strip().lower(),
+            (object_ or "").strip(),
+        ])
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @classmethod
     def _get_http_client(cls, base_url: str, timeout: float) -> httpx.AsyncClient:
@@ -142,6 +183,13 @@ class SemanticGraph:
                     subject TEXT NOT NULL,
                     predicate TEXT NOT NULL,
                     object TEXT NOT NULL,
+                    memory_type TEXT NOT NULL DEFAULT 'fact',
+                    memory_status TEXT NOT NULL DEFAULT 'active',
+                    confidence REAL,
+                    source_turn_id INTEGER,
+                    superseded_by INTEGER,
+                    expires_at TEXT,
+                    content_hash TEXT,
                     valid_from INTEGER NOT NULL,
                     valid_to INTEGER,
                     created_at TEXT NOT NULL
@@ -171,6 +219,46 @@ class SemanticGraph:
                 conn.execute("ALTER TABLE facts ADD COLUMN locus_id TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN conflict_trace INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN prior_value_disputed INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN conflict_reason TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'fact'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN memory_status TEXT NOT NULL DEFAULT 'active'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN confidence REAL")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN source_turn_id INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN superseded_by INTEGER")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN expires_at TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                conn.execute("ALTER TABLE facts ADD COLUMN content_hash TEXT")
+            except sqlite3.OperationalError:
+                pass
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS locus_edges (
                     src_id TEXT NOT NULL,
@@ -180,9 +268,55 @@ class SemanticGraph:
                     PRIMARY KEY (src_id, dst_id)
                 )
             ''')
+            # M1: hot-path indexes on facts. Every context build calls
+            # get_current_facts (session-scoped) and get_owner_current_facts
+            # (cross-session). Without these, a 50-turn session does N full
+            # table scans. The predicate-history index also covers M3's
+            # get_predicate_history reader.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_owner_session_valid "
+                "ON facts(owner_id, session_id, valid_to)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_owner_predicate "
+                "ON facts(owner_id, subject, predicate, valid_to)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_owner_valid_from "
+                "ON facts(owner_id, valid_from DESC)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_owner_type_status "
+                "ON facts(owner_id, memory_type, memory_status, valid_to)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_facts_content_hash "
+                "ON facts(content_hash)"
+            )
             conn.commit()
 
+    def _record_embedding_failure(self, exc: Exception) -> List[float]:
+        self._embed_failure_count += 1
+        if self._embed_failure_count >= 2:
+            if self._embed_available:
+                print(f"[SemanticGraph] Embedding disabled after repeated failures: {exc}")
+            self._embed_available = False
+        elif self._embed_failure_count == 1:
+            print(f"[SemanticGraph] Embedding failed: {exc}")
+        return []
+
     async def _get_embedding(self, text: str) -> List[float]:
+        if not self._embed_available:
+            return []
+        try:
+            embedding = await self._get_embedding_uncached(text)
+            self._embed_failure_count = 0
+            self._embed_available = True
+            return embedding
+        except Exception as exc:
+            return self._record_embedding_failure(exc)
+
+    async def _get_embedding_uncached(self, text: str) -> List[float]:
         """Fetch an embedding from the provider."""
         normalized = self._normalize_text(text)
         model_name = str(self.embedding_model or cfg.EMBED_MODEL).strip()
@@ -287,10 +421,7 @@ class SemanticGraph:
         We embed the string: "subject predicate object"
         """
         text_to_embed = f"search_document: {subject} {predicate} {object_}"
-        try:
-            vector = await self._get_embedding(text_to_embed)
-        except Exception as e:
-            raise Exception(f"Failed to generate embedding: {e}")
+        vector = await self._get_embedding(text_to_embed)
 
         now = datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
@@ -316,12 +447,10 @@ class SemanticGraph:
         2. Calculate cosine similarity against all stored memories in memory.
         3. Return the top_k matching relationships.
         """
-        try:
-            # For retrieval, we use 'search_query: ' prefix
-            query_to_embed = f"search_query: {query}" if query else "search_query: "
-            query_vector = await self._get_embedding(query_to_embed)
-        except Exception as e:
-            print(f"[SemanticGraph] Embedding error: {e}")
+        # For retrieval, we use 'search_query: ' prefix
+        query_to_embed = f"search_query: {query}" if query else "search_query: "
+        query_vector = await self._get_embedding(query_to_embed)
+        if not query_vector:
             return []
 
         results = []
@@ -380,6 +509,38 @@ class SemanticGraph:
             {"id": r[0], "subject": r[1], "predicate": r[2], "object": r[3], "created_at": r[4]}
             for r in rows
         ]
+
+    def list_triplets(
+        self,
+        *,
+        owner_id: Optional[str] = None,
+        locus_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        """Return raw semantic triplets without requiring embeddings.
+
+        This backs exact/locus fallback retrieval when the embedding provider is
+        offline. It does not replace vector traversal; it preserves recall for
+        scoped triplets that are already structurally known.
+        """
+        safe_limit = max(1, int(limit))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            query = (
+                "SELECT id, owner_id, run_id, locus_id, subject, predicate, object, created_at "
+                "FROM memories WHERE 1=1"
+            )
+            params: list[object] = []
+            if owner_id is not None:
+                query += " AND COALESCE(owner_id, '') = COALESCE(?, '')"
+                params.append(owner_id)
+            if locus_id is not None:
+                query += " AND COALESCE(locus_id, '') = COALESCE(?, '')"
+                params.append(locus_id)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(safe_limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
 
     def delete_triplets(
         self,
@@ -480,14 +641,162 @@ class SemanticGraph:
         owner_id: Optional[str] = None,
         run_id: Optional[str] = None,
         locus_id: Optional[str] = None,
+        conflict_trace: bool = False,
+        prior_value_disputed: bool = False,
+        conflict_reason: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        memory_status: str = "active",
+        confidence: Optional[float] = None,
+        expires_at: Optional[str] = None,
     ):
         """Insert a new fact valid from exactly this turn forward."""
         now = datetime.now().isoformat()
+        subject_clean = subject.strip()
+        predicate_clean = predicate.strip()
+        object_clean = object_.strip()
+        fact_type = str(memory_type or self._fact_memory_type(subject_clean, predicate_clean)).strip() or "fact"
+        content_hash = self._content_hash(subject_clean, predicate_clean, object_clean, owner_id, session_id)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
-                INSERT INTO facts (session_id, owner_id, run_id, locus_id, subject, predicate, object, valid_from, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (session_id, owner_id, run_id, locus_id, subject.strip(), predicate.strip(), object_.strip(), turn, now))
+                INSERT INTO facts (
+                    session_id, owner_id, run_id, locus_id, subject, predicate,
+                    object, memory_type, memory_status, confidence, source_turn_id,
+                    expires_at, content_hash, valid_from, created_at, conflict_trace,
+                    prior_value_disputed, conflict_reason
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                session_id,
+                owner_id,
+                run_id,
+                locus_id,
+                subject_clean,
+                predicate_clean,
+                object_clean,
+                fact_type,
+                str(memory_status or "active"),
+                confidence,
+                turn,
+                expires_at,
+                content_hash,
+                turn,
+                now,
+                1 if conflict_trace else 0,
+                1 if prior_value_disputed else 0,
+                conflict_reason,
+            ))
+            conn.commit()
+
+    def replace_temporal_facts(
+        self,
+        session_id: str,
+        *,
+        facts: List[Dict[str, object]],
+        voids: List[Dict[str, object]],
+        turn: int,
+        owner_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        locus_id: Optional[str] = None,
+    ) -> None:
+        """Atomically void old facts and insert replacements.
+
+        `add_temporal_fact()` and `void_temporal_fact()` each commit their own
+        connection. Replacement flows must use this batch method so a failed
+        insert cannot leave the old fact voided with no current replacement.
+        """
+        now = datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            for void in voids:
+                subject = str(void.get("subject") or "").strip()
+                predicate = str(void.get("predicate") or "").strip()
+                if not subject or not predicate:
+                    continue
+                if owner_id is None:
+                    conn.execute(
+                        '''
+                        UPDATE facts
+                        SET valid_to = ?, memory_status = 'superseded'
+                        WHERE session_id = ? AND subject = ? AND predicate = ? AND valid_to IS NULL
+                        ''',
+                        (turn, session_id, subject, predicate),
+                    )
+                else:
+                    conn.execute(
+                        '''
+                        UPDATE facts
+                        SET valid_to = ?, memory_status = 'superseded'
+                        WHERE session_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')
+                          AND subject = ? AND predicate = ? AND valid_to IS NULL
+                        ''',
+                        (turn, session_id, owner_id, subject, predicate),
+                    )
+
+            for fact in facts:
+                subject = str(fact.get("subject") or "").strip()
+                predicate = str(fact.get("predicate") or "").strip()
+                object_ = (fact.get("object") if "object" in fact else fact.get("object_")).strip()
+                if not subject or not predicate:
+                    continue
+                fact_locus_id = str(fact.get("locus_id") or "").strip() or locus_id
+                fact_run_id = str(fact.get("run_id") or "").strip() or run_id
+                fact_type = str(fact.get("memory_type") or self._fact_memory_type(subject, predicate)).strip() or "fact"
+                memory_status = str(fact.get("memory_status") or "active").strip() or "active"
+                confidence = fact.get("confidence")
+                expires_at = str(fact.get("expires_at") or "").strip() or None
+                content_hash = str(fact.get("content_hash") or "").strip() or self._content_hash(subject, predicate, object_, owner_id, session_id)
+                conn.execute(
+                    '''
+                    INSERT INTO facts (
+                        session_id, owner_id, run_id, locus_id, subject, predicate,
+                        object, memory_type, memory_status, confidence, source_turn_id,
+                        expires_at, content_hash, valid_from, created_at, conflict_trace,
+                        prior_value_disputed, conflict_reason
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        session_id,
+                        owner_id,
+                        fact_run_id,
+                        fact_locus_id,
+                        subject,
+                        predicate,
+                        object_,
+                        fact_type,
+                        memory_status,
+                        confidence,
+                        turn,
+                        expires_at,
+                        content_hash,
+                        turn,
+                        now,
+                        1 if bool(fact.get("conflict_trace")) else 0,
+                        1 if bool(fact.get("prior_value_disputed")) else 0,
+                        str(fact.get("conflict_reason") or "") or None,
+                    ),
+                )
+                new_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+                if owner_id is None:
+                    conn.execute(
+                        '''
+                        UPDATE facts
+                        SET superseded_by = ?
+                        WHERE session_id = ? AND subject = ? AND predicate = ?
+                          AND valid_to = ? AND superseded_by IS NULL AND id != ?
+                        ''',
+                        (new_id, session_id, subject, predicate, turn, new_id),
+                    )
+                else:
+                    conn.execute(
+                        '''
+                        UPDATE facts
+                        SET superseded_by = ?
+                        WHERE session_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')
+                          AND subject = ? AND predicate = ?
+                          AND valid_to = ? AND superseded_by IS NULL AND id != ?
+                        ''',
+                        (new_id, session_id, owner_id, subject, predicate, turn, new_id),
+                    )
             conn.commit()
 
     def void_temporal_fact(
@@ -503,13 +812,13 @@ class SemanticGraph:
             if owner_id is None:
                 conn.execute('''
                     UPDATE facts 
-                    SET valid_to = ? 
+                    SET valid_to = ?, memory_status = 'superseded'
                     WHERE session_id = ? AND subject = ? AND predicate = ? AND valid_to IS NULL
                 ''', (turn, session_id, subject.strip(), predicate.strip()))
             else:
                 conn.execute('''
                     UPDATE facts 
-                    SET valid_to = ? 
+                    SET valid_to = ?, memory_status = 'superseded'
                     WHERE session_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')
                       AND subject = ? AND predicate = ? AND valid_to IS NULL
                 ''', (turn, session_id, owner_id, subject.strip(), predicate.strip()))
@@ -551,6 +860,115 @@ class SemanticGraph:
                     break
             return out
 
+    def get_predicate_history(
+        self,
+        owner_id: Optional[str],
+        subject: str,
+        predicate: str,
+        limit: int = 10,
+    ) -> List[Dict[str, Optional[str]]]:
+        """Return the full timeline for one (subject, predicate) pair across
+        all sessions for this owner — including superseded (voided) facts.
+
+        This is the **archaeology** reader. It answers questions like
+        "what did I originally say about Berlin?" or "when did I correct my
+        budget?". The 50-turn shovs scenario (turns 36, 38, 41, 50) requires
+        this surface; without it the agent can only see current facts and
+        will give half-answers to history questions.
+
+        Returns rows ordered by ``valid_from DESC`` (most recent first):
+
+            [
+              {subject, predicate, object, valid_from, valid_to, created_at,
+               run_id, status: "current"|"superseded"},
+              ...
+            ]
+
+        Status is derived (``"current"`` when ``valid_to IS NULL``,
+        ``"superseded"`` otherwise) so callers don't need to interpret the
+        raw column.
+        """
+        safe_limit = max(1, int(limit))
+        clean_subject = (subject or "").strip()
+        clean_predicate = (predicate or "").strip()
+        if not clean_subject or not clean_predicate:
+            return []
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT subject, predicate, object, valid_from, valid_to,
+                       created_at, run_id, session_id, memory_type, memory_status,
+                       confidence, source_turn_id, superseded_by, expires_at, content_hash
+                FROM facts
+                WHERE COALESCE(owner_id, '') = COALESCE(?, '')
+                  AND lower(subject) = lower(?)
+                  AND lower(predicate) = lower(?)
+                ORDER BY valid_from DESC, id DESC
+                LIMIT ?
+                ''',
+                (owner_id, clean_subject, clean_predicate, safe_limit),
+            )
+            out: List[Dict[str, Optional[str]]] = []
+            for row in cursor.fetchall():
+                d = dict(row)
+                d["status"] = "current" if d.get("valid_to") is None else "superseded"
+                out.append(d)
+            return out
+
+    def get_current_fact_records(
+        self,
+        session_id: str,
+        owner_id: Optional[str] = None,
+        *,
+        memory_types: Optional[List[str]] = None,
+        limit: Optional[int] = 100,
+    ) -> List[Dict[str, object]]:
+        """Return current facts with typed-memory provenance.
+
+        This is the richer reader for prompt assembly and inspectors. The older
+        get_current_facts() tuple API intentionally remains unchanged.
+        """
+        safe_limit = max(1, int(limit)) if limit is not None else None
+        normalized_types = [str(t).strip().lower() for t in (memory_types or []) if str(t).strip()]
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            params: list[object] = [session_id]
+            owner_filter = ""
+            if owner_id is not None:
+                owner_filter = " AND COALESCE(owner_id, '') = COALESCE(?, '')"
+                params.append(owner_id)
+            type_filter = ""
+            if normalized_types:
+                type_filter = " AND lower(memory_type) IN (" + ",".join("?" for _ in normalized_types) + ")"
+                params.extend(normalized_types)
+            limit_clause = ""
+            if safe_limit is not None:
+                limit_clause = " LIMIT ?"
+                params.append(safe_limit)
+            cursor = conn.execute(
+                f'''
+                SELECT id, session_id, owner_id, run_id, locus_id, subject, predicate, object,
+                       memory_type, memory_status, confidence, source_turn_id,
+                       superseded_by, expires_at, content_hash, valid_from, valid_to,
+                       created_at, conflict_trace, prior_value_disputed, conflict_reason
+                FROM facts
+                WHERE session_id = ?{owner_filter} AND valid_to IS NULL{type_filter}
+                ORDER BY valid_from ASC, id ASC{limit_clause}
+                ''',
+                tuple(params),
+            )
+            rows = cursor.fetchall()
+        out: List[Dict[str, object]] = []
+        for row in rows:
+            item = dict(row)
+            item["status"] = "current"
+            item["conflict_trace"] = bool(item.get("conflict_trace"))
+            item["prior_value_disputed"] = bool(item.get("prior_value_disputed"))
+            out.append(item)
+        return out
+
     def get_current_facts(self, session_id: str, owner_id: Optional[str] = None) -> List[Tuple[str, str, str]]:
         """Return all currently valid facts (un-voided) for this session."""
         with sqlite3.connect(self.db_path) as conn:
@@ -585,7 +1003,11 @@ class SemanticGraph:
             if owner_id is None:
                 cursor.execute(
                     '''
-                    SELECT subject, predicate, object, valid_from, valid_to, created_at, run_id
+                    SELECT id, subject, predicate, object, valid_from, valid_to,
+                           created_at, run_id, conflict_trace,
+                           prior_value_disputed, conflict_reason, memory_type,
+                           memory_status, confidence, source_turn_id,
+                           superseded_by, expires_at, content_hash
                     FROM facts
                     WHERE session_id = ?
                     ORDER BY id DESC
@@ -596,7 +1018,11 @@ class SemanticGraph:
             else:
                 cursor.execute(
                     '''
-                    SELECT subject, predicate, object, valid_from, valid_to, created_at, run_id
+                    SELECT id, subject, predicate, object, valid_from, valid_to,
+                           created_at, run_id, conflict_trace,
+                           prior_value_disputed, conflict_reason, memory_type,
+                           memory_status, confidence, source_turn_id,
+                           superseded_by, expires_at, content_hash
                     FROM facts
                     WHERE session_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')
                     ORDER BY id DESC
@@ -608,6 +1034,7 @@ class SemanticGraph:
 
         return [
             {
+                "id": row["id"],
                 "subject": row["subject"],
                 "predicate": row["predicate"],
                 "object": row["object"],
@@ -615,6 +1042,16 @@ class SemanticGraph:
                 "valid_to": row["valid_to"],
                 "created_at": row["created_at"],
                 "run_id": row["run_id"],
+                "memory_type": row["memory_type"],
+                "memory_status": row["memory_status"],
+                "confidence": row["confidence"],
+                "source_turn_id": row["source_turn_id"],
+                "superseded_by": row["superseded_by"],
+                "expires_at": row["expires_at"],
+                "content_hash": row["content_hash"],
+                "conflict_trace": bool(row["conflict_trace"]),
+                "prior_value_disputed": bool(row["prior_value_disputed"]),
+                "conflict_reason": row["conflict_reason"],
                 "status": "current" if row["valid_to"] is None else "superseded",
             }
             for row in rows

@@ -4,33 +4,45 @@
 
 Shovs is a Language OS.
 
-The underlying model is still probabilistic at the token level, but the runtime can make behavior increasingly stable at the task level through:
+The model is still probabilistic. It can still make mistakes. The thesis is not that a runtime can make an LLM perfectly deterministic.
+
+The thesis is that a runtime can make agent behavior more stable at the task level by keeping important state outside the model and making every step inspectable.
+
+Shovs does this through:
 
 - controlled context assembly
 - explicit execution phases
+- a canonical run ledger
 - verified tool grounding
-- structured state lanes
-- run identity, checkpoints, artifacts, and evals
-- observable traces and replayable failures
-
-The goal is not to make an LLM mathematically deterministic.
+- structured fact and candidate lanes
+- checkpoints, artifacts, traces, and evals
+- replayable failures
 
 The goal is to make LLM-powered systems:
 
 - more coherent
-- more inspectable
-- more composable
-- more reliable across runs, tools, and models
+- easier to inspect
+- easier to compose
+- more reliable across tools, sessions, and models
 
 ## Core Claim
 
-Language is the universal interface.
+Language is the interface.
 
 Context is the operating surface.
 
 The runtime is the stabilizer.
 
-Shovs treats language as the input and output medium, but not as the only form of state. The runtime parses language into structured execution state, runs explicit phases over that state, and only serializes back into language when the model actually needs it.
+Shovs uses language to talk to users and models, but it does not treat the chat transcript as the only state. The runtime turns language into structured execution state, runs phases over that state, and then gives the model only the context it needs for the current job.
+
+In plain terms:
+
+- the user owns the goal
+- the runtime owns the state
+- the model helps plan, act, observe, and explain
+- tools produce evidence
+- verification checks whether the answer is allowed
+- memory stores only what is eligible to persist
 
 ## What Makes Shovs Different
 
@@ -38,18 +50,19 @@ Shovs is not just:
 
 - a prompt wrapper
 - a chatbot shell
-- a tool-calling loop
+- a generic tool loop
 - a thin UI over a model provider
 
 Shovs is a runtime with:
 
-- `single`, `managed`, and `auto` execution loops
-- explicit `plan -> act -> observe -> verify -> commit`
+- a managed `plan -> act -> observe -> verify -> memory_commit` loop
+- a run ledger for plan steps, tool calls, tool results, evidence, memory writes, verification, and continuation state
 - phase-aware context compilation
 - deterministic fact vs candidate-signal lanes
-- run checkpoints, artifacts, and evals
-- provider/runtime portability across local and cloud models
-- agent construction on top of the kernel
+- side-effect guards for tool claims
+- scenario-state evals that inspect the path taken, not only the final answer
+- provider portability across local and cloud models
+- agent construction on top of the same kernel
 
 ## The Platform Idea
 
@@ -73,9 +86,11 @@ A robust agent on Shovs is defined by a combination of:
 - tool set
 - workspace bootstrap docs
 - model and embedding model
-- planner and loop defaults
+- planner defaults
 - context engine mode
 - memory behavior
+- risk and evidence policy
+- workflow template
 
 That means developers should be able to build:
 
@@ -106,6 +121,37 @@ Shovs aims to:
 
 - raise the floor for small models
 - raise the ceiling for large models
+
+This matters because good agent behavior should not depend only on one frontier model being smart enough to recover from messy state. The runtime should reduce the mess.
+
+## The Reliability Wedge
+
+The smallest useful proof is not a giant autonomous assistant.
+
+The smallest proof is a run where the system can show:
+
+1. what the user asked for
+2. what entities or targets were selected
+3. which tools were allowed
+4. which tool calls actually happened
+5. which results succeeded
+6. what evidence was gathered
+7. what memory was written or rejected
+8. why the final answer passed or failed verification
+
+That is why Shovs invests in run ledgers, trace replay, memory inspection, and scenario evals.
+
+If an agent gives a polished answer after searching the wrong things, Shovs should be able to mark the run as wrong.
+
+That is the practical standard.
+
+The public proof path is intentionally small:
+
+1. Define the harness: [HARNESS.md](../../HARNESS.md)
+2. Run deterministic checks: [BENCHMARKS.md](../../BENCHMARKS.md)
+3. Inspect scenario-state evals: [EVALS.md](../../EVALS.md)
+4. Check claim boundaries: [CLAIMS.md](../../CLAIMS.md)
+5. Compare latest local results: [RESULTS.md](../../RESULTS.md)
 
 ## Frontier Direction
 

@@ -66,6 +66,17 @@ def _build_preview(event_type: str, data: Any, max_chars: int) -> str:
                 max_chars,
             )
 
+        if event_type == "source_contract":
+            status = data.get("status")
+            strategy = data.get("strategy")
+            tools = data.get("selected_tools")
+            entities = data.get("entities")
+            missing = data.get("missing_slots")
+            return _clip(
+                f"status={status} strategy={strategy} tools={tools} entities={entities} missing={missing}",
+                max_chars,
+            )
+
         top_keys = list(data.keys())[:10]
         return _clip(f"keys={top_keys}", max_chars)
 
@@ -98,6 +109,11 @@ def _payload_summary(data: Any) -> dict:
             "tool_name",
             "success",
             "content_length",
+            "status",
+            "strategy",
+            "selected_tools",
+            "entities",
+            "missing_slots",
         ):
             if field in data:
                 summary[field] = data[field]

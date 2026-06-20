@@ -54,6 +54,7 @@ from engine.tool_contract import (
     tool_call_signature as shared_tool_call_signature,
 )
 from engine.tool_loop_guard import ToolLoopGuard
+from engine.response_guard import guard_final_response
 from engine.deterministic_facts import (
     extract_user_stated_fact_updates,
     is_redundant_user_alias_text,
@@ -1647,10 +1648,12 @@ class AgentCore:
             clean_model = strip_provider_prefix(resolved_model)
             self.adapter = current_use_adapter
             
-            # ── CRITICAL: Propagate dynamic adapter to subsystems ─────────
-            # Without this, ContextEngine and Orchestrator remain stuck on 
-            # the original OllamaAdapter even when user selects Groq/Claude/Gemini.
-            ctx_eng.set_adapter(current_use_adapter)
+            self._context_governor.set_adapter(current_use_adapter)
+            if hasattr(ctx_eng, "set_adapter"):
+                try:
+                    ctx_eng.set_adapter(current_use_adapter)
+                except Exception:
+                    pass
             if self.orch:
                 self.orch.set_adapter(current_use_adapter)
             
@@ -2367,6 +2370,36 @@ class AgentCore:
             self._strip_tool_json(self._strip_reasoning(full_response)),
             has_tool_results=bool(all_tool_results),
         )
+        # Guard: If response is only tool calls, keep continuity but still let
+        # the final-response guard inspect the original raw payload below.
+        response_guard_input = clean_response
+        if not clean_response and full_response:
+            clean_response = "[Tool Execution Turn]"
+            response_guard_input = full_response
+
+        guarded_response = guard_final_response(
+            response_guard_input,
+            user_message=user_message,
+            model=model,
+            model_profile=model_profile,
+        )
+        if guarded_response.changed:
+            clean_response = guarded_response.text
+            log(
+                "agent",
+                sid,
+                f"Final response guarded · issues={guarded_response.issues}",
+                level="warn",
+                owner_id=owner_id,
+            )
+            trace_event("final_response_guard", {
+                "issues": guarded_response.issues,
+                "replacement_used": guarded_response.replacement_used,
+                "model_profile": model_profile,
+            })
+            yield _ev("retract_last_tokens")
+            yield {"type": "_retract_response", "clean_response": clean_response}
+            yield _ev("token", content=clean_response)
         
         # — ENHANCEMENT: Automated Citation Verification —
         # Detects if the model contradicted historical facts injected via RAG
@@ -2378,11 +2411,6 @@ class AgentCore:
                     "\n\n[Note: Some details above may conflict with previously stored context. "
                     "Please prioritize established facts from the conversation memory.]"
                 )
-        
-        # Guard: If response is only tool calls, we still want a placeholder for continuity
-        if not clean_response and full_response:
-            clean_response = "[Tool Execution Turn]"
-
         verify_with_context_fn = getattr(self.orch, "verify_with_context", None) if self.orch else None
         if manager_loop_enabled and all_tool_results and callable(verify_with_context_fn):
             trace_phase(ContextPhase.VERIFICATION, "start", result_count=len(all_tool_results))

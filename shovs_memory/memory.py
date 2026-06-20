@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Optional
 
 from engine.deterministic_facts import extract_user_stated_fact_updates
@@ -10,6 +11,13 @@ from shovs_memory.inspector import build_memory_payload
 
 def _simple_context_preview(raw_context: str) -> list[str]:
     return [line.strip() for line in (raw_context or "").splitlines() if line.strip()]
+
+
+def _resolve_db_path(db_path: str) -> str:
+    path = Path(db_path).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str((Path.cwd() / path).resolve())
 
 
 class ShovsMemory:
@@ -32,7 +40,7 @@ class ShovsMemory:
     ):
         self.session_id = session_id
         self.owner_id = owner_id
-        self.graph = graph or SemanticGraph(db_path=db_path, embedding_model=embedding_model)
+        self.graph = graph or SemanticGraph(db_path=_resolve_db_path(db_path), embedding_model=embedding_model)
         self.session_manager = session_manager
 
     async def retrieve(self, query: str, *, top_k: int = 5, threshold: float = 0.5) -> list[dict]:
@@ -52,31 +60,49 @@ class ShovsMemory:
         object_: str,
         turn: int,
         run_id: Optional[str] = None,
+        memory_type: Optional[str] = None,
+        confidence: Optional[float] = None,
+        expires_at: Optional[str] = None,
         supersede_existing: bool = True,
     ) -> dict:
         if supersede_existing:
-            self.graph.void_temporal_fact(
+            self.graph.replace_temporal_facts(
                 self.session_id,
-                subject=subject,
-                predicate=predicate,
+                facts=[
+                    {
+                        "subject": subject,
+                        "predicate": predicate,
+                        "object": object_,
+                        "run_id": run_id,
+                        "memory_type": memory_type,
+                        "confidence": confidence,
+                        "expires_at": expires_at,
+                    }
+                ],
+                voids=[{"subject": subject, "predicate": predicate}],
                 turn=turn,
                 owner_id=self.owner_id,
             )
-        self.graph.add_temporal_fact(
-            self.session_id,
-            subject=subject,
-            predicate=predicate,
-            object_=object_,
-            turn=turn,
-            owner_id=self.owner_id,
-            run_id=run_id,
-        )
+        else:
+            self.graph.add_temporal_fact(
+                self.session_id,
+                subject=subject,
+                predicate=predicate,
+                object_=object_,
+                turn=turn,
+                owner_id=self.owner_id,
+                run_id=run_id,
+                memory_type=memory_type,
+                confidence=confidence,
+                expires_at=expires_at,
+            )
         return {
             "session_id": self.session_id,
             "subject": subject,
             "predicate": predicate,
             "object": object_,
             "turn": turn,
+            "memory_type": memory_type or self.graph._fact_memory_type(subject, predicate),
         }
 
     def apply_user_message(
@@ -91,25 +117,13 @@ class ShovsMemory:
             current_facts=self.current_facts(),
         )
 
-        for void in voids:
-            self.graph.void_temporal_fact(
-                self.session_id,
-                subject=str(void.get("subject") or ""),
-                predicate=str(void.get("predicate") or ""),
-                turn=turn,
-                owner_id=self.owner_id,
-            )
-
-        for fact in facts:
-            self.graph.add_temporal_fact(
-                self.session_id,
-                subject=str(fact.get("subject") or ""),
-                predicate=str(fact.get("predicate") or ""),
-                object_=str(fact.get("object") or ""),
-                turn=turn,
-                owner_id=self.owner_id,
-                run_id=run_id,
-            )
+        self.graph.replace_temporal_facts(
+            self.session_id,
+            facts=[{**fact, "run_id": run_id} for fact in facts],
+            voids=voids,
+            turn=turn,
+            owner_id=self.owner_id,
+        )
 
         return {"facts": facts, "voids": voids}
 

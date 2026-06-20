@@ -84,15 +84,7 @@ class ManifestParser:
             from memory.semantic_graph import SemanticGraph
 
             graph = SemanticGraph()
-            if manifest.voids:
-                graph.void_temporal_fact(
-                    session_id=session_id,
-                    subject=manifest.voids[0],
-                    predicate=manifest.voids[1],
-                    turn=turn,
-                    owner_id=owner_id,
-                )
-
+            grounded_fact: Optional[tuple[str, str, str]] = None
             if manifest.fact:
                 candidate = {
                     "subject": manifest.fact[0],
@@ -114,21 +106,55 @@ class ManifestParser:
                         raw=manifest.raw,
                     )
                 else:
+                    grounded_fact = manifest.fact
+
+            if manifest.voids and grounded_fact:
+                graph.replace_temporal_facts(
+                    session_id,
+                    facts=[
+                        {
+                            "subject": grounded_fact[0],
+                            "predicate": grounded_fact[1],
+                            "object": grounded_fact[2],
+                            "run_id": run_id,
+                        }
+                    ],
+                    voids=[{"subject": manifest.voids[0], "predicate": manifest.voids[1]}],
+                    turn=turn,
+                    owner_id=owner_id,
+                )
+                await graph.add_triplet(
+                    subject=grounded_fact[0],
+                    predicate=grounded_fact[1],
+                    object_=grounded_fact[2],
+                    owner_id=owner_id,
+                    run_id=run_id,
+                )
+            else:
+                if manifest.voids:
+                    graph.void_temporal_fact(
+                        session_id=session_id,
+                        subject=manifest.voids[0],
+                        predicate=manifest.voids[1],
+                        turn=turn,
+                        owner_id=owner_id,
+                    )
+                if grounded_fact:
                     current_facts = set(graph.get_current_facts(session_id, owner_id=owner_id))
-                    if manifest.fact not in current_facts:
+                    if grounded_fact not in current_facts:
                         graph.add_temporal_fact(
                             session_id=session_id,
-                            subject=manifest.fact[0],
-                            predicate=manifest.fact[1],
-                            object_=manifest.fact[2],
+                            subject=grounded_fact[0],
+                            predicate=grounded_fact[1],
+                            object_=grounded_fact[2],
                             turn=turn,
                             owner_id=owner_id,
                             run_id=run_id,
                         )
                         await graph.add_triplet(
-                            subject=manifest.fact[0],
-                            predicate=manifest.fact[1],
-                            object_=manifest.fact[2],
+                            subject=grounded_fact[0],
+                            predicate=grounded_fact[1],
+                            object_=grounded_fact[2],
                             owner_id=owner_id,
                             run_id=run_id,
                         )

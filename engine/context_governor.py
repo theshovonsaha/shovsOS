@@ -76,35 +76,40 @@ class ContextGovernor:
 
     def resolve(
         self,
-        mode: Optional[str] = None,  # Preserved for back-compat; ignored.
+        mode: Optional[str] = None,
         *,
         compression_model: Optional[str] = None,
     ):
-        """Return the unified engine.
+        """Return the context engine based on mode (defaults to V3)."""
+        mode_str = str(mode or "v3").strip().lower()
+        if mode_str == "v1":
+            engine = self._ensure_v1_engine(compression_model)
+        elif mode_str == "v2":
+            if self._v2_engine is None:
+                from engine.context_engine_v2 import ContextEngineV2
 
-        The `mode` argument is accepted but no longer routes — every request
-        lands on V3, which auto-migrates v1/v2 session blobs on first compress.
-        Callers that want v1/v2 directly (tests, debugging) should instantiate
-        ContextEngine / ContextEngineV2 themselves.
-        """
-        # Keep v1 instantiated so any direct legacy callers still find it.
-        self._ensure_v1_engine(compression_model)
+                self._v2_engine = ContextEngineV2(
+                    adapter=self.adapter,
+                    compression_model=compression_model or "llama3.2",
+                )
+            engine = self._v2_engine
+        else:
+            if self._v3_engine is None:
+                from engine.context_engine_v3 import ContextEngineV3
 
-        if self._v3_engine is None:
-            from engine.context_engine_v3 import ContextEngineV3
-
-            self._v3_engine = ContextEngineV3(
-                adapter=self.adapter,
-                semantic_graph=self.graph,
-                compression_model=compression_model or "llama3.2",
-            )
-        engine = self._v3_engine
+                self._v3_engine = ContextEngineV3(
+                    adapter=self.adapter,
+                    semantic_graph=self.graph,
+                    compression_model=compression_model or "llama3.2",
+                )
+            engine = self._v3_engine
 
         if hasattr(engine, "set_adapter"):
             engine.set_adapter(self.adapter)
         if compression_model and hasattr(engine, "compression_model"):
             engine.compression_model = compression_model
         return engine
+
 
     def mode_for_engine(self, engine: Optional[object]) -> str:
         if engine is None:
@@ -139,6 +144,77 @@ class ContextGovernor:
             trace_id=trace_id,
             provenance=provenance or {},
             formatted=True,
+        )
+
+    def _build_exact_memory_lane(
+        self,
+        *,
+        session: Optional[object],
+        owner_id: Optional[str],
+        trace_prefix: str,
+    ) -> Optional[ContextItem]:
+        """Render exact policy/preference memory before semantic recall.
+
+        Policies and preferences are precision lanes: they should be injected
+        directly when present, not rediscovered through vector similarity.
+        """
+        if self.graph is None or session is None or not hasattr(self.graph, "get_current_fact_records"):
+            return None
+        session_id = str(getattr(session, "id", "") or "").strip()
+        if not session_id:
+            return None
+        try:
+            records = list(
+                self.graph.get_current_fact_records(
+                    session_id,
+                    owner_id=owner_id,
+                    memory_types=["policy", "preference"],
+                    limit=16,
+                )
+                or []
+            )
+        except Exception:
+            return None
+        if not records:
+            return None
+
+        grouped: dict[str, list[str]] = {"policy": [], "preference": []}
+        for record in records:
+            memory_type = str(record.get("memory_type") or "fact").strip().lower()
+            if memory_type not in grouped:
+                continue
+            subject = str(record.get("subject") or "").strip()
+            predicate = str(record.get("predicate") or "").strip()
+            object_ = str(record.get("object") or "").strip()
+            if not (subject and predicate and object_):
+                continue
+            confidence = record.get("confidence")
+            suffix = f" (confidence={confidence})" if confidence is not None else ""
+            grouped[memory_type].append(f"- {subject} {predicate}: {object_}{suffix}")
+
+        lines = [
+            "Exact memory lane. Use these directly; do not rely on semantic recall for policy/preference facts."
+        ]
+        if grouped["policy"]:
+            lines.append("Policy:")
+            lines.extend(grouped["policy"][:8])
+        if grouped["preference"]:
+            lines.append("Preference:")
+            lines.extend(grouped["preference"][:8])
+        if len(lines) == 1:
+            return None
+        return self._build_standard_memory_item(
+            item_id="context_governor_exact_memory",
+            title="Exact Policy and Preference Memory",
+            content="\n".join(lines),
+            trace_id=f"{trace_prefix}:governor:exact",
+            provenance={
+                "profile": "exact",
+                "memory_types": ["policy", "preference"],
+                "record_count": sum(len(values) for values in grouped.values()),
+            },
+            priority=61,
+            max_chars=1200,
         )
 
     def _pattern_cues(
@@ -347,6 +423,14 @@ class ContextGovernor:
             current_facts=current_facts,
             trace_prefix=trace_prefix,
         )
+        owner_id = getattr(session, "owner_id", None) if session is not None else None
+        exact_lane = self._build_exact_memory_lane(
+            session=session,
+            owner_id=owner_id,
+            trace_prefix=trace_prefix,
+        )
+        if exact_lane is not None:
+            memory_items = [exact_lane, *memory_items]
         return GovernedMemorySurface(
             candidate_context=candidate_context,
             historical_context=historical_context,

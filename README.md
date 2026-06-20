@@ -1,8 +1,14 @@
 # Shovs LLM OS
 
-A local-first **thinking runtime** for autonomous agents.
+A local-first runtime for building agents that can plan, use tools, remember, verify, and explain what happened.
 
-Not a chat wrapper. Not a RAG pipeline. A runtime that compiles **typed, phase-aware context** for every model call, separates **truth from candidates**, executes tools with **side-effect honesty**, and remembers across sessions through a **unified convergent memory engine**.
+Shovs is not a chat wrapper. It is not only a RAG pipeline. It is a runtime that turns a user request into structured state, runs explicit phases over that state, records every important handoff, and only then asks the model to speak.
+
+The core idea is simple:
+
+> The model can generate language. The runtime should hold the state.
+
+That means Shovs separates trusted facts from guesses, keeps tool calls linked to tool results, checks whether work is actually done, and exposes traces, checkpoints, artifacts, memory state, and evals so a human can inspect the run.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)
@@ -10,23 +16,94 @@ Not a chat wrapper. Not a RAG pipeline. A runtime that compiles **typed, phase-a
 
 ---
 
-## Why this exists
+## Credibility Path
 
-Most "agent platforms" hand the LLM a chat transcript and a tool list, then hope. Shovs treats language as the I/O medium, not the runtime state. Each LLM call receives a **compiled phase packet** — a structured assembly of typed `ContextItem`s drawn from explicit lanes (deterministic facts, candidate signals, working evidence, conversation tension, skill instructions, historical anchors, and more). The packet shape changes with the phase: planning sees durable anchors; acting sees tool evidence; verification sees fact records.
+If you are evaluating Shovs quickly, read these in order:
 
-Five things make this different from a prompt wrapper:
+| File | Purpose |
+| --- | --- |
+| [HARNESS.md](HARNESS.md) | Defines the agent harness in simple terms, with runtime diagrams. |
+| [BENCHMARKS.md](BENCHMARKS.md) | Shows the deterministic benchmark suite and what each scenario proves. |
+| [EVALS.md](EVALS.md) | Explains scenario-state evaluation and why final-answer-only judging is not enough. |
+| [CLAIMS.md](CLAIMS.md) | Separates proven claims from active research and product work. |
+| [RESULTS.md](RESULTS.md) | Records the latest local validation snapshot and live smoke checks. |
 
-|                         | What it means                                                                                                                                                                                                                           |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Voids & Updates**     | Corrections write a void over the stale claim. "Actually, I moved to Berlin" invalidates the prior location — the engine doesn't keep both.                                                                                             |
-| **Side-Effect Honesty** | Tool results carry structured contracts. `bash` and `file_create` emit mandatory verification metadata; the runtime returns `HARD_FAILURE` if expected paths don't exist post-execution. The planner sees real consequences, not prose. |
-| **Sticky Skills**       | Skills declare triggers in `SKILL.md` frontmatter. The loader keeps a registry; activation is per-turn, scoped to PLANNING + ACTING phases only — never bleeding into RESPONSE.                                                         |
-| **Phase-Aware Context** | `ContextItem`s declare `phase_visibility`. Skill instructions appear in PLANNING/ACTING, never in RESPONSE or MEMORY_COMMIT. Working evidence is acting-time. Deterministic facts are visible everywhere.                               |
-| **Resonance**           | A second-pass scoring step lifts modules that share goals with confidently-relevant ones. The packet emerges as a **coherent theme**, not a top-N grab bag.                                                                             |
+Core benchmark command:
+
+```bash
+venv/bin/python -m pytest tests/test_agent_harness_core_benchmarks.py -q
+```
+
+The example result shape is in [benchmarks/agent_harness_core](benchmarks/agent_harness_core).
+
+The operator UI also includes a **Harness** workspace tab. It exposes the same idea interactively:
+
+- compare plain model, model plus tools, observed Shovs, and enforced Shovs modes
+- inspect each wedge and its limitation
+- run the deterministic Agent Harness Core benchmark from the browser
+- see related research references beside the actual runtime features
 
 ---
 
-## Architecture (real, not aspirational)
+## Why this exists
+
+Most agent systems give the model a long transcript, a tool list, and a big prompt. That works until the run gets long, tool results get noisy, or the model forgets which facts are allowed to drive the next step.
+
+Shovs takes a different approach. It treats language as input and output, but not as the only source of truth. A run is stored as structured state:
+
+- the user's objective
+- the current plan
+- allowed tools
+- tool calls and tool results
+- evidence gathered so far
+- memory writes
+- verification results
+- continuation state for unfinished work
+
+Each phase gets a compiled packet built from that state. Planning sees the objective and constraints. Acting sees the next tool requirement. Observation sees tool results and missing slots. Verification checks claims against evidence. Memory commit only writes eligible facts.
+
+Five ideas make this different from a prompt wrapper:
+
+| Idea | Plain meaning |
+| --- | --- |
+| **Run ledger** | Every important action in a run gets a durable record: plan, tool call, result, evidence, memory write, verification, and continuation state. |
+| **Phase packets** | The model does not see one giant blob. It sees the right context for the current phase. |
+| **Fact guard** | User-stated facts and corrections become structured memory. Guesses stay in a candidate lane until verified. |
+| **Tool honesty** | The runtime does not let the agent claim a tool succeeded unless there is a successful tool result. Write tools must verify expected paths. |
+| **Scenario evals** | The system can judge the path taken, not only the final answer. If the agent searched the wrong ticker or fetched the wrong URL, the run can fail even if the response sounds plausible. |
+
+---
+
+## Agent Harness Core
+
+The smallest credible Shovs wedge is the agent harness core:
+
+```mermaid
+flowchart LR
+  A["User objective"] --> B["Run ledger"]
+  B --> C["Phase packets"]
+  C --> D["Model"]
+  D --> E["Tool call draft"]
+  E --> F["Tool registry"]
+  F --> G["Evidence"]
+  G --> H["Verifier"]
+  H --> I["Response guard"]
+  I --> J["User answer"]
+  G --> K["Memory"]
+  B --> L["Trace replay + evals"]
+```
+
+This is the part that should be easy to adopt inside another agent system:
+
+- use the ledger to hold task state
+- use phase packets to reduce prompt drift
+- use evidence IDs to ground final answers
+- use memory lanes to avoid stale facts
+- use replay evals to catch wrong paths
+
+---
+
+## Architecture
 
 ```mermaid
 flowchart TD
@@ -47,9 +124,11 @@ flowchart TD
     B3["/sessions/* · /agents/* · /memory/* · /rag/*"]
   end
 
-  subgraph RunEngine["⚙️ Autonomous Loop (The Engine)"]
+  subgraph RunEngine["⚙️ Managed Runtime"]
     direction TB
-    C1{"1. PLAN"} --> C2("2. ACT") --> C3{"3. OBSERVE"} --> C4("4. VERIFY") --> C5[/"5. COMMIT"/]:::magic
+    C0["Run Ledger"]:::tech
+    C1{"1. PLAN"} --> C2("2. ACT") --> C3{"3. OBSERVE"} --> C4("4. VERIFY") --> C5[/"5. MEMORY COMMIT"/]:::magic
+    C0 -.-> C1 & C2 & C3 & C4 & C5
     
     C2 -.-> C6["Tool Sandbox"]
     C4 -.-> C8["🛡️ Side-Effect Guard<br/>(Trust & Correctness)"]:::guard
@@ -64,7 +143,7 @@ flowchart TD
 
   subgraph STORAGE_TOPOLOGY["🗄️ Storage & Knowledge Graph"]
     direction LR
-    F1[("SQLite<br/>Ledgers")]:::storage
+    F1[("SQLite<br/>Runs, Checkpoints, Artifacts, Evals")]:::storage
     F6[("Memory Graph<br/>(Facts & Voids)")]:::storage
     F8[("Vector DB<br/>(Chroma)")]:::storage
   end
@@ -88,7 +167,7 @@ flowchart TD
   RunEngine -->|Assembles Packet via| CONTEXT_GOVERNOR
 ```
 
-### Phase packet flow (one turn, end-to-end)
+### Runtime flow for one turn
 
 ```
 user message
@@ -100,6 +179,7 @@ session_manager.create() ──── HOOK: session_started ────▶ subs
 RunEngine.stream()
      │
      ├─ Load session + current facts
+     ├─ Create canonical run ledger
      ├─ Analyze conversation tension
      ├─ Discover available skills          (run_engine/skill_loader.py)
      ├─ Classify code intent               (run_engine/code_intent.py)
@@ -107,6 +187,7 @@ RunEngine.stream()
      ├─ PLANNING phase
      │     PacketBuildInputs → build_phase_packet()
      │     orchestrator.plan_with_context()
+     │     ledger.set_plan(...)
      │     ──── HOOK: plan_generated ──▶ subscribers
      │
      ├─ Inject active skill into PacketBuildInputs.active_skill_context
@@ -114,8 +195,10 @@ RunEngine.stream()
      ├─ ACTING phase (loop)
      │     For each tool turn:
      │       compile packet → actor selects tool
+     │       parse hidden ToolCallDraft
      │         ──── HOOK: tool_selected ──▶ subscribers
      │       ToolRegistry executes (Docker sandbox for bash)
+     │       ledger links tool_call_id → tool_result_id
      │       side_effect_guard verifies expected paths
      │         ──── HOOK: tool_completed ──▶ subscribers
      │         ──── HOOK: hard_failure   ──▶ if status=HARD_FAILURE
@@ -123,6 +206,7 @@ RunEngine.stream()
      │
      ├─ OBSERVATION phase
      │     orchestrator decides continue / finalize
+     │     deterministic workflow contracts may require more evidence
      │
      ├─ RESPONSE phase
      │     actor generates final answer (skill context REMOVED)
@@ -130,6 +214,7 @@ RunEngine.stream()
      ├─ VERIFICATION phase
      │     check response against tool evidence
      │     reject if claims unsupported
+     │     persist run evals where available
      │
      └─ MEMORY_COMMIT phase
            deterministic extraction → fact_guard → semantic graph
@@ -238,7 +323,9 @@ shovsOS/
 │   └── deterministic_facts.py  User-stated fact extraction
 │
 ├── run_engine/             Managed runtime
-│   ├── engine.py               Main loop (planning → acting → observe → verify → commit)
+│   ├── engine.py               Main loop (planning → acting → observe → verify → memory_commit)
+│   ├── ledger.py               Canonical run ledger records
+│   ├── scenario_eval.py        Scenario-state evaluation for workflow correctness
 │   ├── context_packets.py      PacketBuildInputs → build_phase_packet()
 │   ├── memory_pipeline.py      Grounding, compression normalization, fact commit
 │   ├── skill_loader.py         SKILL.md discovery + loading
@@ -256,7 +343,7 @@ shovsOS/
 │
 ├── llm/                    Provider adapters (5: Ollama, OpenAI, Anthropic, Groq, Gemini)
 ├── shovs_memory/           Installable memory wedge (uses orchestration + memory)
-├── frontend_shovs/          Operator workspace (React + Vite)
+├── frontend_shovs/         Operator workspace (React + Vite)
 ├── frontend_consumer/      Consumer plane
 ├── .agent/skills/          9 platform skills (agent_platform_backend, debugging, frontend_design, ...)
 ├── scripts/                install.sh, doctor.py
@@ -267,7 +354,7 @@ shovsOS/
 
 ## What `shovs-memory` is
 
-The smallest adoptable surface of this repo. Use it when you want deterministic fact writes, correction-aware temporal memory, and inspectable memory state — without the full runtime loop.
+The smallest adoptable surface of this repo. Use it when you want deterministic fact writes, correction-aware temporal memory, candidate demotion, conflict traces, and inspectable memory state without adopting the full agent runtime.
 
 ```python
 from orchestration.session_manager import SessionManager
@@ -284,7 +371,7 @@ print(memory.fact_timeline())   # history with voids
 print(memory.inspect())         # full memory state snapshot
 ```
 
-Use the full runtime (`RunEngine`) when you also want loop orchestration, tool execution, traces, checkpoints, and artifacts.
+Use the full runtime (`RunEngine`) when you also want loop orchestration, tool execution, run ledgers, traces, checkpoints, artifacts, scenario evals, and verified responses.
 
 ---
 
@@ -362,9 +449,9 @@ Add it to `ALL_TOOLS` in [plugins/tools.py](plugins/tools.py); registration runs
 
 ## Why small models matter here
 
-Runtime discipline raises the floor for small local models — and the ceiling for frontier models. Phase-specific context, model-aware budget shaping (`small_local`, `tool_native_local`, `local_standard`, `frontier_native`, `frontier_standard`), candidate-vs-truth separation, and prompt sanitation after evidence gathering all reduce the noise that small models can't recover from.
+Runtime discipline raises the floor for small local models and the ceiling for frontier models. Phase-specific context, model-aware budget shaping (`small_local`, `tool_native_local`, `local_standard`, `frontier_native`, `frontier_standard`), candidate-vs-truth separation, and evidence cleanup reduce the noise that smaller models cannot recover from.
 
-If a 3B model can stay coherent across multi-tool runs, an Opus / GPT-5 class model becomes nearly bulletproof.
+If a small local model can stay coherent across multi-tool runs, a frontier model becomes easier to supervise, debug, and trust.
 
 ---
 

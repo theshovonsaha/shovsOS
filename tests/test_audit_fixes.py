@@ -13,6 +13,129 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from httpx import AsyncClient, ASGITransport
 
 
+@pytest.mark.asyncio
+async def test_gemini_adapter_patches_async_httpx_wrapper_state_cleanup(monkeypatch):
+    """
+    Regression test for the ``AsyncHttpxClientWrapper object has no attribute '_state'``
+    noise emitted from background GC tasks.
+
+    The patch must silence the error in three places:
+      1. aclose()  – the background coroutine httpx schedules via create_task
+      2. is_closed – the @property __del__ checks BEFORE scheduling aclose()
+      3. __del__   – belt-and-suspenders guard on the del method itself
+    """
+    from llm.gemini_adapter import GeminiAdapter
+
+    class BrokenAsyncHttpxClientWrapper:
+        """Simulates an AsyncHttpxClientWrapper whose httpx internals were never initialised."""
+        _shovs_safe_aclose = False
+
+        async def aclose(self):
+            raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
+
+        @property
+        def is_closed(self):
+            raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
+
+        def __del__(self):
+            if self.is_closed:  # triggers is_closed AttributeError
+                return
+            try:
+                import asyncio
+                asyncio.get_running_loop().create_task(self.aclose())
+            except Exception:
+                pass
+
+    import sys
+    from types import ModuleType
+
+    google_mod = ModuleType("google")
+    genai_mod = ModuleType("google.genai")
+    interactions_mod = ModuleType("google.genai._interactions")
+    base_client_mod = ModuleType("google.genai._interactions._base_client")
+    base_client_mod.AsyncHttpxClientWrapper = BrokenAsyncHttpxClientWrapper
+
+    monkeypatch.setitem(sys.modules, "google", google_mod)
+    monkeypatch.setitem(sys.modules, "google.genai", genai_mod)
+    monkeypatch.setitem(sys.modules, "google.genai._interactions", interactions_mod)
+    monkeypatch.setitem(sys.modules, "google.genai._interactions._base_client", base_client_mod)
+
+    adapter = GeminiAdapter(api_key="test")
+    adapter._patch_async_httpx_wrapper_close()
+
+    assert BrokenAsyncHttpxClientWrapper._shovs_safe_aclose is True
+
+    # 1. aclose() must not raise
+    await BrokenAsyncHttpxClientWrapper().aclose()
+
+    # 2. is_closed must return True (treats uninitialised as closed) without raising
+    w = BrokenAsyncHttpxClientWrapper()
+    assert w.is_closed is True
+
+    # 3. __del__ must not raise (is_closed returns True → returns early without scheduling)
+    BrokenAsyncHttpxClientWrapper().__del__()
+
+    class FactoryBrokenAsyncHttpxClientWrapper:
+        _shovs_safe_aclose = False
+
+        async def aclose(self):
+            raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
+
+        @property
+        def is_closed(self):
+            raise AttributeError("'AsyncHttpxClientWrapper' object has no attribute '_state'")
+
+    base_client_mod.AsyncHttpxClientWrapper = FactoryBrokenAsyncHttpxClientWrapper
+    from llm import adapter_factory
+
+    adapter_factory._apply_gemini_cleanup_patch()
+
+    await FactoryBrokenAsyncHttpxClientWrapper().aclose()
+    assert FactoryBrokenAsyncHttpxClientWrapper._shovs_safe_aclose is True
+    assert FactoryBrokenAsyncHttpxClientWrapper().is_closed is True
+
+    import httpx
+
+    class AsyncHttpxClientWrapper(httpx.AsyncClient):
+        pass
+
+    inherited_wrapper = object.__new__(AsyncHttpxClientWrapper)
+    await inherited_wrapper.aclose()
+
+
+@pytest.mark.asyncio
+async def test_context_engine_strips_provider_prefix_before_compression_call(monkeypatch):
+    from engine.context_engine import ContextEngine
+
+    provider_adapter = MagicMock()
+    provider_adapter.complete = AsyncMock(
+        return_value="- [FACT: User | preferred_model | Groq]"
+    )
+    local_adapter = MagicMock()
+
+    create_calls = []
+
+    def fake_create_adapter(provider=None):
+        create_calls.append(provider)
+        return provider_adapter
+
+    monkeypatch.setattr("engine.context_engine.create_adapter", fake_create_adapter)
+
+    engine = ContextEngine(adapter=local_adapter)
+    _context, facts, _voids = await engine.compress_exchange(
+        user_message="I prefer Groq for this test.",
+        assistant_response="Understood.",
+        current_context="",
+        is_first_exchange=True,
+        model="groq:llama-3.3-70b-versatile",
+        grounding_text="I prefer Groq for this test.",
+    )
+
+    assert create_calls == ["groq"]
+    assert provider_adapter.complete.await_args.kwargs["model"] == "llama-3.3-70b-versatile"
+    assert facts
+
+
 # ── 1. Gemini Consecutive Role Merging ──────────────────────────────────────
 
 def test_gemini_merges_consecutive_same_role():
@@ -42,7 +165,7 @@ def test_gemini_merges_consecutive_same_role():
         sys.modules["google.genai"] = mock_genai
 
         try:
-            result = adapter._convert_messages(messages)
+            result, system = adapter._convert_messages(messages)
         finally:
             # Cleanup mocks
             for k in ["google.genai", "google.genai.types", "google"]:
@@ -347,7 +470,7 @@ async def test_adapter_propagation_to_subsystems():
             events.append(ev)
 
         # ContextEngine and Orchestrator should have received the new adapter
-        ctx_eng.set_adapter.assert_called_once_with(mock_new_adapter)
+        ctx_eng.set_adapter.assert_called_with(mock_new_adapter)
         orch.set_adapter.assert_called_once_with(mock_new_adapter)
 
 

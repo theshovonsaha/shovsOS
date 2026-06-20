@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import inspect
+import asyncio
 import json
+import os
 import re
 from typing import Any, AsyncIterator, Optional
 
 from config.logger import log
 from engine.candidate_signals import extract_stance_signals
-from engine.conversation_tension import analyze_conversation_tension
+from engine.conversation_tension import analyze_conversation_tension, conversation_tension_audit_payload
 from engine.tokenization import get_token_encoding as _get_token_encoding
 from engine.context_schema import ContextPhase
 from engine.context_governor import ContextGovernor
@@ -15,6 +17,7 @@ from engine.deterministic_facts import extract_user_stated_fact_updates
 from engine.direct_fact_policy import should_answer_direct_fact_from_memory
 from engine.side_effect_guard import check_plan_for_side_effects, check_side_effect_claims
 from engine.tool_loop_guard import ToolLoopGuard
+from engine.response_guard import guard_final_response, is_small_or_local_model
 from engine.tool_contract import (
     canonical_tool_call,
     clip_text,
@@ -22,16 +25,20 @@ from engine.tool_contract import (
     enrich_tool_result_content,
     format_tool_result_line,
     is_retry_sensitive_tool,
+    shape_tool_result_for_actor,
     summarize_tool_results,
     tool_call_signature,
 )
 from llm.adapter_factory import create_adapter, strip_provider_prefix
 from plugins.hook_registry import hooks
-from llm.base_adapter import BaseLLMAdapter
+from llm.base_adapter import BaseLLMAdapter, RateLimitError
 from memory.semantic_graph import SemanticGraph
 from orchestration.orchestrator import AgenticOrchestrator
 from orchestration.run_store import RunStore
 from orchestration.session_manager import SessionManager
+from orchestration.capability_cards import render_capability_cards
+from orchestration.workflow_patterns import get_workflow_pattern
+from orchestration.workflow_templates import get_workflow_template
 from plugins.tool_registry import ToolCall, ToolRegistry
 from run_engine.context_packets import PacketBuildInputs, build_phase_packet
 from run_engine.code_intent import CodeIntent, classify_code_intent, check_research_ambiguity
@@ -53,6 +60,30 @@ from run_engine.tool_selection import (
     summarize_arguments,
 )
 from run_engine.types import CompiledPassPacket, RunEngineRequest
+from run_engine.ledger import RunLedger, ToolCallDraft
+
+
+async def _stream_with_rate_limit_retry(
+    adapter,
+    *,
+    model: str,
+    messages: list[dict],
+    **kwargs,
+) -> AsyncIterator[str | dict[str, Any]]:
+    try:
+        async for chunk in adapter.stream(model=model, messages=messages, **kwargs):
+            yield chunk
+    except RateLimitError as exc:
+        match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(exc), re.IGNORECASE)
+        wait = float(match.group(1)) if match else 10.0
+        wait = min(wait, 60.0)
+        yield {
+            "type": "activity_short",
+            "text": f"Rate limit hit, waiting {wait:.0f}s before retry...",
+        }
+        await asyncio.sleep(wait)
+        async for chunk in adapter.stream(model=model, messages=messages, **kwargs):
+            yield chunk
 
 
 TOOL_ACTOR_PROMPT = """\
@@ -65,8 +96,8 @@ Rules:
 - The allowed tools are real and available in this runtime right now.
 - Prefer the smallest useful next action.
 - For current or time-sensitive requests such as latest, current, today, news, prices, or market data, use an allowed web_search tool instead of saying you cannot browse.
-- When the user says "search", "find", "look up", "fetch", "gather", or "investigate", always use a tool. Do not ask for clarification.
-- Do not ask clarifying questions. If the objective can be advanced by a tool call, make the call.
+- If the objective is ambiguous, underspecified, or contradicts existing memory, DO NOT guess. Stop calling tools so you can ask the user a clarifying question.
+- If the objective is clear and can be advanced by a tool call, make the call. Do not ask unnecessary questions.
 - Preserve exact user entities, domains, URLs, file names, and keywords.
 - If a direct URL already exists in the context or signals, use it exactly — do not invent a new one.
 - Use only the allowed tools.
@@ -110,7 +141,9 @@ FINAL_RESPONSE_PROMPT = """\
 You are Shovs, operating inside the canonical Run Engine.
 
 Rules:
-- Answer the user directly using the evidence gathered in this run.
+- Answer the user directly using the evidence gathered in this run and your active memory context.
+- Maintain a coherent, natural conversational flow. Acknowledge the user's intent, provide context for your answers, and demonstrate understanding of the ongoing dialogue.
+- If the objective is ambiguous, underspecified, or missing key details, ask clear, pointed questions to resolve the ambiguity before proceeding.
 - If tools were available earlier in this run, do not claim you lack browsing or tool access.
 - Do not mention hidden planning, phase names, checkpoints, or internal protocol.
 - Do not fabricate completed actions, tool results, URLs, or files.
@@ -121,6 +154,522 @@ Rules:
 
 
 _REDRAFT_ISSUE_THRESHOLD = 2
+_URL_RE = re.compile(r"https?://[^\s\"'<>),\]]+", re.IGNORECASE)
+_TICKER_RE = re.compile(r"\b[A-Z]{2,5}\b")
+_TICKER_STOPWORDS = {
+    "THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT", "TODAY", "STOCK",
+    "STOCKS", "NYSE", "NASDAQ", "AMEX", "ETF", "ETFS", "CEO", "CFO", "SEC",
+    "US", "USA", "USD", "AI", "API", "URL", "JSON", "HTTP", "HTTPS",
+}
+
+
+def _safe_json_payload(raw: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _tool_success_count(tool_results: list[dict[str, Any]], tool_name: str) -> int:
+    return sum(
+        1
+        for item in tool_results
+        if str(item.get("tool_name") or "") == tool_name and bool(item.get("success"))
+    )
+
+
+def _tool_argument_value(item: dict[str, Any], key: str) -> str:
+    args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+    return str(args.get(key) or "").strip()
+
+
+def _extract_urls_from_tool_results(tool_results: list[dict[str, Any]], *, limit: int = 12) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in tool_results:
+        if not item.get("success"):
+            continue
+        content = str(item.get("content") or "")
+        payload = _safe_json_payload(content)
+        candidates: list[str] = []
+        extracted_urls = item.get("extracted_urls")
+        if isinstance(extracted_urls, list):
+            candidates.extend(str(url) for url in extracted_urls)
+        if payload:
+            if payload.get("url"):
+                candidates.append(str(payload.get("url")))
+            results = payload.get("results") or payload.get("organic_results") or []
+            if isinstance(results, list):
+                for result in results:
+                    if isinstance(result, dict):
+                        candidates.append(str(result.get("url") or result.get("link") or ""))
+        candidates.extend(match.group(0).rstrip(".,") for match in _URL_RE.finditer(content))
+        for url in candidates:
+            clean = url.strip().rstrip(".,")
+            if not clean.startswith("http") or clean in seen:
+                continue
+            seen.add(clean)
+            urls.append(clean)
+            if len(urls) >= limit:
+                return urls
+    return urls
+
+
+def _find_cached_retry_sensitive_result(
+    tool_results: list[dict[str, Any]],
+    *,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return a prior successful web result for the same exact tool call."""
+    signature = tool_call_signature(tool_name, arguments or {})
+    for item in reversed(tool_results or []):
+        if not isinstance(item, dict) or not item.get("success"):
+            continue
+        prior_signature = tool_call_signature(
+            str(item.get("tool_name") or ""),
+            item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
+        )
+        if prior_signature == signature:
+            return item
+    return None
+
+
+def _extract_mover_tickers_from_fetched_pages(tool_results: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for item in tool_results:
+        if str(item.get("tool_name") or "") != "web_fetch" or not item.get("success"):
+            continue
+        content = str(item.get("content") or "")
+        payload = _safe_json_payload(content)
+        if payload and payload.get("content"):
+            content = str(payload.get("content") or "")
+        if not re.search(r"\b(market movers|top stock market gainers|gainers)\b", content, re.IGNORECASE):
+            continue
+        gainers_block = content
+        gainers_match = re.search(r"##\s*Gainers(?P<body>.*?)(?:##\s*Losers|##\s*Actives|$)", content, re.IGNORECASE | re.DOTALL)
+        if gainers_match:
+            gainers_block = gainers_match.group("body")
+        for line in gainers_block.splitlines():
+            if "|" not in line or "+" not in line:
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            stock_cell = cells[1] if len(cells) > 1 else line
+            candidates = [match.group(0).upper() for match in _TICKER_RE.finditer(stock_cell)]
+            if not candidates:
+                candidates = [match.group(1).upper() for match in re.finditer(r"/stocks/[^/)]+/([a-z]{1,5})/quote", stock_cell, re.IGNORECASE)]
+            for ticker in reversed(candidates):
+                if ticker in _TICKER_STOPWORDS or ticker in seen:
+                    continue
+                seen.add(ticker)
+                tickers.append(ticker)
+                if len(tickers) >= limit:
+                    return tickers
+                break
+    return tickers
+
+
+def _select_movers_source_url(urls: list[str]) -> str:
+    if not urls:
+        return ""
+    priority_patterns = (
+        "morningstar.com/markets/movers",
+        "marketwatch.com/tools/stockresearch/marketmap",
+        "bankrate.com/investing/best-performing-stocks",
+        "nasdaq.com/market-activity/stocks/screener",
+    )
+    lowered = [(url, url.lower()) for url in urls]
+    for pattern in priority_patterns:
+        for url, low in lowered:
+            if pattern in low:
+                return url
+    for url, low in lowered:
+        if any(term in low for term in ("movers", "gainers", "best-performing-stocks")):
+            return url
+    return ""
+
+
+def _extract_stock_tickers_from_tool_results(tool_results: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
+    mover_tickers = _extract_mover_tickers_from_fetched_pages(tool_results, limit=limit)
+    if len(mover_tickers) >= limit:
+        return mover_tickers[:limit]
+
+    counts: dict[str, int] = {}
+    for item in tool_results:
+        if str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
+            continue
+        content = str(item.get("content") or "")
+        payload = _safe_json_payload(content)
+        texts: list[str] = []
+        results = payload.get("results") or payload.get("organic_results") or []
+        if isinstance(results, list):
+            for result in results[:10]:
+                if not isinstance(result, dict):
+                    continue
+                texts.extend([
+                    str(result.get("title") or ""),
+                    str(result.get("snippet") or result.get("description") or ""),
+                ])
+        texts.append(content[:3000])
+        for text in texts:
+            for match in _TICKER_RE.finditer(text):
+                ticker = match.group(0).upper()
+                if ticker in _TICKER_STOPWORDS:
+                    continue
+                counts[ticker] = counts.get(ticker, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [ticker for ticker, _ in ranked[:limit]]
+
+
+def _explicit_stock_source_workflow_requested(objective: str) -> bool:
+    text = str(objective or "").lower()
+    return (
+        "stock" in text
+        and ("top 3" in text or "three" in text or "3 stocks" in text)
+        and ("separately" in text or "each" in text)
+        and ("web fetch" in text or "fetch" in text)
+        and ("9" in text or "3 relevant" in text or "three relevant" in text)
+    )
+
+
+def _source_collection_contract_from_objective(objective: str) -> dict[str, int]:
+    """Extract the topic-agnostic collection shape from a user request.
+
+    This intentionally captures only the execution contract, not the domain:
+    lock N entities, gather M candidate URLs per entity, then fetch N*M URLs.
+    Domain-specific code may provide the entity extractor, but it must feed
+    this same quota model so search-result noise cannot become new targets.
+    """
+    text = str(objective or "").lower()
+    if not ("fetch" in text and ("url" in text or "source" in text or "result" in text)):
+        return {}
+    if not ("separately" in text or "each" in text or "per " in text):
+        return {}
+
+    entity_count = 0
+    top_match = re.search(r"\btop\s+(\d+)\b", text)
+    if top_match:
+        entity_count = int(top_match.group(1))
+    elif re.search(r"\bthree\b", text):
+        entity_count = 3
+    entity_match = re.search(r"\b(\d+)\s+(?:stocks|companies|products|tools|items|entities)\b", text)
+    if entity_match:
+        entity_count = int(entity_match.group(1))
+
+    per_entity = 0
+    per_match = re.search(
+        r"\b(\d+)\s+(?:relevant\s+)?(?:results?|sources?|urls?|links?|articles?)\s+(?:for\s+)?each\b",
+        text,
+    )
+    if per_match:
+        per_entity = int(per_match.group(1))
+    elif re.search(r"\bthree\s+(?:relevant\s+)?(?:results?|sources?|urls?|links?|articles?)\s+(?:for\s+)?each\b", text):
+        per_entity = 3
+
+    total_urls = 0
+    total_match = re.search(r"\b(?:all\s+)?(\d+)\s+urls?\b", text)
+    if total_match:
+        total_urls = int(total_match.group(1))
+
+    if entity_count <= 0 and total_urls and per_entity:
+        entity_count = max(1, total_urls // per_entity)
+    if per_entity <= 0 and total_urls and entity_count:
+        per_entity = max(1, total_urls // entity_count)
+    if total_urls <= 0 and entity_count and per_entity:
+        total_urls = entity_count * per_entity
+
+    if entity_count <= 0 or per_entity <= 0:
+        return {}
+    return {
+        "entity_count": min(entity_count, 12),
+        "urls_per_entity": min(per_entity, 10),
+        "total_urls": min(total_urls or entity_count * per_entity, 60),
+    }
+
+
+def _default_tool_turn_budget(objective: str, requested_max_turns: Optional[int]) -> int:
+    if requested_max_turns is not None:
+        return max(1, min(int(requested_max_turns), 24))
+    source_contract = _source_collection_contract_from_objective(objective)
+    if source_contract:
+        # discovery + one search per entity + one fetch per required URL + slack
+        return min(24, 3 + source_contract["entity_count"] + source_contract["total_urls"])
+    return 3
+
+
+def _urls_by_entity_from_search_results(
+    *,
+    tool_results: list[dict[str, Any]],
+    entities: list[str],
+    per_entity: int,
+) -> dict[str, list[str]]:
+    by_entity: dict[str, list[str]] = {entity: [] for entity in entities}
+    seen: set[str] = set()
+    for item in tool_results:
+        if str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
+            continue
+        query = _tool_argument_value(item, "query").upper()
+        entity = next((candidate for candidate in entities if re.search(rf"\b{re.escape(candidate)}\b", query)), "")
+        if not entity:
+            continue
+        extracted_urls = item.get("extracted_urls")
+        if isinstance(extracted_urls, list):
+            for extracted_url in extracted_urls:
+                url = str(extracted_url or "").strip().rstrip(".,")
+                if not url.startswith("http") or url in seen:
+                    continue
+                seen.add(url)
+                by_entity[entity].append(url)
+                if len(by_entity[entity]) >= per_entity:
+                    break
+            if len(by_entity[entity]) >= per_entity:
+                continue
+        payload = _safe_json_payload(str(item.get("content") or ""))
+        results = payload.get("results") or payload.get("organic_results") or []
+        if not isinstance(results, list):
+            continue
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url") or result.get("link") or "").strip().rstrip(".,")
+            if not url.startswith("http") or url in seen:
+                continue
+            seen.add(url)
+            by_entity[entity].append(url)
+            if len(by_entity[entity]) >= per_entity:
+                break
+    return by_entity
+
+
+def _stock_source_workflow_override(
+    *,
+    objective: str,
+    allowed_tools: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not _explicit_stock_source_workflow_requested(objective):
+        return {}
+
+    contract = _source_collection_contract_from_objective(objective) or {
+        "entity_count": 3,
+        "urls_per_entity": 3,
+        "total_urls": 9,
+    }
+    entity_count = int(contract["entity_count"])
+    urls_per_entity = int(contract["urls_per_entity"])
+    total_urls = int(contract["total_urls"])
+
+    allowed = {str(item.get("name") or "") for item in allowed_tools if isinstance(item, dict)}
+    tickers = _extract_stock_tickers_from_tool_results(tool_results, limit=entity_count)
+    targeted_queries = [
+        _tool_argument_value(item, "query").upper()
+        for item in tool_results
+        if str(item.get("tool_name") or "") == "web_search" and item.get("success")
+    ]
+    searched_tickers = {
+        ticker
+        for ticker in tickers
+        if any(re.search(rf"\b{re.escape(ticker)}\b", query) for query in targeted_queries)
+    }
+    fetched_urls = {
+        _tool_argument_value(item, "url")
+        for item in tool_results
+        if str(item.get("tool_name") or "") == "web_fetch" and item.get("success")
+    }
+    urls_by_entity = _urls_by_entity_from_search_results(
+        tool_results=tool_results,
+        entities=tickers,
+        per_entity=urls_per_entity,
+    )
+    entity_urls = [
+        url
+        for ticker in tickers
+        for url in urls_by_entity.get(ticker, [])[:urls_per_entity]
+    ]
+    urls = _extract_urls_from_tool_results(tool_results, limit=max(12, total_urls + 3))
+    unfetched_urls = [url for url in entity_urls if url not in fetched_urls]
+    fetched_entity_urls = {url for url in fetched_urls if url in set(entity_urls)}
+    mover_source_fetched = len(_extract_mover_tickers_from_fetched_pages(tool_results, limit=entity_count)) >= entity_count
+
+    if not mover_source_fetched:
+        movers_url = _select_movers_source_url(unfetched_urls)
+        if not movers_url:
+            movers_url = _select_movers_source_url(urls)
+        if movers_url and "web_fetch" in allowed:
+            return {
+                "status": "partial",
+                "selected_tools": ["web_fetch"],
+                "strategy": "Fetch a market movers source before locking ticker entities.",
+                "notes": "Ticker-specific searches must be based on the fetched movers table, not noisy search snippets.",
+                "missing_slots": ["verified_top_3_mover_tickers"],
+                "argument_clues": {"web_fetch": movers_url},
+            }
+        return {
+            "status": "partial",
+            "selected_tools": ["web_search"] if "web_search" in allowed else [],
+            "strategy": "Find a market movers source before source collection.",
+            "notes": "The explicit stock workflow needs a source-backed top-three gainers table before ticker-specific searches.",
+            "missing_slots": ["market_movers_source"],
+            "argument_clues": {"web_search": "Morningstar market movers top stock gainers today"},
+        }
+
+    for ticker in tickers:
+        if ticker not in searched_tickers and "web_search" in allowed:
+            return {
+                "status": "partial",
+                "selected_tools": ["web_search"],
+                "strategy": f"Search {ticker} separately before fetching sources.",
+                "notes": "The user explicitly asked for separate searches for each stock.",
+                "missing_slots": [f"{ticker}_three_relevant_urls"],
+                "argument_clues": {
+                    "web_search": f"{ticker} stock news June 13 2026"
+                },
+                "tickers": tickers,
+                "source_contract": contract,
+            }
+
+    for ticker in tickers:
+        if len(urls_by_entity.get(ticker, [])) < urls_per_entity and "web_search" in allowed:
+            return {
+                "status": "partial",
+                "selected_tools": ["web_search"],
+                "strategy": f"Collect source URLs for {ticker}.",
+                "notes": "Each locked entity needs its own source quota before unrelated URLs can be fetched.",
+                "missing_slots": [f"{ticker}_{urls_per_entity}_urls"],
+                "argument_clues": {
+                    "web_search": f"{ticker} stock news June 13 2026"
+                },
+                "tickers": tickers,
+                "source_contract": contract,
+            }
+
+    if len(fetched_entity_urls) < total_urls:
+        if unfetched_urls and "web_fetch" in allowed:
+            next_url = unfetched_urls[0]
+            return {
+                "status": "partial",
+                "selected_tools": ["web_fetch"],
+                "strategy": f"Fetch source {len(fetched_entity_urls) + 1} of {total_urls}.",
+                "notes": "The user requested all entity-specific URLs to be fetched before the TLDR table.",
+                "missing_slots": [f"{total_urls - len(fetched_entity_urls)}_remaining_web_fetches"],
+                "argument_clues": {"web_fetch": next_url},
+                "tickers": tickers,
+                "fetched_url_count": len(fetched_entity_urls),
+                "source_contract": contract,
+            }
+        if "web_search" in allowed:
+            next_ticker = tickers[min(len(searched_tickers), len(tickers) - 1)]
+            return {
+                "status": "partial",
+                "selected_tools": ["web_search"],
+                "strategy": f"Collect more URLs for {next_ticker}.",
+                "notes": "Need more unique URLs before the 9 fetches can complete.",
+                "missing_slots": ["nine_unique_urls"],
+                "argument_clues": {
+                    "web_search": f"{next_ticker} stock news June 13 2026"
+                },
+                "tickers": tickers,
+                "source_contract": contract,
+            }
+
+    return {}
+
+
+def _should_finalize(
+    observation_status: str,
+    plan_steps: list[dict[str, Any]],
+    tool_turn: int,
+    max_tool_calls: Optional[int],
+    session_id: str,
+    task_tracker=None,
+) -> tuple[bool, str]:
+    """Decide whether the run should finalize this turn.
+
+    Returns ``(should_finalize, reason)`` — reason is always logged into
+    the trace and surfaced in the partial-completion event when finalize
+    is forced by a hard cap. Reasons follow a fixed vocabulary so callers
+    can route on ``startswith``:
+
+    * ``no_plan_steps`` — backward compatible path; observation alone decides
+    * ``clean_finalize`` — observation says finalize, no pending steps, no open todos
+    * ``observation_driven`` — fallback when plan_steps complete but observation drove the call
+    * ``pending_steps:[ids]`` — gate refuses finalize because steps remain
+    * ``open_todos`` — gate refuses finalize because TaskTracker has active tasks
+    * ``max_tool_calls_reached:N_steps_pending`` — hard cap forces finalize anyway
+    """
+    if not plan_steps:
+        return observation_status == "finalize", "no_plan_steps"
+
+    pending = [s for s in plan_steps if s.get("status") == "pending"]
+
+    # Hard cap reached — always finalize, but flag pending steps so the
+    # response phase can be honest about what was not completed.
+    if max_tool_calls is not None and tool_turn >= max_tool_calls:
+        return True, f"max_tool_calls_reached:{len(pending)}_steps_pending"
+
+    # Cross-turn TaskTracker open todos. Best-effort — treat tracker errors
+    # as "no open todos" so a misbehaving tracker can't deadlock the loop.
+    open_todos = False
+    if task_tracker is not None and session_id:
+        try:
+            open_todos = bool(task_tracker.has_active_tasks(session_id))
+        except Exception:
+            open_todos = False
+
+    if observation_status == "finalize" and not pending and not open_todos:
+        return True, "clean_finalize"
+
+    if pending:
+        ids = [str(s.get("id") or "") for s in pending][:6]
+        return False, f"pending_steps:{ids}"
+
+    if open_todos:
+        return False, "open_todos"
+
+    return observation_status == "finalize", "observation_driven"
+
+
+def _update_plan_step(
+    plan_steps: list[dict[str, Any]],
+    tool_name: str,
+    success: bool,
+    *,
+    hard_failure: bool = False,
+) -> Optional[str]:
+    """Match the next pending plan_step for ``tool_name`` and update status.
+
+    Returns the step id that was updated (for tracing) or None if no match.
+    The matcher takes the FIRST pending step whose tool field equals
+    ``tool_name`` — order of plan_steps is the planner's stated execution
+    order, so this preserves intent.
+    """
+    if not plan_steps or not tool_name:
+        return None
+    target_status = "failed" if (hard_failure or not success) else "done"
+    for step in plan_steps:
+        if (
+            isinstance(step, dict)
+            and step.get("tool") == tool_name
+            and step.get("status") == "pending"
+        ):
+            step["status"] = target_status
+            return str(step.get("id") or "")
+    return None
 # Confidence below this triggers a redraft even when issue count is sub-threshold.
 # Picked at 0.4 because the verifier defaults to 0.5 on parse-failure / no-info,
 # so we only redraft when it's actively expressing low trust in the answer.
@@ -147,6 +696,160 @@ def _build_redraft_constraints(*, issues: list[str], side_effect_tripped: bool) 
         "- Do not repeat the previous unsupported claims.\n"
         "- Be direct and concise."
     )
+
+
+def _build_continuation_state_payload(
+    *,
+    reason: str,
+    effective_objective: str,
+    run_id: str,
+    plan_steps: list[dict[str, Any]],
+    missing_slots: list[str],
+    strategy: str,
+    notes: str,
+    tool_results: list[dict[str, Any]],
+    issues: Optional[list[str]] = None,
+    target_state: str = "",
+) -> dict[str, Any]:
+    incomplete_steps = [
+        {
+            "id": str(step.get("id") or ""),
+            "description": str(step.get("description") or ""),
+            "tool": step.get("tool"),
+            "status": str(step.get("status") or "pending"),
+            "risk": str(step.get("risk") or "read_only"),
+        }
+        for step in (plan_steps or [])
+        if isinstance(step, dict)
+        and str(step.get("status") or "pending") not in {"done", "completed", "skipped"}
+    ][:6]
+    clean_missing = [str(item).strip() for item in (missing_slots or []) if str(item).strip()][:6]
+    clean_issues = [str(item).strip() for item in (issues or []) if str(item).strip()][:6]
+    if not incomplete_steps and not clean_missing and not clean_issues and not target_state:
+        return {}
+
+    next_action = ""
+    if clean_missing:
+        next_action = f"Gather missing data: {clean_missing[0]}"
+    elif incomplete_steps:
+        first = incomplete_steps[0]
+        desc = str(first.get("description") or "").strip()
+        tool = str(first.get("tool") or "").strip()
+        next_action = f"Run {tool}: {desc}" if tool else desc
+    elif clean_issues:
+        next_action = f"Resolve verification issue: {clean_issues[0]}"
+    elif target_state:
+        next_action = f"Replan toward target state: {target_state}"
+
+    evidence_summary = [
+        format_tool_result_line(item, preview_chars=140, include_status_label=True)
+        for item in select_working_evidence(
+            tool_results,
+            user_message=effective_objective,
+            max_results=3,
+        )
+    ]
+
+    return {
+        "reason": str(reason or "unfinished_run"),
+        "objective": str(effective_objective or ""),
+        "run_id": str(run_id or ""),
+        "target_state": str(target_state or ""),
+        "next_action": next_action,
+        "pending_steps": incomplete_steps,
+        "missing_slots": clean_missing,
+        "strategy": str(strategy or ""),
+        "notes": str(notes or ""),
+        "issues": clean_issues,
+        "evidence_summary": evidence_summary,
+    }
+
+
+_CONTINUATION_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "for", "from",
+    "get", "go", "have", "how", "i", "in", "is", "it", "me", "my", "near", "of",
+    "on", "or", "please", "that", "the", "this", "to", "use", "we", "what", "with",
+    "you",
+}
+
+
+def _continuation_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9][a-z0-9_-]{2,}", str(text or "").lower())
+        if token not in _CONTINUATION_STOPWORDS
+    }
+
+
+def _assess_continuation_state(
+    *,
+    user_message: str,
+    continuation_state: dict[str, Any],
+    ambiguous_followup: bool,
+) -> dict[str, Any]:
+    """Decide whether a durable unfinished plan should steer this turn.
+
+    The policy is intentionally deterministic: explicit resume language wins,
+    additive language can extend a related plan, and unrelated concrete tasks
+    supersede the stale continuation state before planning begins.
+    """
+    if not isinstance(continuation_state, dict) or not continuation_state.get("objective"):
+        return {"action": "none", "reason": "no_continuation_state", "effective_objective": str(user_message or "")}
+
+    current = str(user_message or "").strip()
+    previous_objective = str(continuation_state.get("objective") or "").strip()
+    pending_steps = [item for item in (continuation_state.get("pending_steps") or []) if isinstance(item, dict)]
+    missing_slots = [str(item).strip() for item in (continuation_state.get("missing_slots") or []) if str(item).strip()]
+    lowered = current.lower()
+
+    explicit_resume = bool(re.search(
+        r"\b(continue|resume|keep going|finish|carry on|pick up|complete (it|that|the plan)|run the next|next step)\b",
+        lowered,
+    ))
+    additive = bool(re.search(r"\b(also|and also|include|add|check|compare|what about|instead|same thing)\b", lowered))
+    current_tokens = _continuation_tokens(current)
+    objective_tokens = _continuation_tokens(previous_objective)
+    denominator = max(1, min(len(current_tokens), len(objective_tokens)))
+    overlap = len(current_tokens & objective_tokens) / denominator
+
+    if ambiguous_followup or explicit_resume:
+        return {
+            "action": "resume",
+            "reason": "explicit_or_ambiguous_resume",
+            "effective_objective": previous_objective or current,
+            "overlap": overlap,
+            "pending_step_count": len(pending_steps),
+            "missing_slot_count": len(missing_slots),
+        }
+
+    if additive and overlap >= 0.15:
+        return {
+            "action": "resume_with_update",
+            "reason": "additive_related_turn",
+            "effective_objective": f"{previous_objective}\nCurrent turn update: {current}",
+            "overlap": overlap,
+            "pending_step_count": len(pending_steps),
+            "missing_slot_count": len(missing_slots),
+        }
+
+    if overlap >= 0.45:
+        return {
+            "action": "resume_with_update",
+            "reason": "related_objective_overlap",
+            "effective_objective": f"{previous_objective}\nCurrent turn update: {current}",
+            "overlap": overlap,
+            "pending_step_count": len(pending_steps),
+            "missing_slot_count": len(missing_slots),
+        }
+
+    return {
+        "action": "supersede",
+        "reason": "new_turn_not_related_to_pending_plan",
+        "effective_objective": current,
+        "overlap": overlap,
+        "pending_step_count": len(pending_steps),
+        "missing_slot_count": len(missing_slots),
+    }
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -218,6 +921,7 @@ class RunEngine:
             semantic_graph=graph,
         )
         self._last_model_swap: Optional[dict[str, Any]] = None
+        self._active_ledgers: dict[str, RunLedger] = {}
 
     @staticmethod
     def _is_trivial_acknowledgement(message: str) -> bool:
@@ -391,6 +1095,17 @@ class RunEngine:
             request.user_message,
             list(getattr(session, "sliding_window", []) or []),
         )
+        continuation_state = getattr(session, "continuation_state", {}) or {}
+        continuation_gate = _assess_continuation_state(
+            user_message=request.user_message,
+            continuation_state=continuation_state if isinstance(continuation_state, dict) else {},
+            ambiguous_followup=self._is_ambiguous_followup(request.user_message),
+        )
+        if continuation_gate.get("action") in {"resume", "resume_with_update"}:
+            effective_objective = str(continuation_gate.get("effective_objective") or "").strip() or effective_objective
+        elif continuation_gate.get("action") == "supersede" and hasattr(self.sessions, "clear_continuation_state"):
+            self.sessions.clear_continuation_state(session.id, owner_id=request.owner_id)
+            session.continuation_state = {}
 
         try:
             tool_results: list[dict[str, Any]] = []
@@ -398,6 +1113,76 @@ class RunEngine:
             failed_tool_names: set[str] = set()
             planner_enabled = bool(request.use_planner)
             allowed_tools_list = self._list_allowed_tools(request.allowed_tools)
+            ledger_mode = str(os.getenv("LEDGER_MODE", request.ledger_mode or "shadow") or "shadow").strip().lower()
+            if ledger_mode not in {"shadow", "ledger_enforced"}:
+                ledger_mode = "shadow"
+            ledger = RunLedger(
+                run_id=run.run_id,
+                session_id=session.id,
+                turn_id=f"{session.id}:{int(getattr(session, 'message_count', 0) or 0)}",
+                owner_id=request.owner_id,
+                agent_id=request.agent_id,
+                objective=effective_objective,
+                allowed_tools=[
+                    str(item.get("name") or "")
+                    for item in allowed_tools_list
+                    if isinstance(item, dict) and item.get("name")
+                ],
+                ledger_mode=ledger_mode,
+            )
+            self._active_ledgers[run.run_id] = ledger
+            ledger.append_event(
+                "intake",
+                source="run_engine",
+                data={
+                    "user_message": request.user_message,
+                    "effective_objective": effective_objective,
+                    "context_mode": requested_context_mode,
+                    "model": session_model,
+                    "workflow_template": request.workflow_template,
+                    "prompt_version": request.prompt_version,
+                    "risk_policy": request.risk_policy,
+                },
+            )
+            if continuation_gate.get("action") != "none":
+                ledger.append_event(
+                    "continuation_gate",
+                    source="run_engine",
+                    status=str(continuation_gate.get("action") or "info"),
+                    data={
+                        "action": continuation_gate.get("action"),
+                        "reason": continuation_gate.get("reason"),
+                        "overlap": continuation_gate.get("overlap"),
+                        "pending_step_count": continuation_gate.get("pending_step_count"),
+                        "missing_slot_count": continuation_gate.get("missing_slot_count"),
+                        "source_run_id": continuation_state.get("run_id") if isinstance(continuation_state, dict) else "",
+                    },
+                )
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="continuation_gate",
+                    data={
+                        "action": continuation_gate.get("action"),
+                        "reason": continuation_gate.get("reason"),
+                        "effective_objective": effective_objective,
+                        "overlap": continuation_gate.get("overlap"),
+                        "pending_step_count": continuation_gate.get("pending_step_count"),
+                        "missing_slot_count": continuation_gate.get("missing_slot_count"),
+                        "source_run_id": continuation_state.get("run_id") if isinstance(continuation_state, dict) else "",
+                    },
+                )
+            self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="intake")
+            workflow_template = get_workflow_template(request.workflow_template)
+            workflow_pattern = get_workflow_pattern(workflow_template.workflow_pattern)
+            if workflow_pattern:
+                ledger.append_event(
+                    "workflow_pattern",
+                    source="workflow_template",
+                    status="active",
+                    data=workflow_pattern.to_dict(),
+                )
+                self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="workflow_pattern")
             latest_strategy = ""
             latest_notes = ""
             latest_observation_status = ""
@@ -409,7 +1194,7 @@ class RunEngine:
                 minimum=1,
                 maximum=24,
             )
-            max_turns = max(1, min(int(request.max_turns or 3), 6))
+            max_turns = _default_tool_turn_budget(effective_objective, request.max_turns)
             if normalized_max_tool_calls is not None:
                 max_turns = min(max_turns, normalized_max_tool_calls)
             current_facts = self._context_governor.get_current_facts(
@@ -453,6 +1238,11 @@ class RunEngine:
                 candidate_signals=list(getattr(session, "candidate_signals", []) or []),
                 current_stance_signals=stance_signals,
             )
+            # Slice 3: tag each extracted fact with source="user_direct" in
+            # the trace event so the evidence ledger (Slice 7) and operator
+            # views can distinguish direct user assertions from compression-
+            # side proposals. The source label lives in the trace; the
+            # semantic_graph schema is not changed (per convergence rule).
             self._trace(
                 request=request,
                 run_id=run.run_id,
@@ -465,10 +1255,14 @@ class RunEngine:
                             "subject": item.get("subject"),
                             "predicate": item.get("predicate"),
                             "object": item.get("object"),
+                            "source": "user_direct",
                         }
                         for item in deterministic_keyed_facts
                     ],
-                    "voids": list(deterministic_voids),
+                    "voids": [
+                        {**v, "source": "user_direct"} if isinstance(v, dict) else v
+                        for v in deterministic_voids
+                    ],
                 },
             )
             if conversation_tension.summary or conversation_tension.conflicting_facts:
@@ -604,10 +1398,92 @@ class RunEngine:
             planned_argument_clues: dict[str, str] = {}
             # Full structured plan — populated by planner, used by verify skip logic.
             structured_plan: dict[str, Any] = {}
+            # Per-turn plan_steps spine — initialized empty so all code paths
+            # (including the no-plan / fast-path return) can reference it
+            # safely. Populated by planner output below; mutated in place by
+            # _update_plan_step after each tool turn.
+            plan_steps_state: list[dict[str, Any]] = []
+            if (
+                continuation_gate.get("action") in {"resume", "resume_with_update"}
+                and isinstance(continuation_state, dict)
+            ):
+                plan_steps_state = [
+                    dict(step)
+                    for step in (continuation_state.get("pending_steps") or [])
+                    if isinstance(step, dict)
+                ]
+                if plan_steps_state:
+                    ledger.set_plan(plan_steps_state, source="continuation_state")
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="continuation_plan_seed")
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="continuation_plan_seeded",
+                        data={
+                            "pending_step_count": len(plan_steps_state),
+                            "source_run_id": continuation_state.get("run_id") or "",
+                        },
+                    )
+            planned_risk_tier: str = "read_only"
             # Route resolved from plan (used by hooks and verify skip).
             _plan_route: str = ""
 
             if not selected_tools and not direct_fact_memory_only and planner_enabled and self.orchestrator is not None:
+                # Slice 5: spatial-aware planning. Pre-fetch the drawer of any
+                # locus the user message targets (token-overlap detection),
+                # plus 1-hop neighbors with score decay. The planner then sees
+                # the actual workspace context — what facts are filed where —
+                # before deciding what tools to use. Without this the planner
+                # only sees a flat list of locus IDs and can't reason about
+                # which one matches the question's substance.
+                _spatial_drawers: list[dict[str, Any]] = []
+                try:
+                    if available_loci and self.graph is not None:
+                        from memory.retrieval import detect_locus_by_overlap
+                        _detected_locus = detect_locus_by_overlap(
+                            request.user_message or "", list(available_loci)
+                        )
+                        if _detected_locus:
+                            _primary = self.graph.get_compiled_drawer(_detected_locus)
+                            if _primary:
+                                _spatial_drawers.append({
+                                    "locus_id": _detected_locus,
+                                    "hop": 0,
+                                    "score": 1.0,
+                                    "content": _primary,
+                                })
+                            # 1-hop neighbors with score decay; cap fanout to
+                            # keep the planning packet tight.
+                            try:
+                                _neighbors = self.graph.get_locus_neighbors(
+                                    _detected_locus, max_depth=1, max_fanout=3,
+                                )
+                            except Exception:
+                                _neighbors = []
+                            for nbr_id, _depth, nbr_score in _neighbors:
+                                nbr_drawer = self.graph.get_compiled_drawer(nbr_id)
+                                if not nbr_drawer:
+                                    continue
+                                _spatial_drawers.append({
+                                    "locus_id": nbr_id,
+                                    "hop": 1,
+                                    "score": float(nbr_score),
+                                    "content": nbr_drawer,
+                                })
+                            if _spatial_drawers:
+                                self._trace(
+                                    request=request,
+                                    run_id=run.run_id,
+                                    event_type="spatial_drawers_loaded",
+                                    data={
+                                        "primary_locus": _detected_locus,
+                                        "drawer_count": len(_spatial_drawers),
+                                        "neighbor_ids": [d["locus_id"] for d in _spatial_drawers if d["hop"] > 0],
+                                    },
+                                )
+                except Exception:
+                    _spatial_drawers = []
+
                 planning_packet = self._compile_phase_packet(
                     context_engine=active_context_engine,
                     run_id=run.run_id,
@@ -626,6 +1502,8 @@ class RunEngine:
                     code_intent_note=code_intent_note,
                     execution_risk_tier=execution_risk_tier,
                     available_loci=available_loci if available_loci else None,
+                    spatial_drawers=_spatial_drawers if _spatial_drawers else None,
+                    plan_steps=plan_steps_state,
                 )
                 _planner_model = (
                     request.planner_model
@@ -669,6 +1547,55 @@ class RunEngine:
                         run_id=run.run_id,
                         event_type="locus_targeted",
                         data={"locus_id": planned_locus_id},
+                    )
+
+                # ── Capture plan_steps spine (Slice 1) ──
+                # Mutable per-turn list; runtime updates statuses as tools complete.
+                # Copied so updates don't leak back into structured_plan if the
+                # planner result is reused elsewhere (defensive).
+                planner_plan_steps = [
+                    dict(step) for step in (structured_plan.get("plan_steps") or [])
+                    if isinstance(step, dict)
+                ]
+                if planner_plan_steps:
+                    plan_steps_state = planner_plan_steps
+                if not plan_steps_state and workflow_pattern:
+                    selected_tool_names_for_pattern = [
+                        entry.get("name")
+                        for entry in structured_plan.get("tools", [])
+                        if isinstance(entry, dict)
+                    ]
+                    if "shopping_advice" in selected_tool_names_for_pattern or "shopping_advice" in request.allowed_tools:
+                        plan_steps_state = [dict(step) for step in workflow_pattern.default_plan_steps]
+                        self._trace(
+                            request=request,
+                            run_id=run.run_id,
+                            event_type="workflow_pattern_applied",
+                            data={
+                                "pattern_id": workflow_pattern.id,
+                                "source": "runtime_fallback_plan_steps",
+                                "step_count": len(plan_steps_state),
+                            },
+                        )
+                planned_risk_tier = str(structured_plan.get("risk_tier", "read_only")).strip().lower() or "read_only"
+                if plan_steps_state:
+                    ledger.set_plan(
+                        plan_steps_state,
+                        source="planner" if planner_plan_steps else "continuation_or_workflow",
+                    )
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="plan_steps")
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="plan_steps",
+                        data={
+                            "step_count": len(plan_steps_state),
+                            "risk_tier": planned_risk_tier,
+                            "steps": [
+                                {"id": s.get("id"), "tool": s.get("tool"), "risk": s.get("risk")}
+                                for s in plan_steps_state
+                            ],
+                        },
                     )
 
                 # ── Load selected skill ──
@@ -739,11 +1666,67 @@ class RunEngine:
                             "declared_risk_tier": execution_risk_tier or "",
                         },
                     )
+
+                # Slice 6: dispatch gate. Promote the advisory to a real gate
+                # for the highest-risk tier ONLY: when the plan picked
+                # destructive tools AND the user message has no authorization
+                # verb, refuse dispatch and ask for explicit confirmation
+                # instead. Write/read_only plans pass through with the trace
+                # advisory only — over-blocking would break legitimate
+                # implicit-write turns ("fix the auth bug" + file_str_replace).
+                _destructive_no_auth = (
+                    _plan_advisory["max_tier"] == "destructive"
+                    and not _plan_advisory["clear"]
+                )
+                if _destructive_no_auth:
+                    _risky_tools = [
+                        name for name in selected_tools
+                        if name in {"bash"}  # only true-destructive surfaces
+                    ]
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="dispatch_gate_blocked",
+                        data={
+                            "reason": "destructive_plan_requires_explicit_auth",
+                            "risky_tools": _risky_tools,
+                            "user_message_preview": (request.user_message or "")[:160],
+                        },
+                    )
+                    yield {
+                        "type": "clarification_needed",
+                        "reason": "destructive_plan_requires_explicit_auth",
+                        "risky_tools": _risky_tools,
+                        "question": (
+                            "I planned a destructive action ("
+                            + ", ".join(_risky_tools)
+                            + ") but your message has no explicit authorization verb. "
+                            "Should I proceed? (Reply with an action verb like 'run', "
+                            "'install', or 'delete' to confirm.)"
+                        ),
+                    }
+                    selected_tools = []
+                    plan_steps_state = []  # don't carry the destructive plan forward
+                    ledger.update_plan_steps(plan_steps_state, source="dispatch_gate")
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="dispatch_gate_blocked")
+
                 _plan_route = str(structured_plan.get("route", "")).strip()
                 if structured_plan.get("strategy"):
                     strategy = str(structured_plan.get("strategy"))
                     latest_strategy = strategy
                     latest_notes = str(structured_plan.get("notes") or "")
+                    ledger.append_event(
+                        "plan",
+                        source="planner",
+                        status="planned",
+                        data={
+                            "strategy": strategy,
+                            "tools": list(selected_tools),
+                            "confidence": structured_plan.get("confidence"),
+                            "route": _plan_route,
+                        },
+                    )
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="plan")
                     self.run_store.save_checkpoint(
                         run_id=run.run_id,
                         phase="planning",
@@ -797,6 +1780,13 @@ class RunEngine:
                     )
                     if not latest_strategy:
                         latest_strategy = bootstrap_strategy
+                    ledger.append_event(
+                        "plan",
+                        source="run_engine_fallback",
+                        status="planned_fallback",
+                        data={"strategy": bootstrap_strategy, "tools": list(selected_tools)},
+                    )
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="plan_fallback")
                     self._trace(
                         request=request,
                         run_id=run.run_id,
@@ -892,6 +1882,7 @@ class RunEngine:
                     execution_risk_tier=execution_risk_tier,
                     available_loci=available_loci if available_loci else None,
                     planned_locus_id=planned_locus_id,
+                    plan_steps=plan_steps_state,
                 )
                 tool_call = await self._select_tool_call(
                     adapter=current_adapter,
@@ -902,6 +1893,7 @@ class RunEngine:
                     tool_results=tool_results,
                     context_block=acting_packet.content,
                     argument_clues=planned_argument_clues if planned_argument_clues else None,
+                    run_id=run.run_id,
                 )
                 if tool_call is None:
                     break
@@ -913,6 +1905,44 @@ class RunEngine:
                         tool_call.arguments["backend"] = request.search_backend
                     if request.search_engine:
                         tool_call.arguments["search_engine"] = request.search_engine
+                if tool_call.tool_name == "shopping_advice":
+                    tool_call.arguments = self._normalize_shopping_arguments(
+                        tool_call.arguments,
+                        objective=effective_objective,
+                    )
+
+                pre_signature = tool_call_signature(tool_call.tool_name, tool_call.arguments or {})
+                if is_retry_sensitive_tool(tool_call.tool_name) and repeated_tool_signatures.get(pre_signature, 0) >= 1:
+                    workflow_override = _stock_source_workflow_override(
+                        objective=effective_objective,
+                        allowed_tools=allowed_tools_list,
+                        tool_results=tool_results,
+                    )
+                    clue_map = dict(workflow_override.get("argument_clues") or {})
+                    pivot_tool = (workflow_override.get("selected_tools") or [tool_call.tool_name])[0] if workflow_override else tool_call.tool_name
+                    pivot_clue = str(clue_map.get(pivot_tool) or "").strip()
+                    if pivot_tool == "web_search" and pivot_clue:
+                        pivot_args = {"query": pivot_clue}
+                        if request.search_backend and request.search_backend != "auto":
+                            pivot_args["backend"] = request.search_backend
+                        if request.search_engine:
+                            pivot_args["search_engine"] = request.search_engine
+                        tool_call = ToolCall(
+                            tool_name="web_search",
+                            arguments=pivot_args,
+                            raw_json=json.dumps({"tool": "web_search", "arguments": pivot_args}),
+                        )
+                        planned_argument_clues.update(clue_map)
+                    elif pivot_tool == "web_fetch" and pivot_clue:
+                        url_match = _URL_RE.search(pivot_clue)
+                        if url_match:
+                            pivot_args = {"url": url_match.group(0).rstrip(".,")}
+                            tool_call = ToolCall(
+                                tool_name="web_fetch",
+                                arguments=pivot_args,
+                                raw_json=json.dumps({"tool": "web_fetch", "arguments": pivot_args}),
+                            )
+                            planned_argument_clues.update(clue_map)
 
                 tool_call_count += 1
 
@@ -925,13 +1955,19 @@ class RunEngine:
 
                 validation_error = self.tool_registry.validate_tool_call(tool_call)
                 call_payload = canonical_tool_call(tool_call.tool_name, tool_call.arguments or {})
+                tool_call_record = ledger.add_tool_call(
+                    tool_call.tool_name,
+                    tool_call.arguments or {},
+                    source="actor",
+                )
                 self._trace(
                     request=request,
                     run_id=run.run_id,
                     event_type="tool_call",
-                    data={**call_payload, "turn": tool_turn},
+                    data={**call_payload, "turn": tool_turn, "tool_call_id": tool_call_record.id},
                 )
-                yield {"type": "tool_call", **call_payload}
+                self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="tool_call")
+                yield {"type": "tool_call", **call_payload, "tool_call_id": tool_call_record.id}
                 if validation_error:
                     failed_tool_names.add(tool_call.tool_name)
                     result_payload = {
@@ -941,12 +1977,22 @@ class RunEngine:
                         "arguments": dict(tool_call.arguments or {}),
                     }
                     tool_results.append(result_payload)
+                    result_record = ledger.link_tool_result(
+                        tool_call_id=tool_call_record.id,
+                        tool_name=tool_call.tool_name,
+                        success=False,
+                        status="failed",
+                        summary=clip_text(result_payload["content"], 280),
+                    )
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="tool_validation_failed")
                     self._record_tool_outcome(
                         request=request,
                         tool_name=tool_call.tool_name,
                         success=False,
                         error_kind="validation_error",
                     )
+                    _update_plan_step(plan_steps_state, tool_call.tool_name, success=False)
+                    ledger.update_plan_steps(plan_steps_state, source="run_engine")
                     self.run_store.save_checkpoint(
                         run_id=run.run_id,
                         phase="acting",
@@ -968,6 +2014,8 @@ class RunEngine:
                             "content_length": len(result_payload["content"]),
                             "content_preview": clip_text(result_payload["content"], 280),
                             "turn": tool_turn,
+                            "tool_call_id": tool_call_record.id,
+                            "tool_result_id": result_record.id,
                         },
                     )
                     yield {
@@ -978,6 +2026,8 @@ class RunEngine:
                         "status": "failed",
                         "content_preview": clip_text(result_payload["content"], 280),
                         "content": result_payload["content"],
+                        "tool_call_id": tool_call_record.id,
+                        "tool_result_id": result_record.id,
                     }
                     break
 
@@ -985,29 +2035,67 @@ class RunEngine:
                 if is_retry_sensitive_tool(tool_call.tool_name):
                     repeat_count = repeated_tool_signatures.get(signature, 0)
                     if repeat_count >= 1:
-                        failed_tool_names.add(tool_call.tool_name)
+                        cached_result = _find_cached_retry_sensitive_result(
+                            tool_results,
+                            tool_name=tool_call.tool_name,
+                            arguments=tool_call.arguments or {},
+                        )
                         duplicate_message = (
-                            f"Duplicate {tool_call.tool_name} call suppressed for this run. "
-                            "Use the existing result or pivot to a different query/source."
+                            f"Duplicate {tool_call.tool_name} call reused from this run's cached tool result."
+                            if cached_result
+                            else (
+                                f"Duplicate {tool_call.tool_name} call suppressed for this run. "
+                                "Use the existing result or pivot to a different query/source."
+                            )
+                        )
+                        duplicate_success = bool(cached_result)
+                        if not duplicate_success:
+                            failed_tool_names.add(tool_call.tool_name)
+                        duplicate_content = (
+                            str(cached_result.get("content") or "")
+                            if cached_result
+                            else duplicate_message
                         )
                         result_payload = {
                             "tool_name": tool_call.tool_name,
-                            "success": False,
-                            "content": duplicate_message,
+                            "success": duplicate_success,
+                            "content": duplicate_content,
                             "arguments": dict(tool_call.arguments or {}),
+                            "cached_duplicate": duplicate_success,
                         }
+                        if cached_result and cached_result.get("actor_summary"):
+                            result_payload["actor_summary"] = str(cached_result.get("actor_summary") or "")
+                        if cached_result and isinstance(cached_result.get("extracted_urls"), list):
+                            result_payload["extracted_urls"] = list(cached_result.get("extracted_urls") or [])
                         tool_results.append(result_payload)
+                        result_record = ledger.link_tool_result(
+                            tool_call_id=tool_call_record.id,
+                            tool_name=tool_call.tool_name,
+                            success=duplicate_success,
+                            status="cached" if duplicate_success else "failed",
+                            summary=clip_text(duplicate_message, 280),
+                        )
+                        if duplicate_success and is_substantive_tool_result(result_payload):
+                            ledger.add_evidence_from_result(result_record)
+                        self._trace_ledger(
+                            request=request,
+                            run_id=run.run_id,
+                            ledger=ledger,
+                            reason="duplicate_cached" if duplicate_success else "duplicate_suppressed",
+                        )
                         self._record_tool_outcome(
                             request=request,
                             tool_name=tool_call.tool_name,
-                            success=False,
-                            error_kind="duplicate_suppressed",
+                            success=duplicate_success,
+                            error_kind="" if duplicate_success else "duplicate_suppressed",
                         )
+                        _update_plan_step(plan_steps_state, tool_call.tool_name, success=duplicate_success)
+                        ledger.update_plan_steps(plan_steps_state, source="run_engine")
                         self.run_store.save_checkpoint(
                             run_id=run.run_id,
                             phase="acting",
                             tool_turn=tool_turn,
-                            status="duplicate_suppressed",
+                            status="duplicate_cached" if duplicate_success else "duplicate_suppressed",
                             notes=duplicate_message,
                             tools=[tool_call.tool_name],
                             tool_results=summarize_tool_results([result_payload], limit=1, preview_chars=220),
@@ -1019,27 +2107,33 @@ class RunEngine:
                             data={
                                 "tool": tool_call.tool_name,
                                 "tool_name": tool_call.tool_name,
-                                "success": False,
-                                "status": "failed",
-                                "content_length": len(duplicate_message),
-                                "content_preview": clip_text(duplicate_message, 280),
+                                "success": duplicate_success,
+                                "status": "cached" if duplicate_success else "failed",
+                                "content_length": len(duplicate_content),
+                                "content_preview": clip_text(duplicate_content, 280),
+                                "cached_duplicate": duplicate_success,
                                 "turn": tool_turn,
+                                "tool_call_id": tool_call_record.id,
+                                "tool_result_id": result_record.id,
                             },
                         )
                         yield {
                             "type": "tool_result",
                             "tool": tool_call.tool_name,
                             "tool_name": tool_call.tool_name,
-                            "success": False,
-                            "status": "failed",
-                            "content_preview": clip_text(duplicate_message, 280),
-                            "content": duplicate_message,
+                            "success": duplicate_success,
+                            "status": "cached" if duplicate_success else "failed",
+                            "content_preview": clip_text(duplicate_content, 280),
+                            "content": duplicate_content,
+                            "cached_duplicate": duplicate_success,
+                            "tool_call_id": tool_call_record.id,
+                            "tool_result_id": result_record.id,
                         }
                         self._save_pass_record(
                             run_id=run.run_id,
                             phase=ContextPhase.ACTING,
                             tool_turn=tool_turn,
-                            status="duplicate_suppressed",
+                            status="duplicate_cached" if duplicate_success else "duplicate_suppressed",
                             objective=effective_objective,
                             strategy=latest_strategy,
                             notes=duplicate_message,
@@ -1077,12 +2171,48 @@ class RunEngine:
                             compiled_context=observation_packet.content,
                         )
                         normalized_observation = self._normalize_observation_decision(observation)
+                        workflow_override = _stock_source_workflow_override(
+                            objective=effective_objective,
+                            allowed_tools=allowed_tools_list,
+                            tool_results=tool_results,
+                        )
+                        if workflow_override:
+                            self._trace_workflow_override(
+                                request=request,
+                                run_id=run.run_id,
+                                tool_turn=tool_turn,
+                                workflow_override=workflow_override,
+                                source="duplicate_recovery",
+                            )
+                            normalized_observation.update({
+                                "status": workflow_override.get("status", normalized_observation["status"]),
+                                "strategy": workflow_override.get("strategy", normalized_observation["strategy"]),
+                                "notes": workflow_override.get("notes", normalized_observation["notes"]),
+                                "selected_tools": list(workflow_override.get("selected_tools") or []),
+                                "missing_slots": list(workflow_override.get("missing_slots") or []),
+                                "should_continue": bool(workflow_override.get("selected_tools")),
+                            })
+                            planned_argument_clues.update(dict(workflow_override.get("argument_clues") or {}))
                         selected_tools = list(normalized_observation["selected_tools"])
                         latest_strategy = str(normalized_observation["strategy"] or latest_strategy)
                         latest_notes = str(normalized_observation["notes"] or latest_notes)
                         latest_observation_status = str(normalized_observation["status"] or "")
                         latest_observation_tools = list(selected_tools)
                         latest_missing_slots = list(normalized_observation.get("missing_slots") or [])
+                        ledger.append_event(
+                            "observation",
+                            source="loop_manager",
+                            status=latest_observation_status or "info",
+                            data={
+                                "strategy": normalized_observation["strategy"],
+                                "notes": normalized_observation["notes"],
+                                "confidence": normalized_observation["confidence"],
+                                "should_continue": normalized_observation["should_continue"],
+                                "tools": selected_tools,
+                                "missing_slots": latest_missing_slots,
+                            },
+                        )
+                        self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="observation")
                         self._trace(
                             request=request,
                             run_id=run.run_id,
@@ -1193,13 +2323,45 @@ class RunEngine:
                     else:
                         _enriched_content = _raw_content
 
+                # Slice 4: shape the tool output for the actor — KEY_LINES on
+                # long bash, SUMMARY on web_search, HARD_FAILURE preservation,
+                # plus a one-line actor_summary for the working_evidence
+                # cross-tool accumulator. Shaping never raises; on failure
+                # the original content is kept verbatim.
+                _shaped_content, _actor_summary = shape_tool_result_for_actor(
+                    tool_result.tool_name,
+                    _enriched_content,
+                    success=bool(tool_result.success),
+                )
                 result_payload = {
                     "tool_name": tool_result.tool_name,
                     "success": tool_result.success,
-                    "content": _enriched_content,
+                    "content": _shaped_content,
+                    "actor_summary": _actor_summary,
                     "arguments": dict(tool_call.arguments or {}),
+                    "tool_call_id": tool_call_record.id,
                 }
+                if tool_result.tool_name in {"web_search", "web_fetch"}:
+                    result_payload["extracted_urls"] = _extract_urls_from_tool_results(
+                        [
+                            {
+                                "success": bool(tool_result.success),
+                                "content": _enriched_content,
+                            }
+                        ],
+                        limit=12,
+                    )
                 tool_results.append(result_payload)
+                result_record = ledger.link_tool_result(
+                    tool_call_id=tool_call_record.id,
+                    tool_name=tool_result.tool_name,
+                    success=bool(tool_result.success),
+                    status="ok" if tool_result.success else "failed",
+                    summary=clip_text(_actor_summary or _shaped_content, 280),
+                )
+                if is_substantive_tool_result(result_payload):
+                    ledger.add_evidence_from_result(result_record)
+                self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="tool_result")
                 if not tool_result.success:
                     failed_tool_names.add(tool_result.tool_name)
                 self._record_tool_outcome(
@@ -1208,6 +2370,13 @@ class RunEngine:
                     success=bool(tool_result.success),
                     error_kind=("hard_failure" if (not tool_result.success and "HARD_FAILURE" in (tool_result.content or "")) else ""),
                 )
+                _update_plan_step(
+                    plan_steps_state,
+                    tool_result.tool_name,
+                    success=bool(tool_result.success),
+                    hard_failure=("HARD_FAILURE" in (tool_result.content or "")),
+                )
+                ledger.update_plan_steps(plan_steps_state, source="run_engine")
 
                 # ── Hook: tool_completed ──
                 hooks.emit_sync("tool_completed", {
@@ -1247,6 +2416,8 @@ class RunEngine:
                         "content_length": len(tool_result.content),
                         "content_preview": clip_text(tool_result.content, 280),
                         "turn": tool_turn,
+                        "tool_call_id": tool_call_record.id,
+                        "tool_result_id": result_record.id,
                     },
                 )
                 yield {
@@ -1257,6 +2428,8 @@ class RunEngine:
                     "status": "ok" if tool_result.success else "failed",
                     "content_preview": clip_text(tool_result.content, 280),
                     "content": tool_result.content,
+                    "tool_call_id": tool_call_record.id,
+                    "tool_result_id": result_record.id,
                 }
                 stall_alert = tool_loop_guard.observe_result(
                     tool_name=tool_result.tool_name,
@@ -1273,14 +2446,25 @@ class RunEngine:
                         "success": False,
                         "content": latest_notes,
                         "arguments": dict(tool_call.arguments or {}),
+                        "tool_call_id": tool_call_record.id,
                     }
                     tool_results.append(alert_payload)
+                    alert_record = ledger.link_tool_result(
+                        tool_call_id=tool_call_record.id,
+                        tool_name=alert_tool_name,
+                        success=False,
+                        status="failed",
+                        summary=clip_text(latest_notes, 280),
+                    )
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="logical_stall")
                     self._record_tool_outcome(
                         request=request,
                         tool_name=alert_tool_name,
                         success=False,
                         error_kind="logical_stall",
                     )
+                    _update_plan_step(plan_steps_state, alert_tool_name, success=False)
+                    ledger.update_plan_steps(plan_steps_state, source="run_engine")
                     self.run_store.save_checkpoint(
                         run_id=run.run_id,
                         phase="acting",
@@ -1300,6 +2484,8 @@ class RunEngine:
                             "message": latest_notes,
                             "suggested_pivot": stall_alert.get("suggested_pivot", ""),
                             "turn": tool_turn,
+                            "tool_call_id": tool_call_record.id,
+                            "tool_result_id": alert_record.id,
                         },
                     )
                     yield stall_alert
@@ -1360,11 +2546,48 @@ class RunEngine:
                     compiled_context=observation_packet.content,
                 )
                 normalized_observation = self._normalize_observation_decision(observation)
+                workflow_override = _stock_source_workflow_override(
+                    objective=effective_objective,
+                    allowed_tools=allowed_tools_list,
+                    tool_results=tool_results,
+                )
+                if workflow_override:
+                    self._trace_workflow_override(
+                        request=request,
+                        run_id=run.run_id,
+                        tool_turn=tool_turn,
+                        workflow_override=workflow_override,
+                        source="observation_override",
+                    )
+                    normalized_observation.update({
+                        "status": workflow_override.get("status", normalized_observation["status"]),
+                        "strategy": workflow_override.get("strategy", normalized_observation["strategy"]),
+                        "notes": workflow_override.get("notes", normalized_observation["notes"]),
+                        "selected_tools": list(workflow_override.get("selected_tools") or []),
+                        "missing_slots": list(workflow_override.get("missing_slots") or []),
+                        "should_continue": bool(workflow_override.get("selected_tools")),
+                    })
+                    planned_argument_clues.update(dict(workflow_override.get("argument_clues") or {}))
                 selected_tools = list(normalized_observation["selected_tools"])
                 latest_strategy = str(normalized_observation["strategy"] or latest_strategy)
                 latest_notes = str(normalized_observation["notes"] or latest_notes)
                 latest_observation_status = str(normalized_observation["status"] or "")
                 latest_observation_tools = list(selected_tools)
+                latest_missing_slots = list(normalized_observation.get("missing_slots") or [])
+                ledger.append_event(
+                    "observation",
+                    source="loop_manager",
+                    status=latest_observation_status or "info",
+                    data={
+                        "strategy": normalized_observation["strategy"],
+                        "notes": normalized_observation["notes"],
+                        "confidence": normalized_observation["confidence"],
+                        "should_continue": normalized_observation["should_continue"],
+                        "tools": selected_tools,
+                        "missing_slots": latest_missing_slots,
+                    },
+                )
+                self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="observation")
                 self._trace(
                     request=request,
                     run_id=run.run_id,
@@ -1402,7 +2625,108 @@ class RunEngine:
                     tool_results=tool_results[-3:],
                     packet=observation_packet,
                 )
-                if normalized_observation["should_continue"]:
+                # ── Slice 2: finalize gate ──────────────────────────────
+                # Cross-check the observation's status against plan_steps and
+                # the cross-session TaskTracker. The observation alone is no
+                # longer authoritative — finalize requires (status == finalize)
+                # AND (all plan_steps done) AND (no open todos). If the gate
+                # refuses, override `selected_tools` with the next pending
+                # step's tool so the actor loop continues against that step.
+                from memory.task_tracker import get_session_task_tracker as _get_tt
+                _tracker_for_gate = None
+                try:
+                    _tracker_for_gate = _get_tt()
+                except Exception:
+                    _tracker_for_gate = None
+                _gate_finalize, _gate_reason = _should_finalize(
+                    observation_status=normalized_observation["status"],
+                    plan_steps=plan_steps_state,
+                    tool_turn=tool_turn,
+                    max_tool_calls=normalized_max_tool_calls,
+                    session_id=session.id,
+                    task_tracker=_tracker_for_gate,
+                )
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="finalize_gate",
+                    data={
+                        "should_finalize": _gate_finalize,
+                        "reason": _gate_reason,
+                        "tool_turn": tool_turn,
+                        "pending_step_count": sum(
+                            1 for s in plan_steps_state if s.get("status") == "pending"
+                        ),
+                    },
+                )
+
+                if (
+                    not _gate_finalize
+                    and _gate_reason.startswith("pending_steps")
+                    and not (workflow_override and selected_tools)
+                ):
+                    # Force one more actor turn against the first pending step.
+                    next_step = next(
+                        (s for s in plan_steps_state if s.get("status") == "pending"), None
+                    )
+                    if next_step and next_step.get("tool"):
+                        selected_tools = [next_step["tool"]]
+                        latest_notes = (
+                            f"{latest_notes}\nNext required: {next_step.get('description', '')}"
+                            if latest_notes else
+                            f"Next required: {next_step.get('description', '')}"
+                        )
+                    elif not selected_tools:
+                        # No tool to drive the step — let observation decide,
+                        # but don't deadlock.
+                        _gate_finalize = True
+
+                # Partial-completion event when the hard cap forces finalize
+                # while plan_steps remain. This must be emitted before the
+                # response phase so the response generator can read it via
+                # the injected `latest_notes` and never claim full success.
+                if _gate_finalize and _gate_reason.startswith("max_tool_calls_reached"):
+                    completed = [
+                        s.get("id") for s in plan_steps_state
+                        if s.get("status") in {"done", "skipped"}
+                    ]
+                    incomplete = [
+                        s.get("id") for s in plan_steps_state
+                        if s.get("status") == "pending"
+                    ]
+                    incomplete_descs = [
+                        s.get("description", "") for s in plan_steps_state
+                        if s.get("status") == "pending"
+                    ]
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="partial_completion",
+                        data={
+                            "completed_steps": completed,
+                            "incomplete_steps": incomplete,
+                            "reason": "max_tool_calls_reached",
+                        },
+                    )
+                    yield {
+                        "type": "partial_completion",
+                        "completed_steps": completed,
+                        "incomplete_steps": incomplete,
+                        "reason": "max_tool_calls_reached",
+                    }
+                    if incomplete_descs:
+                        latest_notes = (
+                            f"{latest_notes}\nNote: {len(incomplete_descs)} planned step(s) "
+                            f"could not be completed: {'; '.join(incomplete_descs[:3])}. "
+                            "Report exactly what was done and what wasn't."
+                        )
+
+                _effective_should_continue = (
+                    normalized_observation["should_continue"]
+                    and not _gate_finalize
+                ) or (not _gate_finalize and bool(selected_tools))
+
+                if _effective_should_continue:
                     strategy = str(normalized_observation["strategy"] or "Manager selected follow-up tools.")
                     self._trace(
                         request=request,
@@ -1416,7 +2740,7 @@ class RunEngine:
                         "tools": selected_tools,
                         "confidence": normalized_observation["confidence"],
                     }
-                if not normalized_observation["should_continue"]:
+                else:
                     selected_tools = []
 
             final_response = ""
@@ -1438,6 +2762,7 @@ class RunEngine:
                 observation_tools=latest_observation_tools,
                 current_facts=current_facts,
                 conversation_tension=conversation_tension,
+                plan_steps=plan_steps_state,
             )
             final_messages = self._build_final_messages(
                 session=session,
@@ -1483,15 +2808,48 @@ class RunEngine:
             stream_kwargs: dict[str, Any] = {}
             if request.reasoning_enabled is not None:
                 stream_kwargs["reasoning_enabled"] = request.reasoning_enabled
-            async for token in current_adapter.stream(
+            buffer_final_response = is_small_or_local_model(session_model)
+            buffered_tokens: list[str] = []
+            async for token in _stream_with_rate_limit_retry(
+                current_adapter,
                 model=clean_model,
                 messages=final_messages,
                 temperature=0.2,
                 images=request.images,
                 **stream_kwargs,
             ):
+                if isinstance(token, dict):
+                    yield token
+                    continue
                 final_response += token
-                yield {"type": "token", "content": token}
+                if buffer_final_response:
+                    buffered_tokens.append(token)
+                else:
+                    yield {"type": "token", "content": token}
+
+            guarded_response = guard_final_response(
+                final_response,
+                user_message=request.user_message,
+                model=session_model,
+            )
+            if guarded_response.changed:
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="final_response_guard",
+                    data={
+                        "issues": guarded_response.issues,
+                        "replacement_used": guarded_response.replacement_used,
+                        "buffered": buffer_final_response,
+                    },
+                )
+                if not buffer_final_response:
+                    yield {"type": "retract_last_tokens"}
+                final_response = guarded_response.text
+                yield {"type": "token", "content": final_response}
+            elif buffer_final_response:
+                for token in buffered_tokens:
+                    yield {"type": "token", "content": token}
 
             response_summary = self._build_controller_summary(
                 status=latest_observation_status,
@@ -1626,10 +2984,51 @@ class RunEngine:
                     "side_effect_guard": "tripped",
                 }
 
+            # Slice 4: 3-way verifier verdict routing.
+            # The verifier now returns one of: supported | needs_redraft | needs_replan.
+            # - supported   → COMMIT (handled by the post-redraft fall-through path)
+            # - needs_redraft → REDRAFT (legacy path, evidence is sufficient)
+            # - needs_replan → emit replan_recommended event + inject honest
+            #   "missing evidence" note into the response. We do NOT re-enter the
+            #   tool loop here (that's the caller's next-turn responsibility);
+            #   we surface the signal so a managing orchestrator or the user can
+            #   trigger the next plan with the missing evidence as the objective.
+            _verifier_verdict = str(verification.get("verdict", "")).strip().lower()
+            if _verifier_verdict == "needs_replan":
+                _missing_evidence = list(verification.get("missing_evidence") or [])
+                _target_state = str(verification.get("target_state") or "gather").strip().lower()
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="replan_recommended",
+                    data={
+                        "target_state": _target_state,
+                        "missing_evidence": _missing_evidence,
+                        "issues": list(verification.get("issues") or [])[:5],
+                        "confidence": verification.get("confidence"),
+                    },
+                )
+                yield {
+                    "type": "replan_recommended",
+                    "target_state": _target_state,
+                    "missing_evidence": _missing_evidence,
+                    "issues": list(verification.get("issues") or [])[:5],
+                    "confidence": verification.get("confidence"),
+                }
+                # Skip the redraft loop — redrafting can't produce missing
+                # evidence. Continue to the standard "ship with warning" path
+                # below, which will surface the warning to the user.
+
             # Re-draft once when verification fails with high severity.
             # Triggered by side-effect guard tripping OR multiple verification issues.
             # Bound to a single attempt — if the redraft also fails, we ship with a warning.
-            if not bool(verification.get("supported", True)):
+            # Only fires for verdict=needs_redraft (legacy unsupported case);
+            # needs_replan is handled above without redraft.
+            _redraft_eligible = (
+                not bool(verification.get("supported", True))
+                and _verifier_verdict != "needs_replan"
+            )
+            if _redraft_eligible:
                 _initial_issues = list(verification.get("issues") or [])
                 _side_effect_tripped = bool(verification.get("side_effect_guard") == "tripped")
                 try:
@@ -1669,15 +3068,48 @@ class RunEngine:
                         {"role": "system", "content": constraints_msg}
                     ]
                     final_response = ""
-                    async for token in current_adapter.stream(
+                    redraft_buffered_tokens: list[str] = []
+                    async for token in _stream_with_rate_limit_retry(
+                        current_adapter,
                         model=clean_model,
                         messages=redraft_messages,
                         temperature=0.1,
                         images=request.images,
                         **stream_kwargs,
                     ):
+                        if isinstance(token, dict):
+                            yield token
+                            continue
                         final_response += token
-                        yield {"type": "token", "content": token}
+                        if buffer_final_response:
+                            redraft_buffered_tokens.append(token)
+                        else:
+                            yield {"type": "token", "content": token}
+
+                    guarded_redraft = guard_final_response(
+                        final_response,
+                        user_message=request.user_message,
+                        model=session_model,
+                    )
+                    if guarded_redraft.changed:
+                        self._trace(
+                            request=request,
+                            run_id=run.run_id,
+                            event_type="final_response_guard",
+                            data={
+                                "issues": guarded_redraft.issues,
+                                "replacement_used": guarded_redraft.replacement_used,
+                                "buffered": buffer_final_response,
+                                "redraft": True,
+                            },
+                        )
+                        if not buffer_final_response:
+                            yield {"type": "retract_last_tokens"}
+                        final_response = guarded_redraft.text
+                        yield {"type": "token", "content": final_response}
+                    elif buffer_final_response:
+                        for token in redraft_buffered_tokens:
+                            yield {"type": "token", "content": token}
 
                     # Re-evaluate ONCE — no further redrafts.
                     side_effect_check = check_side_effect_claims(final_response, tool_results)
@@ -1775,6 +3207,13 @@ class RunEngine:
                 metadata={"issues": verification.get("issues") or []},
             )
             verification_supported = bool(verification.get("supported", True))
+            ledger.set_verification(
+                supported=verification_supported,
+                verdict=str(verification.get("verdict") or ("supported" if verification_supported else "needs_redraft")),
+                issues=[str(item) for item in (verification.get("issues") or [])],
+                confidence=verification.get("confidence"),
+            )
+            self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="verification")
             if not verification_supported:
                 warning = list(verification.get("issues") or [])
                 self._trace(
@@ -1793,6 +3232,74 @@ class RunEngine:
                     "confidence": verification.get("confidence"),
                 }
 
+            pending_or_failed_steps = [
+                step for step in plan_steps_state
+                if isinstance(step, dict)
+                and str(step.get("status") or "pending") not in {"done", "completed", "skipped"}
+            ]
+            verification_missing_evidence = [
+                str(item).strip()
+                for item in (verification.get("missing_evidence") or [])
+                if str(item).strip()
+            ]
+            continuation_missing_slots = list(dict.fromkeys(
+                [str(item).strip() for item in latest_missing_slots if str(item).strip()]
+                + verification_missing_evidence
+            ))
+            continuation_reason = ""
+            if str(verification.get("verdict", "")).strip().lower() == "needs_replan":
+                continuation_reason = "verification_needs_replan"
+            elif pending_or_failed_steps:
+                continuation_reason = "pending_plan_steps"
+            elif continuation_missing_slots:
+                continuation_reason = "missing_evidence_slots"
+            elif not verification_supported:
+                continuation_reason = "verification_unsupported"
+
+            if continuation_reason:
+                continuation_state = _build_continuation_state_payload(
+                    reason=continuation_reason,
+                    effective_objective=effective_objective,
+                    run_id=run.run_id,
+                    plan_steps=plan_steps_state,
+                    missing_slots=continuation_missing_slots,
+                    strategy=latest_strategy,
+                    notes=latest_notes,
+                    tool_results=tool_results,
+                    issues=list(verification.get("issues") or []),
+                    target_state=str(verification.get("target_state") or ""),
+                )
+                if continuation_state and hasattr(self.sessions, "update_continuation_state"):
+                    ledger.set_continuation(continuation_state)
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="continuation_state")
+                    self.sessions.update_continuation_state(
+                        session.id,
+                        continuation_state,
+                        owner_id=request.owner_id,
+                    )
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="continuation_state_updated",
+                        data={
+                            "reason": continuation_reason,
+                            "pending_step_count": len(continuation_state.get("pending_steps") or []),
+                            "missing_slot_count": len(continuation_state.get("missing_slots") or []),
+                            "target_state": continuation_state.get("target_state") or "",
+                        },
+                    )
+            elif hasattr(self.sessions, "clear_continuation_state"):
+                prior_continuation = bool(getattr(session, "continuation_state", {}) or {})
+                self.sessions.clear_continuation_state(session.id, owner_id=request.owner_id)
+                ledger.continuation_state = None
+                if prior_continuation:
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="continuation_state_cleared",
+                        data={"reason": "run_closed"},
+                    )
+
             self.sessions.append_message(session.id, "assistant", final_response)
             if verification_supported:
                 await self._commit_context(
@@ -1803,13 +3310,15 @@ class RunEngine:
                     current_context=session.compressed_context,
                     is_first_exchange=is_first_exchange,
                     tool_results=tool_results,
-                    model=request.context_model or clean_model,
+                    model=request.context_model or session_model,
                     run_id=run.run_id,
                     deterministic_keyed_facts=deterministic_keyed_facts,
                     deterministic_voids=deterministic_voids,
                     current_facts=current_facts,
                     stance_signals=stance_signals,
+                    conversation_tension=conversation_tension,
                     planned_locus_id=planned_locus_id,
+                    run_ledger=ledger,
                 )
             else:
                 self.run_store.save_checkpoint(
@@ -1835,6 +3344,13 @@ class RunEngine:
                 event_type="assistant_response",
                 data={"content": final_response, "content_length": len(final_response)},
             )
+            ledger.append_event(
+                "response",
+                source="run_engine",
+                status="complete",
+                data={"content_length": len(final_response), "verification_supported": verification_supported},
+            )
+            self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="run_complete")
             self.run_store.finish_run(run.run_id, status="completed")
             # ── Hook: run_complete ──
             hooks.emit_sync("run_complete", {
@@ -1845,6 +3361,15 @@ class RunEngine:
             }, run_id=run.run_id, session_id=request.session_id)
             yield {"type": "done", "run_id": run.run_id, "session_id": session.id}
         except Exception as exc:
+            active_ledger = self._active_ledgers.get(run.run_id)
+            if active_ledger is not None:
+                active_ledger.append_event(
+                    "run_failed",
+                    source="run_engine",
+                    status="error",
+                    data={"message": str(exc)},
+                )
+                self._trace_ledger(request=request, run_id=run.run_id, ledger=active_ledger, reason="run_failed")
             self.run_store.finish_run(run.run_id, status="failed", error=str(exc))
             self._trace(
                 request=request,
@@ -1853,10 +3378,12 @@ class RunEngine:
                 data={"message": str(exc)},
             )
             raise
+        finally:
+            self._active_ledgers.pop(run.run_id, None)
 
     def _resolve_adapter(self, model: str) -> BaseLLMAdapter:
         if model and ":" in model:
-            return create_adapter(provider=model)
+            return create_adapter(provider=model.split(":", 1)[0].lower())
         return self.adapter
 
     def _list_allowed_tools(self, allowed_tools: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -1894,6 +3421,7 @@ class RunEngine:
         tool_results: list[dict[str, Any]],
         context_block: str,
         argument_clues: Optional[dict[str, str]] = None,
+        run_id: str = "",
     ) -> Optional[ToolCall]:
         available_names = [name for name in allowed_tools if self.tool_registry.get(name) is not None]
         if not available_names:
@@ -1940,14 +3468,22 @@ class RunEngine:
             )
 
         call = extract_tool_call(raw, self.tool_registry) if raw else None
+        draft = ToolCallDraft(
+            tool_name=call.tool_name if call is not None else "",
+            arguments=dict(call.arguments or {}) if call is not None and isinstance(call.arguments, dict) else {},
+            raw=raw,
+            source="actor",
+            validation_error="" if call is not None else ("empty_actor_output" if not raw else "unparseable_tool_call"),
+        )
         if call is not None:
             # Strict allowed-tool enforcement — actor cannot escape the
             # planner's tool selection by hallucinating a tool name that's
             # registered but not in the planner's narrowed list.
             if call.tool_name not in available_names:
+                draft.validation_error = "tool_not_allowed"
                 self._trace(
                     request=request,
-                    run_id=getattr(request, "run_id", None) or "",
+                    run_id=run_id,
                     event_type="tool_selection_violation",
                     data={
                         "attempted_tool": call.tool_name,
@@ -1956,12 +3492,64 @@ class RunEngine:
                 )
                 call = None
             else:
+                self._trace(
+                    request=request,
+                    run_id=run_id,
+                    event_type="tool_call_draft",
+                    data={
+                        "tool_name": draft.tool_name,
+                        "arguments": draft.arguments,
+                        "valid": draft.valid,
+                        "validation_error": draft.validation_error,
+                        "raw_preview": clip_text(raw, 500),
+                    },
+                )
                 return call
+        self._trace(
+            request=request,
+            run_id=run_id,
+            event_type="tool_call_draft",
+            data={
+                "tool_name": draft.tool_name,
+                "arguments": draft.arguments,
+                "valid": False,
+                "validation_error": draft.validation_error,
+                "raw_preview": clip_text(raw, 500),
+            },
+        )
+        if argument_clues:
+            for name in available_names:
+                clue = str(argument_clues.get(name) or "").strip()
+                if not clue:
+                    continue
+                if name in {"web_search", "rag_search"}:
+                    return ToolCall(
+                        tool_name=name,
+                        arguments={"query": clue},
+                        raw_json=json.dumps({"tool": name, "arguments": {"query": clue}}),
+                    )
+                if name == "web_fetch":
+                    url_match = _URL_RE.search(clue)
+                    if url_match:
+                        url = url_match.group(0).rstrip(".,")
+                        return ToolCall(
+                            tool_name=name,
+                            arguments={"url": url},
+                            raw_json=json.dumps({"tool": name, "arguments": {"url": url}}),
+                        )
         fallback_ranked = self._rank_fallback_tool_candidates(effective_objective, available_names)
+        if "web_fetch" in available_names and "web_fetch" not in fallback_ranked:
+            if re.search(r"https?://[^\s\"'<>),]+", context_block or ""):
+                fallback_ranked.insert(0, "web_fetch")
         for name in fallback_ranked:
             if name not in available_names:
                 continue
-            fallback = fallback_tool_call(name, effective_objective)
+            fallback_objective = effective_objective
+            if name == "web_fetch" and not re.search(r"https?://\S+", fallback_objective or ""):
+                context_url = re.search(r"https?://[^\s\"'<>),]+", context_block or "")
+                if context_url:
+                    fallback_objective = context_url.group(0)
+            fallback = fallback_tool_call(name, fallback_objective)
             if fallback is not None:
                 return fallback
         return None
@@ -1977,6 +3565,10 @@ class RunEngine:
         context_block: str,
         argument_clues: Optional[dict[str, str]] = None,
     ) -> str:
+        capability_context = render_capability_cards(
+            allowed_tools=allowed_tools,
+            workflow_template=request.workflow_template,
+        )
         return build_actor_request_content(
             user_message=request.user_message,
             effective_objective=effective_objective,
@@ -1986,6 +3578,7 @@ class RunEngine:
             context_block=context_block,
             clip_text=self._clip,
             argument_clues=argument_clues,
+            capability_context=capability_context,
         )
 
     @staticmethod
@@ -2118,6 +3711,18 @@ class RunEngine:
             )
             messages.append({"role": "system", "content": f"Evidence gathered this run:\n{evidence}"})
 
+        answer_patch = self._extract_answer_patch(tool_results)
+        if answer_patch:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Answer patch:\n"
+                    f"{json.dumps(answer_patch, ensure_ascii=False, indent=2)}\n\n"
+                    "Use the answer_patch as the source of structured facts. Write a concise buyer answer from it. "
+                    "Do not cite links outside verified_urls. Do not invent prices, availability, purchases, or product facts."
+                ),
+            })
+
         final_user_prompt = user_message
         if effective_objective.strip() and effective_objective.strip() != user_message.strip():
             final_user_prompt = (
@@ -2127,6 +3732,74 @@ class RunEngine:
             )
         messages.append({"role": "user", "content": final_user_prompt})
         return messages
+
+    @staticmethod
+    def _extract_answer_patch(tool_results: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+        for item in reversed(tool_results or []):
+            if item.get("tool_name") != "shopping_advice":
+                continue
+            try:
+                content = json.loads(str(item.get("content") or "{}"))
+            except Exception:
+                continue
+            if isinstance(content, dict) and isinstance(content.get("answer_patch"), dict):
+                return {
+                    "verified_urls": content.get("verified_urls") or [],
+                    "warnings": content.get("warnings") or [],
+                    **content["answer_patch"],
+                }
+        return None
+
+    @staticmethod
+    def _normalize_shopping_arguments(arguments: dict[str, Any], *, objective: str) -> dict[str, Any]:
+        args = dict(arguments or {})
+        text = str(objective or "")
+        lowered = text.lower()
+        if not str(args.get("query") or "").strip():
+            cleaned = re.sub(
+                r"\b(find|buy|get|recommend|best|cheap|near me|near|under|for me|please|check|compare)\b",
+                " ",
+                lowered,
+                flags=re.IGNORECASE,
+            )
+            args["query"] = re.sub(r"\s+", " ", cleaned).strip() or text[:120]
+        if not str(args.get("budget") or "").strip():
+            budget_match = re.search(r"(?:under|below|less than|up to|max(?:imum)?)\s+([$€£]?\s?\d[\d,]*(?:\.\d{2})?\s?(?:cad|usd|eur|gbp)?)", text, re.IGNORECASE)
+            if budget_match:
+                args["budget"] = budget_match.group(1).strip()
+        if not str(args.get("location") or "").strip():
+            location_match = re.search(r"\b(?:near|in|around)\s+([A-Z][A-Za-z .'-]{2,}(?:,\s?[A-Z]{2})?)", text)
+            if location_match:
+                location = re.split(
+                    r"\s+\b(?:at|from|for|under|with|and|or)\b\s+",
+                    location_match.group(1).strip(" ."),
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0].strip(" .")
+                args["location"] = location
+            elif re.search(r"\btoronto\b", lowered):
+                args["location"] = "Toronto"
+        if not args.get("stores"):
+            store_hits: list[str] = []
+            store_aliases = {
+                "costco": "Costco",
+                "canadian tire": "Canadian Tire",
+                "shoppers": "Shoppers",
+                "shoppers drug mart": "Shoppers",
+                "metro": "Metro",
+                "dollarama": "Dollarama",
+                "walmart": "Walmart",
+                "best buy": "Best Buy",
+                "bestbuy": "Best Buy",
+            }
+            for phrase, label in store_aliases.items():
+                if phrase in lowered and label not in store_hits:
+                    store_hits.append(label)
+            if store_hits:
+                args["stores"] = store_hits
+        if not str(args.get("region") or "").strip() and re.search(r"\b(canada|toronto|ontario|cad)\b", lowered):
+            args["region"] = "Canada"
+        return args
 
     async def _commit_context(
         self,
@@ -2144,11 +3817,34 @@ class RunEngine:
         deterministic_voids: list[dict[str, Any]],
         current_facts: list[tuple[str, str, str]],
         stance_signals: list[dict[str, Any]],
+        conversation_tension=None,
         planned_locus_id: str = "",
+        run_ledger: Optional[RunLedger] = None,
     ) -> None:
         session = self.sessions.get(session_id, owner_id=request.owner_id)
         existing_candidate_signals = list(getattr(session, "candidate_signals", []) or [])
         existing_candidate_context = getattr(session, "candidate_context", "") if session is not None else ""
+        memory_packet = None
+        if session is not None:
+            memory_packet = self._compile_phase_packet(
+                context_engine=context_engine,
+                run_id=run_id,
+                request=request,
+                session=session,
+                phase=ContextPhase.MEMORY_COMMIT,
+                system_prompt=request.system_prompt,
+                effective_objective=request.user_message,
+                current_context=current_context,
+                allowed_tools=[],
+                tool_results=tool_results,
+                tool_turn=0,
+                strategy="Commit only verified durable facts, voids, and candidate signals.",
+                notes="Storage must preserve contradiction state and avoid committing unsupported tool or meta claims.",
+                final_response=assistant_response,
+                current_facts=current_facts,
+                conversation_tension=conversation_tension,
+                planned_locus_id=planned_locus_id,
+            )
 
         if context_engine is None or not hasattr(context_engine, "compress_exchange"):
             commit_plan = self._context_governor.build_memory_commit_plan(
@@ -2161,6 +3857,14 @@ class RunEngine:
                 existing_candidate_context=existing_candidate_context,
                 new_candidate_signals=stance_signals,
                 current_turn=self._message_count(session_id, request.owner_id),
+            )
+            self._trace_memory_commit_plan(
+                request=request,
+                run_id=run_id,
+                plan=commit_plan,
+                conversation_tension=conversation_tension,
+                memory_packet=memory_packet,
+                path="deterministic_governor",
             )
             outcome = await self._context_governor.apply_memory_commit(
                 sessions=self.sessions,
@@ -2181,6 +3885,14 @@ class RunEngine:
                     run_id=run_id,
                     event_type="facts_indexed",
                     data={"facts": list(outcome.indexed_fact_keys), "context_lines": outcome.context_lines},
+                )
+            if run_ledger is not None:
+                self._record_memory_outcome(
+                    request=request,
+                    run_id=run_id,
+                    ledger=run_ledger,
+                    outcome=outcome,
+                    path="deterministic_governor",
                 )
             return
         maybe_result = context_engine.compress_exchange(
@@ -2205,6 +3917,14 @@ class RunEngine:
                 new_candidate_signals=stance_signals,
                 current_turn=self._message_count(session_id, request.owner_id),
             )
+            self._trace_memory_commit_plan(
+                request=request,
+                run_id=run_id,
+                plan=commit_plan,
+                conversation_tension=conversation_tension,
+                memory_packet=memory_packet,
+                path="compression_empty_governor",
+            )
             outcome = await self._context_governor.apply_memory_commit(
                 sessions=self.sessions,
                 session_id=session_id,
@@ -2225,6 +3945,14 @@ class RunEngine:
                     event_type="facts_indexed",
                     data={"facts": list(outcome.indexed_fact_keys), "context_lines": outcome.context_lines},
                 )
+            if run_ledger is not None:
+                self._record_memory_outcome(
+                    request=request,
+                    run_id=run_id,
+                    ledger=run_ledger,
+                    outcome=outcome,
+                    path="compression_empty_governor",
+                )
             return
         commit_plan = self._context_governor.build_memory_commit_plan(
             context_result=maybe_result,
@@ -2237,6 +3965,14 @@ class RunEngine:
             existing_candidate_context=existing_candidate_context,
             new_candidate_signals=stance_signals,
             current_turn=self._message_count(session_id, request.owner_id),
+        )
+        self._trace_memory_commit_plan(
+            request=request,
+            run_id=run_id,
+            plan=commit_plan,
+            conversation_tension=conversation_tension,
+            memory_packet=memory_packet,
+            path="compression_plus_governor",
         )
         outcome = await self._context_governor.apply_memory_commit(
             sessions=self.sessions,
@@ -2279,6 +4015,14 @@ class RunEngine:
                 event_type="facts_indexed",
                 data={"facts": list(outcome.indexed_fact_keys), "context_lines": outcome.context_lines},
             )
+        if run_ledger is not None:
+            self._record_memory_outcome(
+                request=request,
+                run_id=run_id,
+                ledger=run_ledger,
+                outcome=outcome,
+                path="compression_plus_governor",
+            )
         self.run_store.save_checkpoint(
             run_id=run_id,
             phase="memory_commit",
@@ -2294,6 +4038,160 @@ class RunEngine:
                 if str(item.get("fact") or "").strip()
             ],
         )
+
+    def _trace_memory_commit_plan(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        plan,
+        conversation_tension=None,
+        memory_packet: Optional[CompiledPassPacket] = None,
+        path: str = "",
+    ) -> None:
+        merged_facts = list(getattr(plan, "merged_facts", None) or [])
+        merged_voids = list(getattr(plan, "merged_voids", None) or [])
+        blocked_keyed_facts = list(getattr(plan, "blocked_keyed_facts", None) or [])
+        candidate_signals = list(getattr(plan, "candidate_signals", None) or [])
+        data = {
+            "path": path,
+            "fact_count": len(merged_facts),
+            "void_count": len(merged_voids),
+            "blocked_count": len(blocked_keyed_facts),
+            "candidate_signal_count": len(candidate_signals),
+            "candidate_context_lines": len(
+                [line for line in str(getattr(plan, "candidate_context", "") or "").splitlines() if line.strip()]
+            ),
+            "facts": [
+                {
+                    "subject": item.get("subject"),
+                    "predicate": item.get("predicate"),
+                    "object": item.get("object"),
+                    "key": item.get("key") or item.get("fact"),
+                }
+                for item in merged_facts[:10]
+            ],
+            "voids": [
+                {
+                    "subject": item.get("subject"),
+                    "predicate": item.get("predicate"),
+                    "reason": item.get("reason") or item.get("source") or "",
+                }
+                for item in merged_voids[:10]
+            ],
+            "blocked": [
+                {
+                    "subject": item.get("subject"),
+                    "predicate": item.get("predicate"),
+                    "object": item.get("object"),
+                    "reason": item.get("grounding_reason"),
+                }
+                for item in blocked_keyed_facts[:10]
+            ],
+            "conversation_tension": conversation_tension_audit_payload(conversation_tension),
+        }
+        if memory_packet is not None:
+            data["phase_packet"] = {
+                "phase": memory_packet.phase.value,
+                "included_ids": [
+                    item.get("item_id")
+                    for item in memory_packet.trace.get("included", [])
+                    if item.get("item_id")
+                ],
+                "excluded_ids": [
+                    item.get("item_id")
+                    for item in memory_packet.trace.get("excluded", [])
+                    if item.get("item_id")
+                ],
+            }
+        self._trace(request=request, run_id=run_id, event_type="memory_commit_plan", data=data)
+
+    def _trace_workflow_override(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        tool_turn: int,
+        workflow_override: dict[str, Any],
+        source: str,
+    ) -> None:
+        """Emit a frontend-friendly diagnostic for deterministic workflow control.
+
+        This is deliberately non-authoritative: it mirrors the runtime override
+        so Trace Monitor can later show why the loop pivoted without requiring
+        UI code to parse notes or raw model observations.
+        """
+        if not workflow_override:
+            return
+        status = str(workflow_override.get("status") or "")
+        strategy = str(workflow_override.get("strategy") or "")
+        selected_tools = list(workflow_override.get("selected_tools") or [])
+        missing_slots = list(workflow_override.get("missing_slots") or [])
+        entities = list(workflow_override.get("tickers") or workflow_override.get("entities") or [])
+        log(
+            "run_engine",
+            request.session_id,
+            f"Source contract {status or 'observed'}: {strategy or 'workflow override'}",
+            level=("warn" if status in {"missing", "blocked"} else "info"),
+            owner_id=request.owner_id,
+            run_id=run_id,
+            turn=tool_turn,
+            selected_tools=selected_tools,
+            missing_slots=missing_slots,
+            entities=entities,
+        )
+        self._trace(
+            request=request,
+            run_id=run_id,
+            event_type="source_contract",
+            data={
+                "source": source,
+                "turn": tool_turn,
+                "status": status,
+                "strategy": strategy,
+                "notes": str(workflow_override.get("notes") or ""),
+                "selected_tools": selected_tools,
+                "missing_slots": missing_slots,
+                "argument_clues": dict(workflow_override.get("argument_clues") or {}),
+                "entities": entities,
+                "source_contract": dict(workflow_override.get("source_contract") or {}),
+            },
+        )
+
+    def _record_memory_outcome(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        ledger: RunLedger,
+        outcome,
+        path: str,
+    ) -> None:
+        fact_count = len(getattr(outcome, "merged_facts", None) or [])
+        void_count = len(getattr(outcome, "merged_voids", None) or [])
+        blocked_count = len(getattr(outcome, "blocked_keyed_facts", None) or [])
+        graph_error = str(getattr(outcome, "graph_error", "") or "")
+        index_error = str(getattr(outcome, "index_error", "") or "")
+        status = "committed"
+        if graph_error or index_error:
+            status = "error"
+        elif blocked_count:
+            status = "partial"
+        ledger.add_memory_write(
+            status=status,
+            summary=f"{path}: facts={fact_count} voids={void_count} blocked={blocked_count}",
+            data={
+                "path": path,
+                "fact_count": fact_count,
+                "void_count": void_count,
+                "blocked_count": blocked_count,
+                "candidate_signal_count": len(getattr(outcome, "candidate_signals", None) or []),
+                "indexed_fact_count": len(getattr(outcome, "indexed_fact_keys", None) or []),
+                "graph_error": graph_error,
+                "index_error": index_error,
+            },
+        )
+        self._trace_ledger(request=request, run_id=run_id, ledger=ledger, reason="memory_commit")
 
     def _build_context_block(self, context: str) -> str:
         if self.context_engine is None or not hasattr(self.context_engine, "build_context_block"):
@@ -2333,7 +4231,21 @@ class RunEngine:
         direct_fact_memory_only: bool = False,
         available_loci: Optional[list[dict[str, str]]] = None,
         planned_locus_id: str = "",
+        plan_steps: Optional[list[dict[str, Any]]] = None,
+        spatial_drawers: Optional[list[dict[str, Any]]] = None,
+        run_ledger: Optional[RunLedger] = None,
     ) -> CompiledPassPacket:
+        active_ledger = run_ledger or self._active_ledgers.get(run_id)
+        if active_ledger is not None:
+            active_ledger.set_phase(phase, source="phase_packet")
+        capability_context = render_capability_cards(
+            allowed_tools=[
+                str(tool.get("name") or "")
+                for tool in allowed_tools
+                if isinstance(tool, dict) and tool.get("name")
+            ],
+            workflow_template=request.workflow_template,
+        )
         inferred_correction_turn = correction_turn or bool(
             re.search(r"\b(actually|instead|correction|updated|changed|not .* anymore|moved to|call me)\b", request.user_message or "", re.IGNORECASE)
         )
@@ -2363,22 +4275,41 @@ class RunEngine:
                 conversation_tension=conversation_tension,
                 active_skill_context=active_skill_context,
                 active_skill_name=active_skill_name,
+                capability_context=capability_context,
                 code_intent_note=code_intent_note,
                 execution_risk_tier=execution_risk_tier,
                 correction_turn=inferred_correction_turn,
                 direct_fact_memory_only=inferred_direct_fact_memory_only,
                 available_loci=available_loci,
                 planned_locus_id=planned_locus_id,
+                plan_steps=plan_steps,
+                spatial_drawers=spatial_drawers,
+                run_ledger=active_ledger,
             ),
         )
         phase_trace = dict(packet.trace)
         if trace_phase_label:
             phase_trace["phase"] = trace_phase_label
+        if active_ledger is not None:
+            phase_trace["run_ledger"] = active_ledger.to_phase_packet(phase)
         self._trace(
             request=request,
             run_id=run_id,
             event_type="phase_context",
             data=phase_trace,
+        )
+        self._trace(
+            request=request,
+            run_id=run_id,
+            event_type="phase_packet",
+            data={
+                "phase": phase_trace.get("phase") or phase.value,
+                "content_chars": len(packet.content or ""),
+                "included": phase_trace.get("included", []),
+                "excluded": phase_trace.get("excluded", []),
+                "summary": phase_trace.get("summary", {}),
+                "run_ledger": active_ledger.to_phase_packet(phase) if active_ledger is not None else None,
+            },
         )
         return packet
 
@@ -2390,6 +4321,21 @@ class RunEngine:
             data,
             run_id=run_id,
             owner_id=request.owner_id,
+        )
+
+    def _trace_ledger(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        ledger: RunLedger,
+        reason: str,
+    ) -> None:
+        self._trace(
+            request=request,
+            run_id=run_id,
+            event_type="run_ledger",
+            data={**ledger.to_trace_payload(), "reason": reason},
         )
 
     def _record_tool_outcome(

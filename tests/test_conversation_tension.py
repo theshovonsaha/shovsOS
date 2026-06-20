@@ -21,6 +21,8 @@ def test_analyze_conversation_tension_detects_conflicting_fact_updates():
     assert tension.challenge_level in {"medium", "high"}
     assert tension.conflicting_facts[0]["previous"] == "Toronto"
     assert tension.conflicting_facts[0]["current"] == "Berlin"
+    assert tension.resolution_policy == "do_not_present_both_as_current"
+    assert tension.storage_action == "store_current_with_conflict_trace"
 
 
 def test_render_conversation_tension_includes_drift_lines():
@@ -41,6 +43,8 @@ def test_render_conversation_tension_includes_drift_lines():
 
     assert "Challenge Level:" in rendered
     assert "Should Challenge: yes" in rendered
+    assert "Resolution Policy: latest_explicit_correction_wins" in rendered
+    assert "Storage Impact: void_previous_store_current" in rendered
     assert "Drift:" in rendered
 
 

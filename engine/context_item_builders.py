@@ -42,6 +42,7 @@ CONVERSATION_TENSION_PHASES = frozenset({
     ContextPhase.PLANNING,
     ContextPhase.ACTING,
     ContextPhase.RESPONSE,
+    ContextPhase.MEMORY_COMMIT,
     ContextPhase.VERIFICATION,
 })
 

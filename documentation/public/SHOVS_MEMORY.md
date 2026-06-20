@@ -1,12 +1,15 @@
 # shovs-memory
 
 `shovs-memory` is the deterministic fact + correction layer extracted from the
-Shovs runtime, packaged for use inside other agent loops.
+Shovs runtime. It is the smallest part of Shovs that can be used on its own.
 
 It is not a general-purpose agent memory system. It is a narrow guarantee:
-explicit user statements get extracted by rule (not by LLM judgment), older
-facts get voided when new ones supersede them, and unverified guesses are
-quarantined as "candidates" instead of graduating into trusted state.
+explicit user statements get extracted by rule, older facts get voided when
+new ones supersede them, and unverified guesses are quarantined as candidates
+instead of graduating into trusted state.
+
+In simple terms: it remembers what the user clearly said, invalidates stale
+facts when corrected, and keeps guesses out of trusted memory.
 
 ## Honest positioning vs mempalace
 
@@ -25,6 +28,7 @@ exposes only what the Shovs runtime needs to keep facts honest:
 | Fact extraction | LLM judgment | rule-based, predicate-typed |
 | Corrections | newer notes coexist with older | older facts voided as state transitions |
 | Candidate vs trusted | not a primitive | first-class lane |
+| Conflict inspection | not the core surface | conflict/dispute traces exposed |
 | Portability | agent-framework agnostic | wraps Shovs `SessionManager` + `SemanticGraph` |
 
 If you want a memory system that *guesses well*, mempalace is the better
@@ -53,6 +57,12 @@ Three things that are not common in markdown-log or vector-only memory layers:
    inspector view surfaces both lanes separately so you can see what the
    system *believes* vs what it has merely *heard*.
 
+4. **Conflict and dispute visibility.** When fresh evidence disputes a stored
+   fact, the inspector can surface that conflict instead of hiding it in a log.
+   This is the practical proof of the Fact Guard idea: trusted facts,
+   superseded facts, disputed candidates, and conflict traces can be inspected
+   separately.
+
 ## Install
 
 ```bash
@@ -77,7 +87,7 @@ memory.apply_user_message("Actually, I moved to Berlin.", turn=2)
 
 facts = memory.current_facts()       # [(User, preferred_name, Shovon), (User, location, Berlin)]
 timeline = memory.fact_timeline()    # current + superseded, ordered by turn
-inspection = memory.inspect()        # trusted + candidates + decision signals
+inspection = memory.inspect()        # trusted + candidates + conflict/dispute lanes
 ```
 
 ## API surface
@@ -93,8 +103,8 @@ inspection = memory.inspect()        # trusted + candidates + decision signals
 - `current_facts()` — only live, non-superseded facts.
 - `fact_timeline()` — full lineage including superseded entries.
 - `inspect()` — structured view: trusted facts, superseded facts, candidate
-  signals, context preview, and recent memory decision signals when running
-  inside the full Shovs runtime.
+  signals, conflict/dispute traces, context preview, and recent memory decision
+  signals when running inside the full Shovs runtime.
 
 ## Honest limits
 
@@ -112,6 +122,10 @@ inspection = memory.inspect()        # trusted + candidates + decision signals
   intentionally outside its scope.
 - **English-language extractor patterns.** Other languages will fall through
   to the candidate lane rather than producing structured facts.
+- **Explicit graph dependency is preferred.** In custom deployments, pass the
+  graph/session dependencies you want to inspect. Silent default database
+  creation can make memory look empty if two processes use different working
+  directories.
 
 ## When to pick this
 

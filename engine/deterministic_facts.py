@@ -138,8 +138,12 @@ _FOLLOWUP_DIRECTIVE_PATTERNS = [
     re.compile(r"\bremind me to\s+(?P<value>[^.!?\n]+)", re.IGNORECASE),
 ]
 _CLEAR_EDITOR_PATTERNS = [
+    # Direct revocation verbs — extended per Slice 3 to match the convergence
+    # plan vocabulary ("forget my X", "void the X", "ignore what I said about X")
+    # in addition to the original clear/remove/delete forms.
     re.compile(
-        r"\b(?:clear|remove|delete)\s+(?:my\s+)?(?:editor|editor preference|preferred editor)\b",
+        r"\b(?:clear|remove|delete|forget|void|ignore)\s+(?:what\s+I\s+said\s+about\s+)?(?:my\s+|the\s+)?"
+        r"(?:editor|editor preference|preferred editor)\b",
         re.IGNORECASE,
     ),
     re.compile(

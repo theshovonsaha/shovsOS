@@ -37,6 +37,8 @@ class VectorEngine:
         self.embedding_timeout = float(getattr(cfg, "EMBEDDING_HTTP_TIMEOUT", 20.0))
         self.embedding_retries = max(0, int(getattr(cfg, "EMBEDDING_HTTP_RETRIES", 2)))
         self.embedding_cache_size = max(64, int(getattr(cfg, "EMBEDDING_CACHE_SIZE", 512)))
+        self._embed_available: bool = True
+        self._embed_failure_count: int = 0
         chroma_path = getattr(cfg, "CHROMA_DB_PATH", DB_PATH) or DB_PATH
         self.client = self._get_chroma_client(chroma_path)
         self._ensure_collection()
@@ -163,7 +165,28 @@ class VectorEngine:
         base_url = (getattr(cfg, "OLLAMA_BASE_URL", "") or OLLAMA_BASE).rstrip("/")
         return "ollama", base_url, "/api/embed", headers, payload
 
+    def _record_embedding_failure(self, exc: Exception) -> List[float]:
+        self._embed_failure_count += 1
+        if self._embed_failure_count >= 2:
+            if self._embed_available:
+                print(f"[VectorEngine] Embedding disabled after repeated failures: {exc}")
+            self._embed_available = False
+        elif self._embed_failure_count == 1:
+            print(f"[VectorEngine] Embedding failed: {exc}")
+        return []
+
     async def _get_embedding(self, text: str) -> List[float]:
+        if not self._embed_available:
+            return []
+        try:
+            embedding = await self._get_embedding_uncached(text)
+            self._embed_failure_count = 0
+            self._embed_available = True
+            return embedding
+        except Exception as exc:
+            return self._record_embedding_failure(exc)
+
+    async def _get_embedding_uncached(self, text: str) -> List[float]:
         normalized = self._normalize_text(text)
         cache_key = f"{self.model}::{normalized}"
         cached = self._cache_get(cache_key)
@@ -221,6 +244,8 @@ class VectorEngine:
     async def index(self, key: str, anchor: str, metadata: Optional[dict] = None):
         doc_id = self._generate_id(key, anchor)
         embedding = await self._get_embedding(key)
+        if not embedding:
+            return
         meta = metadata or {}
         meta["key"] = key
         meta["anchor"] = anchor
@@ -245,6 +270,8 @@ class VectorEngine:
 
     async def query(self, text: str, limit: int = 3) -> List[dict]:
         embedding = await self._get_embedding(text)
+        if not embedding:
+            return []
         results = self.collection.query(query_embeddings=[embedding], n_results=limit)
         parsed = []
         if not results or not results["ids"]: return parsed

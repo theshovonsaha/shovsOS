@@ -5,6 +5,7 @@ from engine.context_engine_v2 import ContextEngineV2
 from engine.context_engine_v3 import ContextEngineV3
 from engine.context_memory_items import build_context_engine_memory_items
 from engine.context_governor import ContextGovernor
+from memory.semantic_graph import SemanticGraph
 
 
 def test_context_governor_resolves_policy_modes_and_bootstraps_v1():
@@ -136,3 +137,43 @@ def test_context_memory_items_prefers_governor_rendering_over_engine_local_items
     pattern_item = next(item for item in items if item.item_id == "context_governor_pattern_cues")
     assert "Goal convergence" in pattern_item.content
     assert "Memory profile" in pattern_item.content
+
+
+def test_context_governor_injects_exact_policy_preference_lane(tmp_path):
+    graph = SemanticGraph(db_path=str(tmp_path / "memory_graph.db"))
+    owner_id = "owner-exact"
+    session = type("Session", (), {"id": "session-exact", "owner_id": owner_id, "candidate_signals": [], "candidate_context": ""})()
+    graph.add_temporal_fact(
+        session.id,
+        "Task",
+        "budget_limit",
+        "under $150",
+        turn=1,
+        owner_id=owner_id,
+        memory_type="policy",
+    )
+    graph.add_temporal_fact(
+        session.id,
+        "User",
+        "preferred_editor",
+        "VS Code",
+        turn=1,
+        owner_id=owner_id,
+        memory_type="preference",
+    )
+    governor = ContextGovernor(adapter=MagicMock(), v1_engine=None, semantic_graph=graph)
+
+    surface = governor.build_memory_surface(
+        engine=None,
+        session=session,
+        context="",
+        trace_prefix="memory:test",
+    )
+
+    exact = next(item for item in surface.memory_items if item.item_id == "context_governor_exact_memory")
+    assert "Exact memory lane" in exact.content
+    assert "Policy:" in exact.content
+    assert "Task budget_limit: under $150" in exact.content
+    assert "Preference:" in exact.content
+    assert "User preferred_editor: VS Code" in exact.content
+    assert exact.provenance["memory_types"] == ["policy", "preference"]

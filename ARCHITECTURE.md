@@ -11,8 +11,8 @@ Shovs is organized as a human control center over an autonomous agent body.
 
 2. Autonomous agent body:
 
-- runtime execution (`run_engine`)
-- orchestration, tools, memory, traces, checkpoints, and evals
+- managed runtime execution (`run_engine`)
+- run ledger, orchestration, tools, memory, traces, checkpoints, artifacts, and evals
 
 3. Shared substrate:
 
@@ -31,7 +31,7 @@ Canonical execution center:
 Convergence objective (active):
 
 - one canonical runtime contract
-- one pass ledger model
+- one run ledger model
 - one tool-calling contract
 - one memory-commit policy
 - one frontend-visible execution story
@@ -43,7 +43,8 @@ Convergence objective (active):
   frontend_shovs || frontend_consumer
     --> {/chat/stream || /consumer/chat/stream}
       --> {RunEngine}
-        --> plan -> act -> observe -> verify -> commit
+        --> run ledger
+        --> plan -> act -> observe -> verify -> memory_commit
         --> ToolRegistry
         --> SessionManager
         --> RunStore + TraceStore
@@ -65,7 +66,16 @@ Convergence objective (active):
 - trace events
 - run checkpoints
 - pass records
+- artifacts
+- evals
 - memory inspector payloads
+
+3. Correctness surfaces:
+
+- tool call/result linking
+- side-effect verification
+- response verification
+- scenario-state evals for workflows where the path matters
 
 ## Design Principles
 
@@ -73,7 +83,8 @@ Convergence objective (active):
 2. Explicit phases over opaque loops.
 3. Deterministic state transitions where possible.
 4. Human-readable logs for all critical decisions.
-5. Backward compatibility during convergence, then controlled deprecation.
+5. Scenario evals over final-answer vibes.
+6. Backward compatibility during convergence, then controlled deprecation.
 
 ## Key References
 

@@ -91,6 +91,11 @@ def _drain_thought_buffer(
                 buffer = buffer[idx + len(_THINK_CLOSE):]
                 in_thought = False
                 continue
+            if "<" not in buffer:
+                if buffer:
+                    chunks.append(buffer)
+                    buffer = ""
+                break
             if len(buffer) > _TAG_HOLDBACK:
                 chunks.append(buffer[:-_TAG_HOLDBACK])
                 buffer = buffer[-_TAG_HOLDBACK:]
@@ -107,6 +112,11 @@ def _drain_thought_buffer(
                 buffer = buffer[idx + len(_THINK_OPEN):]
                 in_thought = True
                 continue
+            if "<" not in buffer:
+                if buffer:
+                    chunks.append(buffer)
+                    buffer = ""
+                break
             if len(buffer) > _TAG_HOLDBACK:
                 chunks.append(buffer[:-_TAG_HOLDBACK])
                 buffer = buffer[-_TAG_HOLDBACK:]
@@ -206,10 +216,13 @@ class OllamaAdapter(BaseLLMAdapter):
         max_tokens: Optional[int] = None,
         images: Optional[list[str]] = None,
         tools: Optional[list[dict]] = None,
+        reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> str:
         """Non-streaming completion with retry. Returns full response string."""
         payload = await self._build_payload(
-            model, messages, temperature, max_tokens, stream=False, images=images, tools=tools
+            model, messages, temperature, max_tokens, stream=False,
+            images=images, tools=tools, reasoning_enabled=reasoning_enabled,
         )
         client = self._get_client()
         last_err: Exception = RuntimeError("no attempts made")
@@ -269,6 +282,7 @@ class OllamaAdapter(BaseLLMAdapter):
         tools: Optional[list[dict]] = None,
         interrupt_check: Optional[object] = None,
         reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> AsyncIterator[str]:
         """Streaming completion with reasoning extraction.
 

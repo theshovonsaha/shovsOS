@@ -65,11 +65,27 @@ type SessionMemoryState = {
 
 type Message = { id: number; role: 'user' | 'assistant'; content: string };
 
+type ActivityStatus =
+  | 'info'
+  | 'success'
+  | 'warning'
+  | 'error'
+  | 'blocked'
+  | 'retrying';
+
 type ActivityItem = {
   id: number;
   label: string;
   detail?: string;
   expanded: boolean;
+  timestamp: string;
+  phase?: Phase;
+  source: string;
+  action: string;
+  status: ActivityStatus;
+  summary: string;
+  related?: string[];
+  raw?: unknown;
 };
 
 type SessionHistoryItem = {
@@ -94,6 +110,73 @@ const fmtBytes = (b: number) => {
   }
   return `${v.toFixed(v >= 100 ? 0 : 1)} ${u[i]}`;
 };
+
+const fmtTime = (iso: string) =>
+  new Date(iso).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+
+const normalizeStatus = (label: string): ActivityStatus => {
+  const lower = label.toLowerCase();
+  if (lower.includes('error') || lower.includes('failed')) return 'error';
+  if (lower.includes('warn') || lower.includes('verification')) return 'warning';
+  if (lower.includes('redraft') || lower.includes('retry')) return 'retrying';
+  if (lower.includes('blocked')) return 'blocked';
+  if (lower.includes('done') || lower.includes('complete')) return 'success';
+  return 'info';
+};
+
+const inferSource = (label: string, raw?: unknown) => {
+  if (
+    raw &&
+    typeof raw === 'object' &&
+    'type' in raw &&
+    typeof raw.type === 'string'
+  ) {
+    if (raw.type.includes('verification')) return 'verifier';
+    if (raw.type === 'plan') return 'planner';
+    if (raw.type === 'redraft') return 'verifier';
+    if (raw.type === 'tension') return 'context';
+    if (raw.type.includes('activity')) return 'runtime';
+  }
+  const lower = label.toLowerCase();
+  if (lower.includes('strategy')) return 'planner';
+  if (lower.includes('verification') || lower.includes('redraft'))
+    return 'verifier';
+  if (lower.includes('reasoning')) return 'model';
+  if (lower.includes('memory')) return 'memory';
+  if (lower.includes('tool')) return 'tool';
+  return 'runtime';
+};
+
+const inferAction = (label: string, raw?: unknown) => {
+  if (
+    raw &&
+    typeof raw === 'object' &&
+    'type' in raw &&
+    typeof raw.type === 'string'
+  ) {
+    return raw.type.replace(/_/g, ' ');
+  }
+  return label.split(':')[0].replace(/[↻⚠]/g, '').trim() || 'event';
+};
+
+const makeActivity = (
+  label: string,
+  opts: Partial<Omit<ActivityItem, 'id' | 'label' | 'expanded'>> = {},
+): ActivityItem => ({
+  id: uid(),
+  label,
+  expanded: false,
+  timestamp: new Date().toISOString(),
+  source: opts.source ?? inferSource(label, opts.raw),
+  action: opts.action ?? inferAction(label, opts.raw),
+  status: opts.status ?? normalizeStatus(label),
+  summary: opts.summary ?? label,
+  ...opts,
+});
 
 // Strip <THOUGHT>...</THOUGHT> spans from the streaming token feed.
 // The adapter wraps thinking-model reasoning in these markers so it doesn't
@@ -160,6 +243,10 @@ export default function App() {
   const [activityShort, setActivityShort] = useState('');
   const [activities, setActivities] = useState<ActivityItem[]>([]);
   const [showMore, setShowMore] = useState(false);
+  const [traceOpen, setTraceOpen] = useState(false);
+  const [selectedActivity, setSelectedActivity] = useState<ActivityItem | null>(
+    null,
+  );
 
   // Input
   const [text, setText] = useState('');
@@ -309,6 +396,19 @@ export default function App() {
             if (ev.type === 'session') setSessionId(ev.session_id);
             if (ev.type === 'phase') {
               setPhase(ev.phase);
+              setActivities((prev) =>
+                [
+                  makeActivity(`Phase: ${ev.phase}`, {
+                    phase: ev.phase,
+                    source: 'runtime',
+                    action: 'phase',
+                    status: ev.phase === 'finalizing' ? 'success' : 'info',
+                    summary: `Runtime entered ${ev.phase}.`,
+                    raw: ev,
+                  }),
+                  ...prev,
+                ].slice(0, 40),
+              );
               setActivityShort(
                 {
                   thinking: 'Thinking…',
@@ -321,14 +421,14 @@ export default function App() {
             if (ev.type === 'activity_detail') {
               setActivities((prev) =>
                 [
-                  {
-                    id: uid(),
-                    label: ev.text,
+                  makeActivity(ev.text, {
                     detail: ev.detail,
-                    expanded: false,
-                  },
+                    phase,
+                    summary: ev.text,
+                    raw: ev,
+                  }),
                   ...prev,
-                ].slice(0, 20),
+                ].slice(0, 40),
               );
             }
             if (ev.type === 'token') {
@@ -344,14 +444,18 @@ export default function App() {
               setStrategy(ev.strategy);
               setActivities((prev) =>
                 [
-                  {
-                    id: uid(),
-                    label: `Strategy: ${ev.strategy}`,
+                  makeActivity(`Strategy: ${ev.strategy}`, {
                     detail: ev.tools.join(', '),
-                    expanded: false,
-                  },
+                    phase: 'thinking',
+                    source: 'planner',
+                    action: 'plan',
+                    status: ev.confidence >= 0.65 ? 'success' : 'warning',
+                    summary: `Planner selected ${ev.tools.length || 0} tool path${ev.tools.length === 1 ? '' : 's'} with ${Math.round(ev.confidence * 100)}% confidence.`,
+                    related: ev.tools,
+                    raw: ev,
+                  }),
                   ...prev,
-                ].slice(0, 20),
+                ].slice(0, 40),
               );
             }
             if (ev.type === 'redraft') {
@@ -361,44 +465,68 @@ export default function App() {
               setStreaming('');
               setActivities((prev) =>
                 [
-                  {
-                    id: uid(),
-                    label: '↻ Redrafting (verification failed)',
+                  makeActivity('Redrafting after verification', {
                     detail: (ev.issues || []).join('\n'),
-                    expanded: false,
-                  },
+                    phase: 'finalizing',
+                    source: 'verifier',
+                    action: 'redraft',
+                    status: 'retrying',
+                    summary:
+                      ev.reason ||
+                      `${ev.issues?.length || 0} verification issue(s) triggered a redraft.`,
+                    raw: ev,
+                  }),
                   ...prev,
-                ].slice(0, 20),
+                ].slice(0, 40),
               );
             }
             if (ev.type === 'verification_warning') {
               setVerificationIssues(ev.issues);
               setActivities((prev) =>
                 [
-                  {
-                    id: uid(),
-                    label: `⚠ Verification: ${ev.issues[0] || 'issue detected'}`,
-                    expanded: false,
-                  },
+                  makeActivity(
+                    `Verification: ${ev.issues[0] || 'issue detected'}`,
+                    {
+                      detail: (ev.issues || []).join('\n'),
+                      phase: 'finalizing',
+                      source: 'verifier',
+                      action: 'verification',
+                      status: 'warning',
+                      summary: `${ev.issues?.length || 1} issue(s) found at ${Math.round(ev.confidence * 100)}% confidence.`,
+                      raw: ev,
+                    },
+                  ),
                   ...prev,
-                ].slice(0, 20),
+                ].slice(0, 40),
               );
             }
             if (ev.type === 'tension') {
               setActivities((prev) =>
                 [
-                  {
-                    id: uid(),
-                    label: `Tension: ${ev.summary}`,
-                    expanded: false,
-                  },
+                  makeActivity(`Tension: ${ev.summary}`, {
+                    detail: `Challenge level: ${ev.challenge_level}`,
+                    phase,
+                    source: 'context',
+                    action: 'tension',
+                    status:
+                      ev.challenge_level === 'high' ? 'warning' : 'info',
+                    summary: ev.summary,
+                    raw: ev,
+                  }),
                   ...prev,
-                ].slice(0, 20),
+                ].slice(0, 40),
               );
             }
             if (ev.type === 'error') {
               setActivities((prev) => [
-                { id: uid(), label: `Error: ${ev.message}`, expanded: false },
+                makeActivity(`Error: ${ev.message}`, {
+                  phase,
+                  source: 'runtime',
+                  action: 'error',
+                  status: 'error',
+                  summary: ev.message,
+                  raw: ev,
+                }),
                 ...prev,
               ]);
               setIsRunning(false);
@@ -418,14 +546,17 @@ export default function App() {
                 // observability of the model's internal channel.
                 setActivities((prev) =>
                   [
-                    {
-                      id: uid(),
-                      label: 'Reasoning',
+                    makeActivity('Reasoning captured', {
                       detail: thoughtAcc,
-                      expanded: false,
-                    },
+                      phase: 'thinking',
+                      source: 'model',
+                      action: 'reasoning',
+                      status: 'info',
+                      summary:
+                        'Model reasoning was separated from the visible answer.',
+                    }),
                     ...prev,
-                  ].slice(0, 20),
+                  ].slice(0, 40),
                 );
               }
               setIsRunning(false);
@@ -438,7 +569,12 @@ export default function App() {
       } catch (err: unknown) {
         if (err instanceof Error && err.name !== 'AbortError') {
           setActivities((prev) => [
-            { id: uid(), label: 'Connection error', expanded: false },
+            makeActivity('Connection error', {
+              source: 'network',
+              action: 'stream',
+              status: 'error',
+              summary: err.message || 'The response stream could not continue.',
+            }),
             ...prev,
           ]);
         }
@@ -577,50 +713,16 @@ export default function App() {
     );
   }, []);
 
-  // Activity chips — reused in both layouts
-  const ActivityChips = useCallback(
+  // Activity timeline — reused in both layouts
+  const ActivityTimelineView = useCallback(
     () => (
-      <div className='activities'>
-        {activities.slice(0, showMore ? 10 : 3).map((act) => (
-          <motion.div
-            key={act.id}
-            className='act-chip'
-            initial={{ opacity: 0, y: 6, scale: 0.94 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            transition={
-              reduced
-                ? { duration: 0 }
-                : { type: 'spring', stiffness: 400, damping: 36 }
-            }
-            layout
-          >
-            <button
-              className='act-chip-head'
-              onClick={() => act.detail && toggleActivity(act.id)}
-              style={{ cursor: act.detail ? 'pointer' : 'default' }}
-            >
-              <span className='act-dot' />
-              <span className='act-label'>{act.label}</span>
-              {act.detail && (
-                <span className='act-toggle'>{act.expanded ? '−' : '+'}</span>
-              )}
-            </button>
-            <AnimatePresence>
-              {act.expanded && act.detail && (
-                <motion.div
-                  className='act-detail'
-                  initial={{ height: 0, opacity: 0 }}
-                  animate={{ height: 'auto', opacity: 1 }}
-                  exit={{ height: 0, opacity: 0 }}
-                  transition={{ duration: 0.2 }}
-                >
-                  {act.detail}
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </motion.div>
-        ))}
-      </div>
+      <ActivityTimeline
+        activities={activities}
+        limit={showMore ? 10 : 4}
+        reduced={!!reduced}
+        onToggle={toggleActivity}
+        onOpenDetails={setSelectedActivity}
+      />
     ),
     [activities, showMore, reduced, toggleActivity],
   );
@@ -686,6 +788,31 @@ export default function App() {
                 >
                   <circle cx='8' cy='8' r='6.5' />
                   <polyline points='8,4 8,8 11,10' />
+                </svg>
+              </button>
+              <button
+                className={`icon-btn ${traceOpen ? 'active' : ''}`}
+                onClick={() => setTraceOpen((v) => !v)}
+                aria-label='Run trace'
+                title='Run trace'
+                disabled={activities.length === 0}
+              >
+                <svg
+                  width='15'
+                  height='15'
+                  viewBox='0 0 16 16'
+                  fill='none'
+                  stroke='currentColor'
+                  strokeWidth='1.4'
+                  strokeLinecap='round'
+                  strokeLinejoin='round'
+                >
+                  <path d='M3 3.5h10' />
+                  <path d='M3 8h10' />
+                  <path d='M3 12.5h10' />
+                  <circle cx='5' cy='3.5' r='1.2' fill='currentColor' />
+                  <circle cx='10.5' cy='8' r='1.2' fill='currentColor' />
+                  <circle cx='7.5' cy='12.5' r='1.2' fill='currentColor' />
                 </svg>
               </button>
               <button
@@ -765,7 +892,7 @@ export default function App() {
                   exit={{ opacity: 0 }}
                   transition={ease32}
                 >
-                  <ActivityChips />
+                  <ActivityTimelineView />
                 </motion.div>
               )}
             </AnimatePresence>
@@ -890,7 +1017,7 @@ export default function App() {
                           </motion.span>
                         </AnimatePresence>
                       </div>
-                      {activities.length > 0 && <ActivityChips />}
+                      {activities.length > 0 && <ActivityTimelineView />}
                     </motion.div>
                   )}
                 </AnimatePresence>
@@ -915,6 +1042,70 @@ export default function App() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* ── Run trace panel ── */}
+      <AnimatePresence>
+        {traceOpen && (
+          <>
+            <motion.div
+              className='options-scrim'
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              onClick={() => setTraceOpen(false)}
+            />
+            <motion.aside
+              className='trace-panel'
+              initial={{ x: '100%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '100%' }}
+              transition={reduced ? { duration: 0 } : spring}
+            >
+              <div className='opt-head'>
+                <div>
+                  <span className='opt-title'>Run Trace</span>
+                  <div className='trace-subtitle'>
+                    {activities.length} event{activities.length === 1 ? '' : 's'} recorded
+                  </div>
+                </div>
+                <button
+                  className='icon-btn'
+                  onClick={() => setTraceOpen(false)}
+                  aria-label='Close trace'
+                >
+                  <svg
+                    width='13'
+                    height='13'
+                    viewBox='0 0 13 13'
+                    fill='none'
+                    stroke='currentColor'
+                    strokeWidth='1.8'
+                    strokeLinecap='round'
+                  >
+                    <line x1='2' y1='2' x2='11' y2='11' />
+                    <line x1='11' y1='2' x2='2' y2='11' />
+                  </svg>
+                </button>
+              </div>
+              <div className='trace-body'>
+                <ActivityTimeline
+                  activities={activities}
+                  reduced={!!reduced}
+                  onToggle={toggleActivity}
+                  onOpenDetails={setSelectedActivity}
+                  searchable
+                />
+              </div>
+            </motion.aside>
+          </>
+        )}
+      </AnimatePresence>
+
+      <TraceDetailModal
+        activity={selectedActivity}
+        onClose={() => setSelectedActivity(null)}
+      />
 
       {/* ── Session history sidebar ── */}
       <AnimatePresence>
@@ -1274,6 +1465,257 @@ export default function App() {
         )}
       </AnimatePresence>
     </div>
+  );
+}
+
+interface ActivityTimelineProps {
+  activities: ActivityItem[];
+  limit?: number;
+  reduced: boolean;
+  searchable?: boolean;
+  onToggle: (id: number) => void;
+  onOpenDetails: (activity: ActivityItem) => void;
+}
+
+function ActivityTimeline({
+  activities,
+  limit,
+  reduced,
+  searchable = false,
+  onToggle,
+  onOpenDetails,
+}: ActivityTimelineProps) {
+  const [query, setQuery] = useState('');
+  const [status, setStatus] = useState<ActivityStatus | 'all'>('all');
+  const [phaseFilter, setPhaseFilter] = useState<Phase | 'all'>('all');
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return activities
+      .filter((act) => status === 'all' || act.status === status)
+      .filter((act) => phaseFilter === 'all' || act.phase === phaseFilter)
+      .filter((act) => {
+        if (!q) return true;
+        return [
+          act.label,
+          act.summary,
+          act.source,
+          act.action,
+          act.detail,
+          ...(act.related || []),
+        ]
+          .filter(Boolean)
+          .some((value) => String(value).toLowerCase().includes(q));
+      })
+      .slice(0, limit ?? activities.length);
+  }, [activities, limit, phaseFilter, query, status]);
+
+  if (activities.length === 0) {
+    return <div className='trace-empty'>No trace events recorded yet.</div>;
+  }
+
+  return (
+    <div className='trace-timeline'>
+      {searchable && (
+        <div className='trace-filters'>
+          <input
+            className='trace-search'
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder='Search trace'
+            aria-label='Search trace'
+          />
+          <select
+            className='trace-select'
+            value={status}
+            onChange={(e) => setStatus(e.target.value as ActivityStatus | 'all')}
+            aria-label='Filter by status'
+          >
+            <option value='all'>All status</option>
+            <option value='info'>Info</option>
+            <option value='success'>Success</option>
+            <option value='warning'>Warning</option>
+            <option value='error'>Error</option>
+            <option value='retrying'>Retrying</option>
+            <option value='blocked'>Blocked</option>
+          </select>
+          <select
+            className='trace-select'
+            value={phaseFilter}
+            onChange={(e) => setPhaseFilter(e.target.value as Phase | 'all')}
+            aria-label='Filter by phase'
+          >
+            <option value='all'>All phases</option>
+            <option value='thinking'>Thinking</option>
+            <option value='working'>Working</option>
+            <option value='finalizing'>Finalizing</option>
+            <option value='idle'>Idle</option>
+          </select>
+        </div>
+      )}
+
+      {visible.length === 0 ? (
+        <div className='trace-empty'>No events match those filters.</div>
+      ) : (
+        visible.map((act) => (
+          <motion.div
+            key={act.id}
+            className={`trace-row status-${act.status}`}
+            initial={{ opacity: 0, y: 6, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            transition={
+              reduced
+                ? { duration: 0 }
+                : { type: 'spring', stiffness: 400, damping: 36 }
+            }
+            layout
+          >
+            <div className='trace-rail'>
+              <span className='trace-dot' />
+            </div>
+            <div className='trace-card'>
+              <button
+                className='trace-main'
+                onClick={() => (act.detail ? onToggle(act.id) : onOpenDetails(act))}
+              >
+                <span className='trace-time'>{fmtTime(act.timestamp)}</span>
+                <span className={`trace-badge ${act.status}`}>
+                  {act.status}
+                </span>
+                <span className='trace-action'>{act.action}</span>
+                <span className='trace-summary'>{act.summary}</span>
+              </button>
+              <div className='trace-meta'>
+                <span>{act.phase ?? 'not recorded'}</span>
+                <span>{act.source}</span>
+                {act.related?.slice(0, 2).map((item) => (
+                  <span key={item}>{item}</span>
+                ))}
+              </div>
+              <div className='trace-actions'>
+                {act.detail && (
+                  <button className='trace-link' onClick={() => onToggle(act.id)}>
+                    {act.expanded ? 'Hide detail' : 'Expand'}
+                  </button>
+                )}
+                <button
+                  className='trace-link'
+                  onClick={() => onOpenDetails(act)}
+                >
+                  Open details
+                </button>
+                <button
+                  className='trace-link'
+                  onClick={() =>
+                    void navigator.clipboard.writeText(
+                      JSON.stringify(act.raw ?? act, null, 2),
+                    )
+                  }
+                >
+                  Copy JSON
+                </button>
+              </div>
+              <AnimatePresence>
+                {act.expanded && act.detail && (
+                  <motion.pre
+                    className='trace-detail-inline'
+                    initial={{ height: 0, opacity: 0 }}
+                    animate={{ height: 'auto', opacity: 1 }}
+                    exit={{ height: 0, opacity: 0 }}
+                    transition={{ duration: 0.18 }}
+                  >
+                    {act.detail}
+                  </motion.pre>
+                )}
+              </AnimatePresence>
+            </div>
+          </motion.div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function TraceDetailModal({
+  activity,
+  onClose,
+}: {
+  activity: ActivityItem | null;
+  onClose: () => void;
+}) {
+  if (!activity) return null;
+  const raw = activity.raw ?? activity;
+
+  return (
+    <AnimatePresence>
+      <motion.div
+        className='modal-scrim'
+        initial={{ opacity: 0 }}
+        animate={{ opacity: 1 }}
+        exit={{ opacity: 0 }}
+        onClick={onClose}
+      >
+        <motion.div
+          className='trace-modal'
+          initial={{ opacity: 0, y: 16, scale: 0.98 }}
+          animate={{ opacity: 1, y: 0, scale: 1 }}
+          exit={{ opacity: 0, y: 8, scale: 0.98 }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className='trace-modal-head'>
+            <div>
+              <span className={`trace-badge ${activity.status}`}>
+                {activity.status}
+              </span>
+              <h2>{activity.action}</h2>
+              <p>{activity.summary}</p>
+            </div>
+            <button className='icon-btn' onClick={onClose} aria-label='Close'>
+              <svg
+                width='13'
+                height='13'
+                viewBox='0 0 13 13'
+                fill='none'
+                stroke='currentColor'
+                strokeWidth='1.8'
+                strokeLinecap='round'
+              >
+                <line x1='2' y1='2' x2='11' y2='11' />
+                <line x1='11' y1='2' x2='2' y2='11' />
+              </svg>
+            </button>
+          </div>
+          <div className='trace-modal-grid'>
+            <div>
+              <span>time</span>
+              <strong>{fmtTime(activity.timestamp)}</strong>
+            </div>
+            <div>
+              <span>phase</span>
+              <strong>{activity.phase ?? 'not recorded'}</strong>
+            </div>
+            <div>
+              <span>source</span>
+              <strong>{activity.source}</strong>
+            </div>
+            <div>
+              <span>related</span>
+              <strong>{activity.related?.join(', ') || 'not recorded'}</strong>
+            </div>
+          </div>
+          {activity.detail && (
+            <>
+              <div className='trace-modal-label'>Detail</div>
+              <pre className='trace-modal-pre'>{activity.detail}</pre>
+            </>
+          )}
+          <div className='trace-modal-label'>Raw JSON</div>
+          <pre className='trace-modal-pre'>
+            {JSON.stringify(raw, null, 2)}
+          </pre>
+        </motion.div>
+      </motion.div>
+    </AnimatePresence>
   );
 }
 

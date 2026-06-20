@@ -139,3 +139,39 @@ async def test_vector_engine_ollama_embed_endpoint_falls_back_to_legacy_embeddin
     assert embedding == [0.1, 0.2, 0.3]
     assert client.post.await_args_list[0].args[0] == "/api/embed"
     assert client.post.await_args_list[1].args[0] == "/api/embeddings"
+
+
+@pytest.mark.asyncio
+async def test_vector_engine_disables_embedding_after_repeated_failures(capsys):
+    from memory.vector_engine import VectorEngine
+
+    with patch.object(VectorEngine, "_ensure_collection", return_value=None):
+        ve = VectorEngine(session_id="embed_circuit_test", model="nomic-embed-text")
+
+    ve._get_embedding_uncached = AsyncMock(side_effect=RuntimeError("embed 404"))
+
+    assert await ve._get_embedding("first") == []
+    assert await ve._get_embedding("second") == []
+    assert await ve._get_embedding("third") == []
+
+    assert ve._embed_available is False
+    assert ve._get_embedding_uncached.await_count == 2
+    output = capsys.readouterr().out
+    assert output.count("Embedding disabled after repeated failures") == 1
+
+
+@pytest.mark.asyncio
+async def test_semantic_graph_disables_embedding_after_repeated_failures(tmp_path, capsys):
+    from memory.semantic_graph import SemanticGraph
+
+    graph = SemanticGraph(db_path=str(tmp_path / "memory.db"))
+    graph._get_embedding_uncached = AsyncMock(side_effect=RuntimeError("embed 404"))
+
+    assert await graph._get_embedding("first") == []
+    assert await graph._get_embedding("second") == []
+    assert await graph._get_embedding("third") == []
+
+    assert graph._embed_available is False
+    assert graph._get_embedding_uncached.await_count == 2
+    output = capsys.readouterr().out
+    assert output.count("Embedding disabled after repeated failures") == 1

@@ -4,6 +4,7 @@ import { LogPanel } from './LogPanel';
 import { useAgent } from './useAgent';
 import { AgentCapabilitiesView } from './components/AgentCapabilitiesView';
 import { GuardrailConfirmationModal } from './components/GuardrailConfirmationModal';
+import { HarnessLabView } from './components/HarnessLabView';
 import { MemoryWorkspaceView } from './components/MemoryWorkspaceView';
 import { OptionsPanel } from './components/OptionsPanel';
 import { PremiumSelect } from './components/PremiumSelect';
@@ -219,10 +220,13 @@ function App() {
     'none' | 'sessions' | 'options'
   >('none');
   const [workspaceView, setWorkspaceView] = useState<
-    'chat' | 'capabilities' | 'monitor' | 'memory'
+    'chat' | 'capabilities' | 'monitor' | 'memory' | 'harness'
   >(() => {
     const saved = localStorage.getItem('shovs_workspace_view');
-    return saved === 'capabilities' || saved === 'monitor' || saved === 'memory'
+    return saved === 'capabilities' ||
+      saved === 'monitor' ||
+      saved === 'memory' ||
+      saved === 'harness'
       ? saved
       : 'chat';
   });
@@ -477,6 +481,12 @@ function App() {
             Monitor
           </button>
           <button
+            className={workspaceView === 'harness' ? 'active' : ''}
+            onClick={() => setWorkspaceView('harness')}
+          >
+            Harness
+          </button>
+          <button
             className={workspaceView === 'memory' ? 'active' : ''}
             onClick={() => setWorkspaceView('memory')}
           >
@@ -644,6 +654,8 @@ function App() {
               sessionId={agent.currentSessionId}
               memoryState={agent.sessionMemoryState}
             />
+          ) : workspaceView === 'harness' ? (
+            <HarnessLabView />
           ) : (
             <>
               <section

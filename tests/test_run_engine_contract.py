@@ -225,6 +225,11 @@ async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
     assert "tool_result" in event_types
     assert "done" in event_types
     assert "".join(event.get("content", "") for event in events if event["type"] == "token") == "Final answer."
+    streamed_tool_call = next(event for event in events if event["type"] == "tool_call")
+    streamed_tool_result = next(event for event in events if event["type"] == "tool_result")
+    assert streamed_tool_call["tool_call_id"]
+    assert streamed_tool_result["tool_call_id"] == streamed_tool_call["tool_call_id"]
+    assert streamed_tool_result["tool_result_id"]
 
     run_id = next(event["run_id"] for event in events if event["type"] == "session")
     checkpoint = runs.latest_checkpoint(run_id)
@@ -283,20 +288,36 @@ async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
 
     assert any(event["event_type"] == "tool_result" for event in traces.events)
     assert any(event["event_type"] == "tool_call" for event in traces.events)
+    assert any(event["event_type"] == "run_ledger" for event in traces.events)
+    assert any(event["event_type"] == "phase_packet" for event in traces.events)
     tool_result_events = [event for event in traces.events if event["event_type"] == "tool_result"]
     assert any(event["data"].get("status") == "ok" for event in tool_result_events)
+    assert any(event["data"].get("tool_call_id") == streamed_tool_call["tool_call_id"] for event in tool_result_events)
     tool_call_events = [event for event in traces.events if event["event_type"] == "tool_call"]
     assert any(event["data"].get("arguments_summary") for event in tool_call_events)
     assert any(event["data"].get("tool") == "web_search" for event in tool_call_events)
+    assert any(event["data"].get("tool_call_id") == streamed_tool_call["tool_call_id"] for event in tool_call_events)
+    run_ledger_events = [event for event in traces.events if event["event_type"] == "run_ledger"]
+    assert any(event["data"]["summary"]["tool_calls"] >= 1 for event in run_ledger_events)
+    assert any(event["data"]["summary"]["tool_results"] >= 1 for event in run_ledger_events)
+    phase_packet_events = [event for event in traces.events if event["event_type"] == "phase_packet"]
+    assert any(event["data"].get("run_ledger", {}).get("version") == "run-ledger-v1" for event in phase_packet_events)
     assert any(event["event_type"] == "deterministic_fact_extractor" for event in traces.events)
     assert any(event["event_type"] == "conversation_tension" for event in traces.events)
     assert any(event["event_type"] == "phase_context" for event in traces.events)
     assert any(event["event_type"] == "manager_observation" for event in traces.events)
     assert any(event["event_type"] == "verification_result" for event in traces.events)
     assert any(event["event_type"] == "memory_fact_filter" for event in traces.events)
+    memory_commit_plans = [event for event in traces.events if event["event_type"] == "memory_commit_plan"]
+    assert memory_commit_plans
+    assert memory_commit_plans[-1]["data"]["conversation_tension"]["dynamic"] is True
+    assert memory_commit_plans[-1]["data"]["conversation_tension"]["storage_action"] == "void_previous_store_current"
+    assert "conversation_tension" in memory_commit_plans[-1]["data"]["phase_packet"]["included_ids"]
+    assert "meta_context" in memory_commit_plans[-1]["data"]["phase_packet"]["excluded_ids"]
     compiled_events = [event for event in traces.events if event["event_type"] == "compiled_context"]
     phase_context_events = [event for event in traces.events if event["event_type"] == "phase_context"]
     assert phase_context_events
+    assert any(event["data"].get("phase") == "memory_commit" for event in phase_context_events)
     assert not compiled_events
     assert all(event["data"].get("trace_scope") == "phase_packet" for event in phase_context_events)
     assert all(event["data"].get("canonical_event") == "phase_context" for event in phase_context_events)
@@ -464,6 +485,233 @@ async def test_run_engine_blocks_memory_commit_on_unsupported_verification(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_run_engine_persists_continuation_state_on_needs_replan(tmp_path):
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(
+        return_value='{"tool_calls": [{"function": {"name": "web_search", "arguments": "{\\"query\\": \\\"example pricing\\\"}"}}]}'
+    )
+    adapter.stream = MagicMock(return_value=AsyncIter(["I do not have the pricing page yet."]))
+
+    orchestrator = MagicMock()
+    orchestrator.plan_with_context = AsyncMock(
+        return_value={
+            "strategy": "Search first, then fetch pricing.",
+            "tools": [{"name": "web_search", "priority": "high", "reason": "Need first lead."}],
+            "plan_steps": [
+                {"id": "step_1", "description": "Search for pricing page", "tool": "web_search", "status": "pending"},
+                {"id": "step_2", "description": "Fetch first-party pricing page", "tool": "web_fetch", "status": "pending"},
+            ],
+            "confidence": 0.9,
+        }
+    )
+    orchestrator.observe_with_context = AsyncMock(
+        return_value={
+            "status": "finalize",
+            "strategy": "Search was not enough.",
+            "tools": [],
+            "notes": "Need pricing page before final answer.",
+            "confidence": 0.7,
+        }
+    )
+    orchestrator.verify_with_context = AsyncMock(
+        return_value={
+            "supported": False,
+            "verdict": "needs_replan",
+            "target_state": "gather",
+            "missing_evidence": ["first-party pricing page"],
+            "issues": ["Pricing page was not fetched."],
+            "confidence": 0.2,
+        }
+    )
+
+    registry = ToolRegistry()
+
+    async def web_search(query: str, **kwargs):
+        return {"type": "web_search_results", "results": [{"title": "Pricing", "url": "https://example.com/pricing"}], "query": query}
+
+    registry.register(
+        Tool(
+            name="web_search",
+            description="Search the web.",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            handler=web_search,
+            response_format="json",
+        )
+    )
+    registry.register(
+        Tool(
+            name="web_fetch",
+            description="Fetch a URL.",
+            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            handler=AsyncMock(return_value='{"type":"web_fetch_result","content":"pricing"}'),
+            response_format="json",
+        )
+    )
+
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=FakeTraceStore(),
+        orchestrator=orchestrator,
+        context_engine=MagicMock(compress_exchange=AsyncMock(return_value=("ctx", [], []))),
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="run-engine-needs-replan",
+                owner_id="owner-run-engine",
+                agent_id="default",
+                user_message="Research example.com pricing.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_search", "web_fetch"),
+                use_planner=True,
+                max_tool_calls=1,
+            )
+        )
+    ]
+
+    assert any(event["type"] == "replan_recommended" for event in events)
+    session = sessions.get("run-engine-needs-replan", owner_id="owner-run-engine")
+    assert session is not None
+    assert session.continuation_state["reason"] == "verification_needs_replan"
+    assert session.continuation_state["target_state"] == "gather"
+    assert "first-party pricing page" in session.continuation_state["missing_slots"]
+    assert session.continuation_state["pending_steps"]
+
+
+@pytest.mark.asyncio
+async def test_scripted_model_resume_run_uses_continuation_state_across_phases(tmp_path):
+    from orchestration.orchestrator import AgenticOrchestrator
+
+    class ScriptedModel:
+        def __init__(self):
+            self.complete_prompts = []
+            self.stream_prompts = []
+
+        async def complete(self, *, messages, **kwargs):
+            joined = "\n\n".join(str(item.get("content") or "") for item in messages)
+            self.complete_prompts.append(joined)
+            if "[Shovs Orchestrator]" in joined:
+                assert "Continuation State" in joined
+                assert "https://example.com/pricing" in joined
+                return (
+                    '{"strategy":"Resume by fetching the pricing page.",'
+                    '"tools":[{"name":"web_fetch","priority":"high","reason":"Continuation requires exact pricing evidence.","target_argument_clue":"https://example.com/pricing"}],'
+                    '"plan_steps":[{"id":"step_1","description":"Fetch exact pricing page","tool":"web_fetch","status":"pending","risk":"read_only"}],'
+                    '"risk_tier":"read_only","confidence":0.95}'
+                )
+            if "You are the Shovs Run Engine actor" in joined:
+                assert "Continuation State" in joined
+                assert "Planner argument hints" in joined
+                return '{"tool_calls":[{"function":{"name":"web_fetch","arguments":"{\\"url\\":\\"https://example.com/pricing\\"}"}}]}'
+            if "[Shovs Verification Layer]" in joined:
+                assert "Example pricing page" in joined
+                return '{"supported":true,"verdict":"supported","issues":[],"confidence":0.98}'
+            return "{}"
+
+        async def stream(self, *, messages, **kwargs):
+            self.stream_prompts.append("\n\n".join(str(item.get("content") or "") for item in messages))
+            yield "The pricing page shows the Starter plan is $10/month."
+
+    adapter = ScriptedModel()
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    session = sessions.create(
+        model="llama3.2",
+        system_prompt="You are Shovs.",
+        agent_id="default",
+        session_id="scripted-resume",
+        owner_id="owner-run-engine",
+    )
+    sessions.update_continuation_state(
+        session.id,
+        {
+            "reason": "verification_needs_replan",
+            "objective": "Research example.com pricing.",
+            "next_action": "Fetch https://example.com/pricing",
+            "pending_steps": [
+                {"id": "step_1", "description": "Fetch exact pricing page", "tool": "web_fetch", "status": "pending"}
+            ],
+            "missing_slots": ["first-party pricing page"],
+            "evidence_summary": ["- web_search [ok]: Found https://example.com/pricing"],
+        },
+        owner_id="owner-run-engine",
+    )
+
+    registry = ToolRegistry()
+
+    async def web_fetch(url: str, **kwargs):
+        return {
+            "type": "web_fetch_result",
+            "url": url,
+            "title": "Example pricing page",
+            "content": "Example pricing page " + ("lists Starter at $10/month. " * 12),
+        }
+
+    registry.register(
+        Tool(
+            name="web_fetch",
+            description="Fetch a URL.",
+            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            handler=web_fetch,
+            response_format="json",
+        )
+    )
+
+    traces = FakeTraceStore()
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+    context_engine.set_adapter = MagicMock()
+
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=AgenticOrchestrator(adapter=adapter),
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id=session.id,
+                owner_id="owner-run-engine",
+                agent_id="default",
+                user_message="continue",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_fetch",),
+                use_planner=True,
+            )
+        )
+    ]
+
+    assert any(event.get("type") == "tool_call" and event.get("tool_name") == "web_fetch" for event in events)
+    tool_call = next(event for event in events if event.get("type") == "tool_call")
+    assert tool_call["arguments"] == {"url": "https://example.com/pricing"}
+    refreshed = sessions.get(session.id, owner_id="owner-run-engine")
+    assert refreshed is not None
+    assert refreshed.continuation_state == {}
+    phase_contexts = [event["data"] for event in traces.events if event["event_type"] == "phase_context"]
+    assert any(
+        item["item_id"] == "continuation_state"
+        for packet in phase_contexts
+        for item in packet.get("included", [])
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_engine_observation_finalize_does_not_emit_followup_plan(tmp_path):
     adapter = MagicMock()
     adapter.complete = AsyncMock(
@@ -557,6 +805,118 @@ async def test_run_engine_observation_finalize_does_not_emit_followup_plan(tmp_p
         and event["data"].get("status") == "finalize"
         and event["data"].get("raw_status") == "finalize"
         and event["data"].get("tools") == []
+        for event in traces.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_engine_reuses_duplicate_web_result_without_second_network_call(tmp_path):
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(
+        return_value='{"tool_calls": [{"function": {"name": "web_search", "arguments": "{\\"query\\": \\\"find run engine\\\"}"}}]}'
+    )
+    adapter.stream = MagicMock(return_value=AsyncIter(["Final answer."]))
+
+    orchestrator = MagicMock()
+    orchestrator.plan_with_context = AsyncMock(
+        return_value={
+            "strategy": "Search first.",
+            "tools": [{"name": "web_search", "priority": "high", "reason": "Need evidence."}],
+            "confidence": 0.9,
+        }
+    )
+    orchestrator.observe_with_context = AsyncMock(
+        side_effect=[
+            {
+                "status": "continue",
+                "strategy": "Repeat search to simulate actor drift.",
+                "tools": [{"name": "web_search", "priority": "high", "reason": "Actor repeats same query."}],
+                "notes": "Continue once.",
+                "confidence": 0.6,
+            },
+            {
+                "status": "finalize",
+                "strategy": "Cached evidence is enough.",
+                "tools": [],
+                "notes": "Answer from cached result.",
+                "confidence": 0.9,
+            },
+        ]
+    )
+    orchestrator.verify_with_context = AsyncMock(
+        return_value={"supported": True, "issues": [], "confidence": 0.95}
+    )
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    call_count = 0
+
+    async def web_search(query: str, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return {
+            "type": "web_search_results",
+            "query": query,
+            "results": [{"title": "Run Engine", "url": "https://example.com/run-engine"}],
+        }
+
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="web_search",
+            description="Search the web.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query."}},
+                "required": ["query"],
+            },
+            handler=web_search,
+            response_format="json",
+        )
+    )
+
+    runs = RunStore(db_path=str(tmp_path / "runs.db"))
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=registry,
+        run_store=runs,
+        trace_store=traces,
+        orchestrator=orchestrator,
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="run-engine-duplicate-web-cache",
+                owner_id="owner-run-engine",
+                agent_id="default",
+                user_message="Research run engine and summarize it.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_search",),
+                use_planner=True,
+                max_tool_calls=3,
+            )
+        )
+    ]
+
+    tool_results = [event for event in events if event.get("type") == "tool_result"]
+    assert call_count == 1
+    assert len(tool_results) >= 2
+    assert tool_results[0]["status"] == "ok"
+    assert tool_results[1]["status"] == "cached"
+    assert tool_results[1]["cached_duplicate"] is True
+    assert not any(
+        event["event_type"] == "tool_result"
+        and event["data"].get("status") == "failed"
+        and "Duplicate web_search" in str(event["data"].get("content_preview") or "")
         for event in traces.events
     )
 
@@ -1052,3 +1412,90 @@ async def test_run_engine_injects_search_routing_and_embed_model_context(tmp_pat
     assert seen["backend"] == "searxng"
     assert seen["search_engine"] == "brave"
     assert seen["embed_model"] == "openai:text-embedding-3-small"
+
+
+@pytest.mark.asyncio
+async def test_run_engine_passes_provider_qualified_model_to_context_compression(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Acknowledged."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=FakeTraceStore(),
+        orchestrator=None,
+        context_engine=context_engine,
+    )
+    engine._resolve_adapter = MagicMock(return_value=adapter)
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="provider-qualified-compression",
+                owner_id="owner-model-route",
+                agent_id="default",
+                user_message="Remember that my test route uses Groq.",
+                model="groq:llama-3.3-70b-versatile",
+                system_prompt="You are Shovs.",
+                allowed_tools=(),
+                use_planner=False,
+            )
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
+    assert context_engine.compress_exchange.await_args.kwargs["model"] == "groq:llama-3.3-70b-versatile"
+
+
+@pytest.mark.asyncio
+async def test_run_engine_retries_response_stream_once_on_rate_limit(tmp_path, monkeypatch):
+    from llm.base_adapter import RateLimitError
+
+    async def rate_limited_stream():
+        raise RateLimitError("Gemini Rate Limit: retry in 0.01s")
+        yield ""
+
+    adapter = MagicMock()
+    adapter.stream = MagicMock(side_effect=[rate_limited_stream(), AsyncIter(["Recovered."])])
+    monkeypatch.setattr("run_engine.engine.asyncio.sleep", AsyncMock())
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=FakeTraceStore(),
+        orchestrator=None,
+        context_engine=context_engine,
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="rate-limit-retry",
+                owner_id="owner-rate-limit",
+                agent_id="default",
+                user_message="Say hello.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=(),
+                use_planner=False,
+            )
+        )
+    ]
+
+    assert any(event.get("type") == "activity_short" and "Rate limit hit" in event.get("text", "") for event in events)
+    assert "".join(event.get("content", "") for event in events if event.get("type") == "token") == "Recovered."
+    assert adapter.stream.call_count == 2

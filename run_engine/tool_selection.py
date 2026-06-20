@@ -18,6 +18,7 @@ def build_actor_request_content(
     context_block: str,
     clip_text,
     argument_clues: Optional[dict[str, str]] = None,
+    capability_context: str = "",
 ) -> str:
     recent_results = "\n".join(
         format_tool_result_line(item, preview_chars=200)
@@ -39,6 +40,9 @@ def build_actor_request_content(
         if relevant:
             clue_lines = "\n".join(f"- {name}: {clue}" for name, clue in relevant.items())
             clues_block = f"Planner argument hints (use these as starting arguments for each tool):\n{clue_lines}\n\n"
+    capability_block = ""
+    if capability_context.strip():
+        capability_block = f"Capability cards for available workflows:\n{capability_context.strip()}\n\n"
 
     return (
         f"{objective_block}"
@@ -50,6 +54,7 @@ def build_actor_request_content(
         "- If planner argument hints are provided, use them as the exact argument values for those tools.\n\n"
         "The allowed tools below are available in this runtime right now. If a current-information request can be answered with an allowed tool, use that tool instead of claiming you lack access.\n\n"
         f"Allowed tools: {', '.join(allowed_tools)}\n\n"
+        f"{capability_block}"
         f"{clues_block}"
         f"Recent tool results:\n{recent_results}\n\n"
         f"Session first message: {session_first_message or 'none'}\n\n"

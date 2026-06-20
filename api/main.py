@@ -29,12 +29,13 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Any, Optional, List
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 from orchestration.agent_profiles import ProfileManager, AgentProfile
+from orchestration.workflow_templates import list_workflow_templates
 from orchestration.orchestrator import AgenticOrchestrator
 from llm.llm_adapter import OllamaAdapter
 from engine.context_engine import ContextEngine
@@ -50,6 +51,7 @@ from api.log_routes import setup_log_routes
 from api.voice_endpoint import setup_voice_routes
 from api.rag_routes import make_rag_router            # ← NEW
 from api.consumer_routes import make_consumer_router
+from api.harness_lab import make_harness_lab_router
 from api.memory_inspector import build_session_memory_payload
 from api.owner import require_owner_id
 from services.storage_admin import StorageAdminService, StoreSelection
@@ -104,6 +106,27 @@ def _context_preview(raw_context: str) -> list[str]:
     except Exception:
         pass
     return [l for l in raw_context.split("\n") if l.strip()]
+
+
+def _coerce_agent_patch_value(key: str, value: Any) -> Any:
+    if key in {"tools", "skills", "bootstrap_files"}:
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        if isinstance(value, str):
+            return [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
+        return []
+    if key in {"default_use_planner", "unified_model_mode"}:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+    if key == "bootstrap_max_chars":
+        try:
+            return int(value)
+        except Exception:
+            return 8000
+    return value
 
 # ── Singletons ────────────────────────────────────────────────────────────────
 adapter         = OllamaAdapter()
@@ -200,7 +223,10 @@ def _seed_standard_profiles():
             id="researcher",
             name="Research Specialist",
             model=cfg.DEFAULT_MODEL,
-            tools=["web_search", "web_fetch", "rag_search", "query_memory", "store_memory"],
+            tools=[
+                "source_contract", "source_select", "source_next_action",
+                "web_search", "web_fetch", "rag_search", "query_memory", "store_memory",
+            ],
             system_prompt=(
                 "You are a meticulous research agent. Always verify claims across multiple sources. "
                 "CRITICAL: Only call web_fetch with URLs returned by a prior web_search result. "
@@ -232,15 +258,39 @@ def _seed_standard_profiles():
             name="Consumer Assistant",
             description="Plain-language assistant for the consumer chat surface.",
             model="groq:moonshotai/kimi-k2-instruct",
-            tools=["web_search", "web_fetch", "query_memory"],
+            tools=["source_contract", "source_select", "source_next_action", "web_search", "web_fetch", "query_memory"],
             system_prompt=(
                 "You are a clear, calm assistant for the consumer product surface. "
                 "Prefer plain text, avoid internal execution chatter, and only use tools when they materially improve accuracy or complete the task."
             ),
             default_use_planner=True,
             default_loop_mode="auto",
-            default_context_mode="v3",
+            default_context_mode="v2",
             bootstrap_files=["IDENTITY.md", "SOUL.md"],
+        ),
+        AgentProfile(
+            id="shopping-advisor",
+            name="Shopping Advisor",
+            description="Verifies product pages, prices, and tradeoffs before recommending.",
+            model=cfg.DEFAULT_MODEL,
+            tools=[
+                "shopping_advice", "source_contract", "source_select", "source_next_action",
+                "web_search", "web_fetch", "query_memory", "store_memory",
+            ],
+            system_prompt=(
+                "You are a practical shopping advisor for normal consumers. Use shopping_advice for buying questions. "
+                "When location matters, compare relevant nearby Canadian retailers such as Costco, Canadian Tire, "
+                "Shoppers, Metro, Dollarama, Walmart, and Best Buy. Give short recommendations based on verified URLs, "
+                "observed prices, ratings, and concrete tradeoffs. If a price, product page, or availability was not "
+                "verified, say that plainly."
+            ),
+            default_use_planner=True,
+            default_loop_mode="managed",
+            default_context_mode="v3",
+            workflow_template="shopping_advisor_v1",
+            prompt_version="shopping_patch_v1",
+            risk_policy="consumer_verified",
+            ledger_mode="shadow",
         ),
     ]
     for p in standard:
@@ -274,6 +324,7 @@ setup_log_routes(app)
 setup_voice_routes(app, run_engine=run_engine, profile_manager=profile_manager)
 app.include_router(make_guardrail_router(guardrail_middleware), prefix="/guardrails")
 app.include_router(make_rag_router(), prefix="/rag")          # ← NEW
+app.include_router(make_harness_lab_router())
 app.include_router(
     make_consumer_router(
         profile_manager=profile_manager,
@@ -282,6 +333,7 @@ app.include_router(
         consumer_store=consumer_store,
         tool_registry=tool_registry,
         run_engine=consumer_run_engine,
+        graph=semantic_graph,
     )
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -351,6 +403,7 @@ async def health():
         "groq",
         "gemini",
         "anthropic",
+        "nvidia",
     ):
         try:
             provider_status[provider] = await create_adapter(provider).health()
@@ -374,6 +427,7 @@ async def list_models():
         "groq": [],
         "gemini": [],
         "anthropic": [],
+        "nvidia": [],
     }
     embeddings = []
     for provider in grouped:
@@ -530,6 +584,10 @@ async def chat_stream(
                 search_backend=search_backend,
                 search_engine=search_engine,
                 agent_revision=getattr(profile, "revision", None),
+                workflow_template=getattr(profile, "workflow_template", "general_operator_v1"),
+                prompt_version=getattr(profile, "prompt_version", "role_contracts_v1"),
+                risk_policy=getattr(profile, "risk_policy", "standard"),
+                ledger_mode=getattr(profile, "ledger_mode", "shadow"),
                 forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
                 workspace_path=getattr(profile, "workspace_path", None),
                 reasoning_enabled=reasoning_enabled,
@@ -609,11 +667,11 @@ async def create_session(payload: Optional[dict] = Body(default=None)):
     payload = payload or {}
     owner_id = _require_owner_id(payload.get("owner_id"))
     agent_id = payload.get("agent_id") or "default"
-    model = payload.get("model") or FALLBACK_CHAT_MODEL
     requested_mode = payload.get("context_mode") or "v3"
     context_mode = requested_mode if requested_mode in ("v1", "v2", "v3") else "v3"
 
     profile = profile_manager.get(agent_id, owner_id=owner_id) or profile_manager.get("default", owner_id=owner_id)
+    model = payload.get("model") or (profile.model if profile else FALLBACK_CHAT_MODEL)
     system_prompt = profile.system_prompt if profile else ""
     if "context_mode" not in payload and profile:
         context_mode = getattr(profile, "default_context_mode", "v3")
@@ -772,6 +830,7 @@ async def get_session_memory_state(session_id: str, owner_id: str):
         session=s,
         owner_id=owner_id,
         context_preview=_context_preview,
+        graph=semantic_graph,
     )
 
 @app.get("/memory")
@@ -877,10 +936,16 @@ async def list_agents(owner_id: Optional[str] = None):
     owner_id = _require_owner_id(owner_id)
     return {"agents": profile_manager.list_all(owner_id=owner_id)}
 
+@app.get("/agent-templates")
+async def list_agent_templates():
+    return {"templates": list_workflow_templates()}
+
 @app.post("/agents")
 async def create_agent(profile: AgentProfile):
     profile.owner_id = _require_owner_id(profile.owner_id)
-    return profile_manager.create(profile)
+    created = profile_manager.create(profile)
+    agent_manager.invalidate_cache(created.id, owner_id=created.owner_id)
+    return created
 
 @app.get("/agents/{agent_id}")
 async def get_agent(agent_id: str, owner_id: Optional[str] = None):
@@ -914,6 +979,10 @@ async def update_agent(agent_id: str, payload: dict):
         "default_loop_mode",
         "default_context_mode",
         "unified_model_mode",
+        "workflow_template",
+        "prompt_version",
+        "risk_policy",
+        "ledger_mode",
     }
     if "embed_model" in payload and payload["embed_model"] != p.embed_model:
         raise HTTPException(
@@ -922,12 +991,12 @@ async def update_agent(agent_id: str, payload: dict):
         )
     for key, val in payload.items():
         if key in allowed:
-            setattr(p, key, val)
+            setattr(p, key, _coerce_agent_patch_value(key, val))
     from datetime import datetime, timezone
     p.updated_at = datetime.now(timezone.utc).isoformat()
-    profile_manager.create(p)
+    updated = profile_manager.create(p)
     agent_manager.invalidate_cache(agent_id, owner_id=owner_id)
-    return p
+    return updated
 
 @app.delete("/agents/{agent_id}")
 async def delete_agent(agent_id: str, owner_id: Optional[str] = None):

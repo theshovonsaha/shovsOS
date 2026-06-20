@@ -23,6 +23,108 @@ from typing import AsyncIterator, Optional, Any
 from llm.base_adapter import BaseLLMAdapter, LLMError, RateLimitError, ProviderError
 
 RETRY_DELAYS = [0.5, 1.5, 3.0]
+_ASYNC_HTTPX_WRAPPER_PATCHED = False
+_HTTPX_ACLOSE_PATCHED = False
+
+
+def patch_async_httpx_wrapper_close() -> None:
+    """Patch a google-genai cleanup edge case seen in long-running servers.
+
+    Some google-genai versions wrap ``httpx.AsyncClient`` with an object whose
+    ``__del__`` schedules ``aclose()`` even when httpx internals were not
+    initialized. That produces noisy background task exceptions:
+    ``AsyncHttpxClientWrapper object has no attribute '_state'``. The request
+    already completed; the cleanup error should be swallowed.
+    """
+    global _ASYNC_HTTPX_WRAPPER_PATCHED, _HTTPX_ACLOSE_PATCHED
+    if not _HTTPX_ACLOSE_PATCHED:
+        try:
+            import httpx
+        except Exception:
+            httpx = None
+        if httpx is not None and not getattr(httpx.AsyncClient, "_shovs_google_wrapper_safe_aclose", False):
+            original_httpx_aclose = httpx.AsyncClient.aclose
+
+            async def safe_httpx_aclose(client, *args, **kwargs):
+                try:
+                    return await original_httpx_aclose(client, *args, **kwargs)
+                except AttributeError as exc:
+                    if "_state" in str(exc) and type(client).__name__ == "AsyncHttpxClientWrapper":
+                        return None
+                    raise
+
+            httpx.AsyncClient.aclose = safe_httpx_aclose
+            httpx.AsyncClient._shovs_google_wrapper_safe_aclose = True
+        _HTTPX_ACLOSE_PATCHED = True
+
+    try:
+        from google.genai._interactions._base_client import AsyncHttpxClientWrapper
+    except Exception:
+        return
+    if getattr(AsyncHttpxClientWrapper, "_shovs_safe_aclose", False):
+        _ASYNC_HTTPX_WRAPPER_PATCHED = True
+        return
+
+    # Guards the background task that httpx's __del__ schedules.
+    original_aclose = AsyncHttpxClientWrapper.aclose
+
+    async def safe_aclose(wrapper, *args, **kwargs):
+        try:
+            return await original_aclose(wrapper, *args, **kwargs)
+        except AttributeError as exc:
+            if "_state" in str(exc):
+                return None
+            raise
+
+    AsyncHttpxClientWrapper.aclose = safe_aclose
+
+    # __del__ calls `self.is_closed` before scheduling aclose(), and is_closed
+    # reads `self._state` directly. Missing _state means the wrapper was never
+    # fully initialized; treat it as closed so __del__ short-circuits.
+    original_is_closed_fget = None
+    raw = AsyncHttpxClientWrapper.__dict__.get("is_closed")
+    if raw is None:
+        for base in type.mro(AsyncHttpxClientWrapper):
+            raw = base.__dict__.get("is_closed")
+            if raw is not None:
+                break
+    if isinstance(raw, property):
+        original_is_closed_fget = raw.fget
+
+    if original_is_closed_fget is not None:
+        def _safe_is_closed_fget(wrapper):
+            try:
+                return original_is_closed_fget(wrapper)
+            except AttributeError as exc:
+                if "_state" in str(exc):
+                    return True
+                raise
+
+        AsyncHttpxClientWrapper.is_closed = property(_safe_is_closed_fget)
+
+    original_del = AsyncHttpxClientWrapper.__dict__.get("__del__")
+    if original_del is None:
+        for base in type.mro(AsyncHttpxClientWrapper):
+            original_del = base.__dict__.get("__del__")
+            if original_del is not None:
+                break
+
+    if original_del is not None:
+        def safe_del(wrapper):
+            try:
+                original_del(wrapper)
+            except AttributeError as exc:
+                if "_state" in str(exc):
+                    return
+                raise
+
+        AsyncHttpxClientWrapper.__del__ = safe_del
+
+    AsyncHttpxClientWrapper._shovs_safe_aclose = True
+    _ASYNC_HTTPX_WRAPPER_PATCHED = True
+
+
+patch_async_httpx_wrapper_close()
 
 
 class GeminiAdapter(BaseLLMAdapter):
@@ -30,17 +132,46 @@ class GeminiAdapter(BaseLLMAdapter):
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.getenv("GEMINI_API_KEY", "")
         self._client = None
+        self._patched_async_wrapper = False
 
     def _get_client(self):
         if self._client is None:
             if not self.api_key:
                 raise LLMError("GEMINI_API_KEY not found in environment.")
             try:
+                self._patch_async_httpx_wrapper_close()
                 from google import genai
                 self._client = genai.Client(api_key=self.api_key)
             except ImportError:
                 raise LLMError("google-genai not installed. Run: pip install google-genai")
         return self._client
+
+    def _patch_async_httpx_wrapper_close(self) -> None:
+        self._patched_async_wrapper = True
+        patch_async_httpx_wrapper_close()
+
+    async def close(self) -> None:
+        client = self._client
+        self._client = None
+        if client is None:
+            return
+        try:
+            aio_client = getattr(client, "aio", None)
+            aclose = getattr(aio_client, "aclose", None)
+            if callable(aclose):
+                await aclose()
+                return
+        except AttributeError as exc:
+            if "_state" not in str(exc):
+                raise
+        except Exception:
+            pass
+        try:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+        except Exception:
+            pass
 
     @staticmethod
     def _build_tool_config(tools: Optional[list[dict]]) -> Optional[list[dict]]:
@@ -243,7 +374,7 @@ class GeminiAdapter(BaseLLMAdapter):
     def _convert_messages(
         self,
         messages: list[dict],
-        images: Optional[list[str]],
+        images: Optional[list[str]] = None,
     ) -> tuple[list[Any], Optional[str]]:
         """Convert internal {role, content} to google-genai Contents.
 

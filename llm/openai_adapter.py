@@ -42,10 +42,12 @@ class OpenAIAdapter(BaseLLMAdapter):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: float = 120.0,
+        provider_name: str = "openai",
     ):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.timeout = timeout
+        self.provider_name = provider_name
         self._client = None
 
     def _get_client(self):
@@ -70,6 +72,7 @@ class OpenAIAdapter(BaseLLMAdapter):
         tools: Optional[list[dict]],
         images: Optional[list[str]],
         stream: bool = False,
+        reasoning_enabled: Optional[bool] = None,
     ) -> dict:
         msgs = self._prepare_messages(messages, images)
         kwargs: dict = {
@@ -85,10 +88,22 @@ class OpenAIAdapter(BaseLLMAdapter):
             # Token budget uses a different parameter name.
             if max_tokens:
                 kwargs["max_completion_tokens"] = int(max_tokens)
+            # Map reasoning_enabled → reasoning_effort. OpenAI reasoning
+            # models can't be fully disabled (the model always reasons), so
+            # ``False`` collapses to "minimal" effort instead of off.
+            # ``True``/``None`` leave the provider default (medium) alone
+            # unless the caller explicitly wants high effort. Forward-compat:
+            # if the SDK rejects ``reasoning_effort``, the call still
+            # succeeds because we only set it on known reasoning models.
+            if reasoning_enabled is False:
+                kwargs["reasoning_effort"] = "minimal"
+            elif reasoning_enabled is True:
+                kwargs["reasoning_effort"] = "high"
         else:
             kwargs["temperature"] = temperature
             if max_tokens:
                 kwargs["max_tokens"] = int(max_tokens)
+            # Non-reasoning OpenAI models silently ignore reasoning_enabled.
 
         if tools:
             kwargs["tools"] = tools
@@ -104,6 +119,8 @@ class OpenAIAdapter(BaseLLMAdapter):
         max_tokens: Optional[int] = None,
         images: Optional[list[str]] = None,
         tools: Optional[list[dict]] = None,
+        reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> str:
         client = self._get_client()
         kwargs = self._build_kwargs(
@@ -114,6 +131,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             tools=tools,
             images=images,
             stream=False,
+            reasoning_enabled=reasoning_enabled,
         )
 
         last_err: Exception = RuntimeError("no attempts made")
@@ -151,12 +169,15 @@ class OpenAIAdapter(BaseLLMAdapter):
         images: Optional[list[str]] = None,
         tools: Optional[list[dict]] = None,
         interrupt_check: Optional[object] = None,
+        reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> AsyncIterator[str]:
         client = self._get_client()
         kwargs = self._build_kwargs(
             model=model,
             messages=messages,
             temperature=temperature,
+            reasoning_enabled=reasoning_enabled,
             max_tokens=max_tokens,
             tools=tools,
             images=images,

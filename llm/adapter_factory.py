@@ -52,6 +52,17 @@ _FALLBACK_CHAIN: list[str] = [
 ]
 
 
+def _apply_gemini_cleanup_patch() -> None:
+    try:
+        from llm.gemini_adapter import patch_async_httpx_wrapper_close
+        patch_async_httpx_wrapper_close()
+    except Exception:
+        pass
+
+
+_apply_gemini_cleanup_patch()
+
+
 def record_provider_failure(provider: str) -> None:
     """
     Record a failure for a provider. After _FAILOVER_THRESHOLD consecutive
@@ -117,20 +128,24 @@ def _build_openai_compat_adapter(provider: str):
         return OpenAIAdapter(
             api_key=os.getenv("LMSTUDIO_API_KEY", "lm-studio"),
             base_url=os.getenv("LMSTUDIO_BASE_URL", "http://127.0.0.1:1234/v1"),
+            provider_name="lmstudio",
         )
     if provider == "llamacpp":
         return OpenAIAdapter(
             api_key=os.getenv("LLAMACPP_API_KEY", "llama.cpp"),
             base_url=os.getenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8080/v1"),
+            provider_name="llamacpp",
         )
     if provider == "local_openai":
         return OpenAIAdapter(
             api_key=os.getenv("OPENAI_API_KEY", "local"),
             base_url=os.getenv("OPENAI_BASE_URL"),
+            provider_name="local_openai",
         )
     return OpenAIAdapter(
         api_key=os.getenv("OPENAI_API_KEY"),
         base_url=os.getenv("OPENAI_BASE_URL"),
+        provider_name="openai",
     )
 
 def create_adapter(provider: str = None) -> BaseLLMAdapter:
@@ -230,6 +245,13 @@ def get_default_model(adapter: BaseLLMAdapter) -> str:
     if isinstance(adapter, OllamaAdapter):
         return cfg.OLLAMA_DEFAULT_MODEL
     if isinstance(adapter, OpenAIAdapter):
+        provider_name = str(getattr(adapter, "provider_name", "") or "").lower()
+        if provider_name == "lmstudio":
+            return os.getenv("LMSTUDIO_DEFAULT_MODEL", cfg.DEFAULT_MODEL)
+        if provider_name == "llamacpp":
+            return os.getenv("LLAMACPP_DEFAULT_MODEL", cfg.DEFAULT_MODEL)
+        if provider_name == "local_openai":
+            return os.getenv("LOCAL_OPENAI_DEFAULT_MODEL", cfg.DEFAULT_MODEL)
         return cfg.OPENAI_DEFAULT_MODEL
     if isinstance(adapter, GroqLLMAdapter):
         return cfg.GROQ_DEFAULT_MODEL

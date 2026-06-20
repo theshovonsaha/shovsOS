@@ -254,12 +254,13 @@ Research wigglebudget.com and give me a TLDR.
 
 If you are using a small local model, start with:
 
-- `Execution Loop = Single`
-- `Manager Agent = off`
+- managed runtime
+- planner enabled only if the model follows structured tool instructions
 - `Max Tool Calls = 2 or 3`
 - `Max Turns = 2 or 3`
+- simple read-only tasks before write-capable tools
 
-Then move to `auto` or `managed` once the baseline is stable.
+Then increase tool and turn limits after the baseline is stable.
 
 If you are testing semantic memory too, confirm `EMBED_MODEL` points at a reachable embedding model for the same provider family you are using.
 

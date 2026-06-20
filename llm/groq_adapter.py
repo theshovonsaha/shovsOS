@@ -37,6 +37,30 @@ class GroqLLMAdapter(BaseLLMAdapter):
             self._client = AsyncGroq(api_key=self.api_key, timeout=self.timeout)
         return self._client
 
+    @staticmethod
+    def _maybe_attach_reasoning(
+        kwargs: dict,
+        *,
+        model: str,
+        reasoning_enabled: Optional[bool],
+    ) -> None:
+        """Map ``reasoning_enabled`` → Groq's ``reasoning_format`` flag.
+
+        Groq exposes reasoning controls on R1-style models via
+        ``reasoning_format``: ``"hidden"`` strips chain-of-thought from the
+        response, ``"parsed"`` returns it as a separate field, ``"raw"``
+        inlines ``<think>...</think>``. When the user asks to disable
+        reasoning, ``"hidden"`` is the closest semantically-equivalent
+        no-think setting (the model still reasons internally but we pay no
+        token cost surfacing it). On non-reasoning models we no-op.
+        """
+        if reasoning_enabled is None:
+            return
+        from llm.model_capabilities import supports_reasoning
+        if not supports_reasoning(model):
+            return
+        kwargs["reasoning_format"] = "raw" if reasoning_enabled else "hidden"
+
     async def complete(
         self,
         model: str,
@@ -45,6 +69,8 @@ class GroqLLMAdapter(BaseLLMAdapter):
         max_tokens: Optional[int] = None,
         images: Optional[list[str]] = None,
         tools: Optional[list[dict]] = None,
+        reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> str:
         client = self._get_client()
         kwargs = {
@@ -57,6 +83,7 @@ class GroqLLMAdapter(BaseLLMAdapter):
             kwargs["tool_choice"] = "auto"
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
+        self._maybe_attach_reasoning(kwargs, model=model, reasoning_enabled=reasoning_enabled)
 
         last_err: Exception = RuntimeError("no attempts")
         for i, delay in enumerate(RETRY_DELAYS):
@@ -93,6 +120,8 @@ class GroqLLMAdapter(BaseLLMAdapter):
         images: Optional[list[str]] = None,
         tools: Optional[list[dict]] = None,
         interrupt_check: Optional[object] = None,
+        reasoning_enabled: Optional[bool] = None,
+        **_extra_kwargs,
     ) -> AsyncIterator[str]:
         client = self._get_client()
         kwargs = {
@@ -106,6 +135,7 @@ class GroqLLMAdapter(BaseLLMAdapter):
             kwargs["tool_choice"] = "auto"
         if max_tokens:
             kwargs["max_tokens"] = max_tokens
+        self._maybe_attach_reasoning(kwargs, model=model, reasoning_enabled=reasoning_enabled)
 
         in_thought = False
         tool_call_acc: dict[int, dict] = {}

@@ -1,0 +1,42 @@
+{
+  "suite": "agent_harness_core",
+  "version": 1,
+  "results": [
+    {
+      "scenario": "response_guard_tool_json",
+      "passed": true,
+      "score": 1.0,
+      "issues": ["tool_json_final_response"],
+      "summary": "Tool-call-shaped JSON was converted into clean user-facing text."
+    },
+    {
+      "scenario": "source_collection_contract",
+      "passed": true,
+      "score": 1.0,
+      "issues": [],
+      "summary": "Locked entities received targeted searches and the required source fetches."
+    },
+    {
+      "scenario": "source_collection_drift_negative_control",
+      "passed": true,
+      "score": 1.0,
+      "issues": ["forbidden_query_drift"],
+      "summary": "The evaluator caught unrelated entity drift."
+    },
+    {
+      "scenario": "ledger_orphan_tool_result_rejected",
+      "passed": true,
+      "score": 1.0,
+      "issues": [],
+      "summary": "The ledger rejected a tool result without a matching tool call."
+    },
+    {
+      "scenario": "memory_replacement_rollback",
+      "passed": true,
+      "score": 1.0,
+      "issues": [],
+      "summary": "A failed fact replacement preserved the previous current fact."
+    }
+  ]
+}
+
