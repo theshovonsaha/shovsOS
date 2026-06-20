@@ -2,7 +2,7 @@
 
 ## The Thesis
 
-Shovs is a Language OS.
+Shovs is an experimental Language OS research project.
 
 The model is still probabilistic. It can still make mistakes. The thesis is not that a runtime can make an LLM perfectly deterministic.
 
@@ -18,12 +18,12 @@ Shovs does this through:
 - checkpoints, artifacts, traces, and evals
 - replayable failures
 
-The goal is to make LLM-powered systems:
+The goal is to test whether LLM-powered systems can become:
 
 - more coherent
 - easier to inspect
 - easier to compose
-- more reliable across tools, sessions, and models
+- more reliable across tools, sessions, and models in measured workflows
 
 ## Core Claim
 
@@ -53,7 +53,7 @@ Shovs is not just:
 - a generic tool loop
 - a thin UI over a model provider
 
-Shovs is a runtime with:
+Shovs is being built as a runtime with:
 
 - a managed `plan -> act -> observe -> verify -> memory_commit` loop
 - a run ledger for plan steps, tool calls, tool results, evidence, memory writes, verification, and continuation state
@@ -64,13 +64,13 @@ Shovs is a runtime with:
 - provider portability across local and cloud models
 - agent construction on top of the same kernel
 
-## The Platform Idea
+## The Runtime Idea
 
-The platform is the kernel.
+The research hypothesis is that the runtime should be the kernel.
 
 Agents are compositions built on top of it.
 
-The product shape is:
+The possible product shape is:
 
 - a human control center for supervising and steering execution
 - an autonomous agent body that performs work across tools, memory, and model runtimes
@@ -105,9 +105,9 @@ without changing the kernel itself.
 
 ## Why Small Models Matter
 
-One of the strongest tests of the platform is whether it can make smaller local models behave coherently.
+One of the strongest tests of the runtime is whether it can make smaller local models behave coherently in narrow workflows.
 
-If the runtime can improve:
+If the runtime can improve measured:
 
 - prompt discipline
 - tool obedience
@@ -115,9 +115,9 @@ If the runtime can improve:
 - failure recovery
 - traceability
 
-for small models, then larger frontier models benefit even more.
+for small models, then larger frontier models may benefit from the same structure.
 
-Shovs aims to:
+Shovs aims to test whether this can:
 
 - raise the floor for small models
 - raise the ceiling for large models
@@ -143,7 +143,7 @@ That is why Shovs invests in run ledgers, trace replay, memory inspection, and s
 
 If an agent gives a polished answer after searching the wrong things, Shovs should be able to mark the run as wrong.
 
-That is the practical standard.
+That is the research standard this repo is testing.
 
 The public proof path is intentionally small:
 
@@ -155,14 +155,14 @@ The public proof path is intentionally small:
 
 ## Frontier Direction
 
-The long-term ambition is to make Shovs a next-generation open-source runtime for serious AI systems:
+The long-term ambition is to move Shovs toward an open-source runtime for inspectable AI systems:
 
 - local-first when useful
 - cloud-capable when needed
 - deeply observable
 - easy to debug
 - easy to extend
-- structurally more reliable than prompt-heavy agent wrappers
+- testing whether structured runtime discipline can be more reliable than prompt-heavy agent wrappers
 
 The project should feel futuristic not because it adds more knobs, but because it makes intelligence:
 
@@ -173,12 +173,12 @@ The project should feel futuristic not because it adds more knobs, but because i
 
 ## Public Standard
 
-For Shovs to earn its claim, it must continue proving:
+For Shovs to strengthen its claim, it must continue showing:
 
-1. Better coherence through runtime discipline, not only bigger models.
-2. Better observability through logs, traces, checkpoints, and evals.
-3. Better extensibility through profiles, adapters, tools, and workspace context.
-4. Better developer ergonomics for building robust agents on the same kernel.
+1. Measurable coherence gains through runtime discipline, not only bigger models.
+2. Observable execution through logs, traces, checkpoints, and evals.
+3. Extensibility through profiles, adapters, tools, and workspace context.
+4. Developer ergonomics for building agents on the same runtime.
 
 ## Practical Reading
 

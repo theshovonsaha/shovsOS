@@ -934,6 +934,15 @@ class RunEngine:
         )
 
     @staticmethod
+    def _trivial_response(message: str) -> str:
+        lowered = str(message or "").strip().lower().strip(".! ")
+        if lowered in {"thanks", "thank you"}:
+            return "You're welcome."
+        if lowered in {"ok", "okay", "cool", "nice", "yes", "yeah", "yep", "sure", "sounds good"}:
+            return "Got it."
+        return "Hi."
+
+    @staticmethod
     def _is_ambiguous_followup(message: str) -> bool:
         lowered = str(message or "").strip().lower()
         if not lowered:
@@ -1173,6 +1182,42 @@ class RunEngine:
                     },
                 )
             self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="intake")
+
+            if (
+                self._is_trivial_acknowledgement(request.user_message)
+                and continuation_gate.get("action") == "none"
+                and not request.forced_tools
+            ):
+                final_response = self._trivial_response(request.user_message)
+                ledger.append_event(
+                    "response",
+                    source="run_engine",
+                    status="trivial_chat",
+                    data={"content_length": len(final_response)},
+                )
+                self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="trivial_chat")
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="route_decision",
+                    data={
+                        "route_type": "trivial_chat",
+                        "reason": "short_acknowledgement_fast_path",
+                        "tools_allowed": False,
+                    },
+                )
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="assistant_response",
+                    data={"content": final_response, "content_length": len(final_response)},
+                )
+                self.sessions.append_message(session.id, "assistant", final_response)
+                self.run_store.finish_run(run.run_id, status="completed")
+                yield {"type": "token", "content": final_response}
+                yield {"type": "done", "run_id": run.run_id, "session_id": session.id}
+                return
+
             workflow_template = get_workflow_template(request.workflow_template)
             workflow_pattern = get_workflow_pattern(workflow_template.workflow_pattern)
             if workflow_pattern:
@@ -1297,7 +1342,7 @@ class RunEngine:
             workspace_path = str(getattr(request, "workspace_path", "") or "").strip() or None
             if workspace_path:
                 skill_manifests = list_available_skills(workspace_path)
-                _tool_names = [t.get("name", "") for t in (request.tools or [])]
+                _tool_names = list(request.allowed_tools or ())
                 available_skills = [
                     {
                         "name": m.name,

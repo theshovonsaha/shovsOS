@@ -884,6 +884,50 @@ SOURCE_NEXT_ACTION_TOOL = Tool(
 )
 
 
+WEB_FETCH_BATCH_TOOL = Tool(
+    name="web_fetch_batch",
+    description=(
+        "Fetch multiple previously selected URLs in one deterministic tool call. "
+        "Use after source_select when several exact URLs must be read. Returns compact fetched_sources, failures, and answer rules."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "urls": {"type": "array", "items": {"type": "string"}, "description": "Exact URLs selected from prior web_search/source_select results."},
+            "max_chars_per_url": {"type": "integer", "description": "Maximum readable chars per URL before compacting.", "default": 4000},
+            "use_jina": {"type": "boolean", "description": "Use Jina Reader before http fallback.", "default": True},
+            "max_urls": {"type": "integer", "description": "Maximum URLs to fetch in this batch.", "default": 12},
+        },
+        "required": ["urls"],
+    },
+    handler=_web_fetch_batch,
+    tags=["kernel", "source", "web"],
+    response_format="json",
+)
+
+
+SOURCE_COVERAGE_TOOL = Tool(
+    name="source_coverage",
+    description=(
+        "Verify whether selected and fetched sources satisfy a source_contract. "
+        "Use before final answer to avoid claiming a workflow is complete when URLs/entities are missing."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "contract": {"type": "object", "description": "A source_contract.contract object."},
+            "entities": {"type": "array", "items": {"type": "string"}, "description": "Locked entities."},
+            "selected_payload": {"type": "object", "description": "A source_select payload."},
+            "fetch_payloads": {"type": "array", "items": {}, "description": "web_fetch or web_fetch_batch payloads."},
+            "fetched_urls": {"type": "array", "items": {"type": "string"}, "description": "Known fetched URLs if payloads are unavailable."},
+        },
+    },
+    handler=_source_coverage,
+    tags=["kernel", "source", "web"],
+    response_format="json",
+)
+
+
 async def _search_duckduckgo(query: str, num_results: int) -> list[dict]:
     """Compatibility fallback used by tools_web when DuckDuckGo is requested directly."""
     loop = asyncio.get_running_loop()
@@ -2593,6 +2637,8 @@ ALL_TOOLS = [
     SOURCE_CONTRACT_TOOL,
     SOURCE_SELECT_TOOL,
     SOURCE_NEXT_ACTION_TOOL,
+    WEB_FETCH_BATCH_TOOL,
+    SOURCE_COVERAGE_TOOL,
     SHOPPING_ADVICE_TOOL,
     IMAGE_SEARCH_TOOL,
     BASH_TOOL,

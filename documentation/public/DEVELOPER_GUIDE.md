@@ -33,7 +33,7 @@ Public credibility docs:
 - [HARNESS.md](../../HARNESS.md) defines the agent harness.
 - [BENCHMARKS.md](../../BENCHMARKS.md) lists deterministic benchmark scenarios.
 - [EVALS.md](../../EVALS.md) explains scenario-state evaluation.
-- [CLAIMS.md](../../CLAIMS.md) separates proven claims from active work.
+- [CLAIMS.md](../../CLAIMS.md) separates locally validated claims from active work.
 - [RESULTS.md](../../RESULTS.md) records the local validation snapshot.
 
 ## Core Modules
@@ -192,7 +192,7 @@ Store the result through `RunStore.save_eval(...)` so replay and frontend views 
 
 ### Agent Harness Core Benchmark
 
-Run this before claiming a runtime change improves reliability:
+Run this before claiming a runtime change improves reliability in the covered scenarios:
 
 ```bash
 venv/bin/python -m pytest \
@@ -505,7 +505,7 @@ Never let the system appear to have done work it did not actually do.
 
 ### 3. Small Models Matter
 
-If the runtime can keep small models coherent, larger models become even more reliable.
+If the runtime can keep small models coherent in measured workflows, larger models may benefit from the same structure.
 
 ### 4. One Run Beats Fake Swarms By Default
 

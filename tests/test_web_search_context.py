@@ -7,8 +7,10 @@ from plugins.tools import (
     _format_search_results,
     _normalize_search_results,
     _source_contract,
+    _source_coverage,
     _source_next_action,
     _source_select,
+    _web_fetch_batch,
     register_tools,
 )
 from plugins import tools_web
@@ -128,11 +130,13 @@ async def test_source_next_action_moves_from_search_to_fetch_to_finalize():
 
 def test_kernel_source_tools_register_by_name():
     registry = ToolRegistry()
-    register_tools(registry, "source_contract", "source_select", "source_next_action")
+    register_tools(registry, "source_contract", "source_select", "source_next_action", "web_fetch_batch", "source_coverage")
 
     assert registry.get("source_contract") is not None
     assert registry.get("source_select") is not None
     assert registry.get("source_next_action") is not None
+    assert registry.get("web_fetch_batch") is not None
+    assert registry.get("source_coverage") is not None
 
 
 def test_web_search_curation_adds_stable_result_metadata():
@@ -148,3 +152,84 @@ def test_web_search_curation_adds_stable_result_metadata():
     assert results[0]["rank"] == 1
     assert results[0]["host"] == "example.com"
     assert results[0]["normalized_url"] == "https://example.com/post?id=1"
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_batch_compacts_multiple_urls(monkeypatch):
+    async def fake_fetch(url: str, max_chars: int = 8000, use_jina: bool = True):
+        return json.dumps({
+            "type": "web_fetch_result",
+            "url": url,
+            "final_url": url,
+            "host": url.split("/")[2],
+            "backend": "fake",
+            "content": f"Full content for {url}. " * 40,
+            "truncated": False,
+            "total_length": 500,
+            "title": f"Title {url}",
+            "status_code": 200,
+        })
+
+    monkeypatch.setattr("plugins.tools._web_fetch", fake_fetch)
+
+    payload = json.loads(await _web_fetch_batch(
+        ["https://example.com/a", "https://example.com/a", "https://example.com/b"],
+        max_chars_per_url=1000,
+    ))
+
+    assert payload["type"] == "web_fetch_batch_result"
+    assert payload["attempted_count"] == 2
+    assert payload["fetched_count"] == 2
+    assert payload["failed_count"] == 0
+    assert payload["fetched_sources"][0]["content_excerpt"].startswith("Full content")
+
+
+@pytest.mark.asyncio
+async def test_source_coverage_blocks_answer_until_required_urls_fetched():
+    selected_payload = {
+        "selected_by_entity": {
+            "ROKU": [{"url": "https://news.example/roku-1"}, {"url": "https://news.example/roku-2"}],
+            "TBN": [{"url": "https://news.example/tbn-1"}],
+        },
+        "selected_urls": [
+            "https://news.example/roku-1",
+            "https://news.example/roku-2",
+            "https://news.example/tbn-1",
+        ],
+    }
+    contract = {"entity_count": 2, "results_per_entity": 2, "total_fetches": 4}
+
+    incomplete = json.loads(await _source_coverage(
+        contract=contract,
+        entities=["ROKU", "TBN"],
+        selected_payload=selected_payload,
+        fetched_urls=["https://news.example/roku-1"],
+    ))
+
+    assert incomplete["complete"] is False
+    assert incomplete["answer_allowed"] is False
+    assert "TBN_selected_urls" in incomplete["missing_slots"]
+    assert incomplete["next_tool"] in {"source_select", "web_fetch_batch"}
+
+    complete_payload = {
+        "selected_by_entity": {
+            "ROKU": [{"url": "https://news.example/roku-1"}, {"url": "https://news.example/roku-2"}],
+            "TBN": [{"url": "https://news.example/tbn-1"}, {"url": "https://news.example/tbn-2"}],
+        },
+        "selected_urls": [
+            "https://news.example/roku-1",
+            "https://news.example/roku-2",
+            "https://news.example/tbn-1",
+            "https://news.example/tbn-2",
+        ],
+    }
+    complete = json.loads(await _source_coverage(
+        contract=contract,
+        entities=["ROKU", "TBN"],
+        selected_payload=complete_payload,
+        fetched_urls=complete_payload["selected_urls"],
+    ))
+
+    assert complete["complete"] is True
+    assert complete["answer_allowed"] is True
+    assert complete["missing_slots"] == []
