@@ -923,14 +923,14 @@ class SemanticGraph:
         owner_id: Optional[str] = None,
         *,
         memory_types: Optional[List[str]] = None,
-        limit: int = 100,
+        limit: Optional[int] = 100,
     ) -> List[Dict[str, object]]:
         """Return current facts with typed-memory provenance.
 
         This is the richer reader for prompt assembly and inspectors. The older
         get_current_facts() tuple API intentionally remains unchanged.
         """
-        safe_limit = max(1, int(limit))
+        safe_limit = max(1, int(limit)) if limit is not None else None
         normalized_types = [str(t).strip().lower() for t in (memory_types or []) if str(t).strip()]
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
@@ -943,7 +943,10 @@ class SemanticGraph:
             if normalized_types:
                 type_filter = " AND lower(memory_type) IN (" + ",".join("?" for _ in normalized_types) + ")"
                 params.extend(normalized_types)
-            params.append(safe_limit)
+            limit_clause = ""
+            if safe_limit is not None:
+                limit_clause = " LIMIT ?"
+                params.append(safe_limit)
             cursor = conn.execute(
                 f'''
                 SELECT id, session_id, owner_id, run_id, locus_id, subject, predicate, object,
@@ -952,8 +955,7 @@ class SemanticGraph:
                        created_at, conflict_trace, prior_value_disputed, conflict_reason
                 FROM facts
                 WHERE session_id = ?{owner_filter} AND valid_to IS NULL{type_filter}
-                ORDER BY valid_from ASC, id ASC
-                LIMIT ?
+                ORDER BY valid_from ASC, id ASC{limit_clause}
                 ''',
                 tuple(params),
             )

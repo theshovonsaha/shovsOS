@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -1100,6 +1101,164 @@ def test_finalize_gate_allows_no_max_cap():
     should, reason = _should_finalize("finalize", steps, 999, None, "s1")
     assert should is True
     assert reason == "clean_finalize"
+
+
+def test_stock_source_workflow_forces_separate_ticker_searches_before_fetches():
+    from run_engine.engine import _stock_source_workflow_override
+
+    objective = (
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls one by one."
+    )
+    broad_result = {
+        "tool_name": "web_search",
+        "success": True,
+        "arguments": {"query": "top 3 stocks with major price jumps today"},
+        "content": json.dumps({
+            "results": [
+                {"title": "Morningstar market movers", "url": "https://www.morningstar.com/markets/movers"},
+                {"title": "EPAM jumps on earnings", "url": "https://news.example/epam"},
+                {"title": "ARKO stock rises today", "url": "https://news.example/arko"},
+            ]
+        }),
+    }
+
+    override = _stock_source_workflow_override(
+        objective=objective,
+        allowed_tools=[{"name": "web_search"}, {"name": "web_fetch"}],
+        tool_results=[broad_result],
+    )
+
+    assert override["status"] == "partial"
+    assert override["selected_tools"] == ["web_fetch"]
+    assert override["argument_clues"]["web_fetch"] == "https://www.morningstar.com/markets/movers"
+
+
+def test_stock_source_workflow_locks_tickers_from_fetched_movers_table_not_noisy_search():
+    from run_engine.engine import _stock_source_workflow_override
+
+    objective = (
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls one by one."
+    )
+    noisy_search = {
+        "tool_name": "web_search",
+        "success": True,
+        "arguments": {"query": "top 3 stocks with major price jumps today June 13 2026"},
+        "content": json.dumps({
+            "results": [
+                {"title": "EPAM stock major jump today", "url": "https://news.example/epam"},
+                {"title": "US stock market update PM", "url": "https://news.example/us-pm"},
+                {"title": "ARKO stock headlines", "url": "https://news.example/arko"},
+            ]
+        }),
+    }
+    movers_fetch = {
+        "tool_name": "web_fetch",
+        "success": True,
+        "arguments": {"url": "https://www.morningstar.com/markets/movers"},
+        "content": """
+## Gainers
+| 1-Day Chart | Stock | Price | Volume/Average |
+| --- | --- | --- | --- |
+| | [Roku Inc](https://www.morningstar.com/stocks/xnas/roku/quote) ROKU | $143.66 +24.02 (20.08%) | 15M 3M |
+| | [Tamboran Resources Corp](https://www.morningstar.com/stocks/xnys/tbn/quote) TBN | $40.37 +6.71 (19.93%) | 509,942 222,049 |
+| | [Seneca Foods Corp](https://www.morningstar.com/stocks/xnas/senea/quote) SENEA | $175.37 +26.16 (17.53%) | 538,088 133,799 |
+## Losers
+""",
+    }
+
+    override = _stock_source_workflow_override(
+        objective=objective,
+        allowed_tools=[{"name": "web_search"}, {"name": "web_fetch"}],
+        tool_results=[noisy_search, movers_fetch],
+    )
+
+    assert override["status"] == "partial"
+    assert override["selected_tools"] == ["web_search"]
+    assert override["tickers"] == ["ROKU", "TBN", "SENEA"]
+    assert override["argument_clues"]["web_search"] == "ROKU stock news June 13 2026"
+    assert "EPAM" not in override["argument_clues"]["web_search"]
+
+
+def test_stock_source_workflow_fetches_collected_urls_before_finalizing():
+    from run_engine.engine import _stock_source_workflow_override
+
+    objective = (
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls one by one."
+    )
+    tool_results = []
+    tool_results.append({
+        "tool_name": "web_fetch",
+        "success": True,
+        "arguments": {"url": "https://www.morningstar.com/markets/movers"},
+        "content": """
+## Gainers
+| 1-Day Chart | Stock | Price | Volume/Average |
+| --- | --- | --- | --- |
+| | [Materialise NV](https://www.morningstar.com/stocks/xnas/mtls/quote) MTLS | $10.00 +2.00 (25.00%) | 1M 2M |
+| | [Luxfer Holdings](https://www.morningstar.com/stocks/xnys/lxfr/quote) LXFR | $11.00 +2.00 (22.00%) | 1M 2M |
+| | [ARKO Corp](https://www.morningstar.com/stocks/xnas/arko/quote) ARKO | $12.00 +2.00 (20.00%) | 1M 2M |
+## Losers
+""",
+    })
+    for ticker in ("MTLS", "LXFR", "ARKO"):
+        tool_results.append({
+            "tool_name": "web_search",
+            "success": True,
+            "arguments": {"query": f"{ticker} stock news June 13 2026"},
+            "content": json.dumps({
+                "results": [
+                    {"title": f"{ticker} source A", "url": f"https://news.example/{ticker.lower()}-a"},
+                    {"title": f"{ticker} source B", "url": f"https://news.example/{ticker.lower()}-b"},
+                    {"title": f"{ticker} source C", "url": f"https://news.example/{ticker.lower()}-c"},
+                ]
+            }),
+        })
+
+    override = _stock_source_workflow_override(
+        objective=objective,
+        allowed_tools=[{"name": "web_search"}, {"name": "web_fetch"}],
+        tool_results=tool_results,
+    )
+
+    assert override["status"] == "partial"
+    assert override["selected_tools"] == ["web_fetch"]
+    assert override["argument_clues"]["web_fetch"].startswith("https://news.example/")
+
+
+def test_stock_source_workflow_gets_enough_default_tool_turns():
+    from run_engine.engine import _default_tool_turn_budget, _source_collection_contract_from_objective
+
+    objective = (
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls one by one."
+    )
+
+    assert _source_collection_contract_from_objective(objective) == {
+        "entity_count": 3,
+        "urls_per_entity": 3,
+        "total_urls": 9,
+    }
+    assert _default_tool_turn_budget(objective, None) >= 14
+    assert _default_tool_turn_budget("hello", None) == 3
+    assert _default_tool_turn_budget(objective, 5) == 5
+
+
+def test_source_collection_contract_is_topic_agnostic():
+    from run_engine.engine import _source_collection_contract_from_objective
+
+    objective = (
+        "Find top 4 budget laptops, search each separately, collect 2 review URLs "
+        "for each, web fetch all 8 URLs, then summarize."
+    )
+
+    assert _source_collection_contract_from_objective(objective) == {
+        "entity_count": 4,
+        "urls_per_entity": 2,
+        "total_urls": 8,
+    }
 
 
 # ── Slice 3: deterministic extractor canonical-predicate coverage ────────

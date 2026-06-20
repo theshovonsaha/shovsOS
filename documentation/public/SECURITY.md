@@ -31,3 +31,23 @@ We aim to provide a remediation plan or status update within 7 business days.
 - Use .env files locally and .env.example for templates
 - Keep dependencies updated and pinned where practical
 - Prefer least-privilege tokens for external integrations
+
+## Agent-Specific Security Notes
+
+Shovs treats agent security as a runtime problem, not only a prompt problem.
+
+Important rules:
+
+- Tool results are evidence, not instructions. Do not let fetched pages or command output rewrite the system prompt, plan, or memory policy.
+- Do not claim side effects unless a successful tool result proves them.
+- Write-capable tools should verify expected paths and return failure when verification fails.
+- Memory writes should come from explicit user facts, verified evidence, or clearly labeled candidates. Do not promote model guesses into trusted memory.
+- Keep secrets out of traces, logs, artifacts, and memory. If a tool may return secrets, redact before persistence.
+
+If you add a new tool, include:
+
+- a narrow schema
+- clear success and failure status
+- safe error text
+- redaction behavior for sensitive outputs
+- tests for invalid arguments and failed execution

@@ -56,6 +56,9 @@ class BridgeAdapter(BaseLLMAdapter):
         messages: list[dict],
         temperature: float,
         tools: Optional[list[dict]] = None,
+        max_tokens: Optional[int] = None,
+        images: Optional[list[str]] = None,
+        reasoning_enabled: Optional[bool] = None,
     ) -> str:
         """Write handoff file and return its path."""
         payload = {
@@ -63,7 +66,11 @@ class BridgeAdapter(BaseLLMAdapter):
             "model": model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": max_tokens,
+            "image_count": len(images or []),
+            "images": images or [],
             "tools": tools or [],
+            "reasoning_enabled": reasoning_enabled,
             "timestamp": time.time(),
         }
         handoff_path = os.path.join(self.bridge_dir, f"handoff_{request_id}.json")
@@ -115,7 +122,16 @@ class BridgeAdapter(BaseLLMAdapter):
         # request to a sidecar. ``reasoning_enabled`` is captured in the
         # handoff payload for the receiver to honor (or ignore).
         request_id = uuid.uuid4().hex[:12]
-        handoff = self._write_handoff(request_id, model, messages, temperature, tools)
+        handoff = self._write_handoff(
+            request_id,
+            model,
+            messages,
+            temperature,
+            tools,
+            max_tokens=max_tokens,
+            images=images,
+            reasoning_enabled=reasoning_enabled,
+        )
         print(f"\n[BRIDGE] Handoff written: {handoff}")
         print(f"[BRIDGE] Waiting for response: response_{request_id}.json")
         return await self._poll_response(request_id)

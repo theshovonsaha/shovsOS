@@ -4,6 +4,7 @@ from pathlib import Path
 from orchestration.session_manager import SessionManager
 from memory.semantic_graph import SemanticGraph
 from shovs_memory import ShovsMemory
+from shovs_memory.inspector import build_memory_payload
 
 
 def test_shovs_memory_facade_applies_deterministic_updates_and_inspects_state(tmp_path):
@@ -82,11 +83,176 @@ def test_temporal_fact_replacement_rolls_back_void_when_add_fails(tmp_path):
     ]
 
 
+def test_shovs_memory_store_fact_rolls_back_replacement_when_add_fails(tmp_path):
+    graph = SemanticGraph(db_path=str(tmp_path / "memory_graph.db"))
+    memory = ShovsMemory(
+        session_id="session-facade-rollback",
+        owner_id="owner-facade-rollback",
+        graph=graph,
+    )
+    memory.store_fact(
+        subject="User",
+        predicate="location",
+        object_="Vancouver",
+        turn=1,
+    )
+
+    try:
+        memory.store_fact(
+            subject="User",
+            predicate="location",
+            object_=object(),
+            turn=2,
+        )
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("replacement should fail before committing the void")
+
+    assert memory.current_facts() == [("User", "location", "Vancouver")]
+
+
+def test_shovs_memory_apply_user_message_rolls_back_batch_when_add_fails(tmp_path, monkeypatch):
+    graph = SemanticGraph(db_path=str(tmp_path / "memory_graph.db"))
+    memory = ShovsMemory(
+        session_id="session-message-rollback",
+        owner_id="owner-message-rollback",
+        graph=graph,
+    )
+    memory.store_fact(
+        subject="User",
+        predicate="location",
+        object_="Vancouver",
+        turn=1,
+    )
+
+    monkeypatch.setattr(
+        "shovs_memory.memory.extract_user_stated_fact_updates",
+        lambda *_args, **_kwargs: (
+            [{"subject": "User", "predicate": "location", "object": object()}],
+            [{"subject": "User", "predicate": "location"}],
+        ),
+    )
+
+    try:
+        memory.apply_user_message("Actually I moved.", turn=2)
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("batch update should fail before committing the void")
+
+    assert memory.current_facts() == [("User", "location", "Vancouver")]
+
+
 def test_shovs_memory_default_db_path_is_resolved_once(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     memory = ShovsMemory(session_id="session-path", owner_id="owner-path")
 
     assert Path(memory.graph.db_path).is_absolute()
+
+
+def test_shovs_memory_inspector_requires_explicit_graph(tmp_path):
+    session_manager = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    session = session_manager.create(
+        model="llama3.2",
+        system_prompt="",
+        agent_id="default",
+        owner_id="owner-required-graph",
+    )
+
+    try:
+        build_memory_payload(
+            session=session,
+            owner_id="owner-required-graph",
+            graph=None,
+            context_preview=lambda raw: [],
+        )
+    except ValueError as exc:
+        assert "requires an explicit SemanticGraph" in str(exc)
+    else:
+        raise AssertionError("inspector should not default-construct a graph")
+
+
+def test_shovs_memory_inspector_counts_all_current_facts_beyond_timeline_limit(tmp_path):
+    graph = SemanticGraph(db_path=str(tmp_path / "memory_graph.db"))
+    session_manager = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    owner_id = "owner-long-count"
+    session = session_manager.create(
+        model="llama3.2",
+        system_prompt="",
+        agent_id="default",
+        owner_id=owner_id,
+    )
+    for index in range(65):
+        graph.add_temporal_fact(
+            session.id,
+            "User",
+            f"preference_{index}",
+            f"value_{index}",
+            turn=index + 1,
+            owner_id=owner_id,
+        )
+
+    payload = build_memory_payload(
+        session=session,
+        owner_id=owner_id,
+        graph=graph,
+        timeline_limit=40,
+        context_preview=lambda raw: [],
+    )
+
+    assert payload["summary"]["deterministic_fact_count"] == 65
+    assert len(payload["deterministic_facts"]) == 65
+    assert payload["summary"]["timeline_truncated"] is True
+    assert payload["graph_db_path"] == str(tmp_path / "memory_graph.db")
+
+
+def test_shovs_memory_inspector_surfaces_disputed_and_conflict_traced_facts(tmp_path):
+    graph = SemanticGraph(db_path=str(tmp_path / "memory_graph.db"))
+    session_manager = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    owner_id = "owner-dispute-demo"
+    session = session_manager.create(
+        model="llama3.2",
+        system_prompt="",
+        agent_id="default",
+        owner_id=owner_id,
+    )
+    session_manager.update_candidate_signals(
+        session.id,
+        [
+            {
+                "text": "User location may not be Toronto",
+                "reason": "evidence_disputed",
+                "signal_type": "disputed_fact",
+                "subject": "User",
+                "predicate": "location",
+                "object": "Toronto",
+            }
+        ],
+    )
+    graph.add_temporal_fact(
+        session.id,
+        "User",
+        "location",
+        "Berlin",
+        turn=2,
+        owner_id=owner_id,
+        conflict_trace=True,
+        prior_value_disputed=True,
+        conflict_reason="fresh evidence disputed prior location",
+    )
+
+    payload = build_memory_payload(
+        session=session,
+        owner_id=owner_id,
+        graph=graph,
+        context_preview=lambda raw: [],
+    )
+
+    assert payload["summary"]["disputed_fact_count"] == 1
+    assert payload["summary"]["conflict_traced_count"] == 1
+    assert payload["disputed_facts"][0]["reason"] == "evidence_disputed"
+    assert payload["conflict_traced_facts"][0]["conflict_trace"] is True
 
 
 def test_typed_fact_records_include_lifecycle_provenance_and_supersession(tmp_path):

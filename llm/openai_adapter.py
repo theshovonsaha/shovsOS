@@ -42,10 +42,12 @@ class OpenAIAdapter(BaseLLMAdapter):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: float = 120.0,
+        provider_name: str = "openai",
     ):
         self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
         self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
         self.timeout = timeout
+        self.provider_name = provider_name
         self._client = None
 
     def _get_client(self):

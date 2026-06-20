@@ -433,11 +433,15 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                 basePayload.embed_model = embedModel;
             }
             const payload = withOwnerPayload(basePayload);
-            await fetch(isEdit ? withOwnerQuery(`/api/agents/${initialAgent!.id}`) : '/api/agents', {
+            const response = await fetch(isEdit ? withOwnerQuery(`/api/agents/${initialAgent!.id}`) : '/api/agents', {
                 method: isEdit ? 'PATCH' : 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
+            if (!response.ok) {
+                const data = await response.json().catch(() => ({}));
+                throw new Error(data?.detail || `Agent save failed with HTTP ${response.status}`);
+            }
             onCreated();
         } catch (e) { console.error('Create failed:', e); }
         finally { setCreating(false); }

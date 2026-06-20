@@ -366,6 +366,7 @@ export function useAgent() {
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const audioContextRef = useRef<AudioContext | null>(null);
     const ttsChunksRef = useRef<ArrayBuffer[]>([]);
+    const chatAbortRef = useRef<AbortController | null>(null);
 
     const isSendingRef = useRef(false);
     const bottomRef = useRef<HTMLDivElement>(null);
@@ -810,6 +811,9 @@ export function useAgent() {
             ];
         });
 
+        const streamController = new AbortController();
+        chatAbortRef.current = streamController;
+
         try {
             const fd = appendOwnerId(new FormData());
             fd.append('message', text || '(see attached files)');
@@ -833,7 +837,11 @@ export function useAgent() {
             fd.append('forced_tools_json', JSON.stringify(forcedTools));
             filesToSend.forEach(f => fd.append('files', f.file));
 
-            const res = await fetch('/api/chat/stream', { method: 'POST', body: fd });
+            const res = await fetch('/api/chat/stream', {
+                method: 'POST',
+                body: fd,
+                signal: streamController.signal,
+            });
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const reader = res.body?.getReader();
             if (!reader) throw new Error('No reader');
@@ -1050,12 +1058,15 @@ export function useAgent() {
                     msg._pendingStructured = '';
                     msg.blocks = [...msg.blocks, {
                         id: 'err', type: 'text',
-                        content: `\n\n⚠ connection error: ${sanitizeVisibleText(e.message)}`,
+                        content: e?.name === 'AbortError'
+                            ? '\n\nStopped.'
+                            : `\n\n⚠ connection error: ${sanitizeVisibleText(e.message)}`,
                     }];
                 }
                 return next;
             });
         } finally {
+            if (chatAbortRef.current === streamController) chatAbortRef.current = null;
             setIsStreaming(false);
             isSendingRef.current = false;
             refreshSessionMemoryState(currentSessionId);
@@ -1276,6 +1287,7 @@ export function useAgent() {
     };
 
     const stopExecution = async () => {
+        chatAbortRef.current?.abort();
         if (!currentSessionId) return;
         try {
             await fetch(withOwnerQuery(`/api/sessions/${currentSessionId}/stop`), { method: 'POST' });

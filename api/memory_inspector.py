@@ -99,14 +99,19 @@ def build_session_memory_payload(
     graph: Optional[SemanticGraph] = None,
     trace_store: Optional[TraceStore] = None,
 ) -> dict:
+    graph_was_defaulted = graph is None
     graph = graph or SemanticGraph()
     trace_store = trace_store or get_trace_store()
 
     timeline = graph.list_temporal_facts(session.id, owner_id=owner_id, limit=40)
     if hasattr(graph, "get_current_fact_records"):
-        current_facts = graph.get_current_fact_records(session.id, owner_id=owner_id, limit=200)
+        current_facts = graph.get_current_fact_records(session.id, owner_id=owner_id, limit=None)
     else:
-        current_facts = [item for item in timeline if item.get("status") == "current"]
+        current_triples = graph.get_current_facts(session.id, owner_id=owner_id)
+        current_facts = [
+            {"subject": s, "predicate": p, "object": o, "status": "current", "memory_type": "fact"}
+            for (s, p, o) in current_triples
+        ]
     superseded_facts = [item for item in timeline if item.get("status") == "superseded"]
     typed_memory_counts: dict[str, int] = {}
     for item in current_facts:
@@ -154,6 +159,8 @@ def build_session_memory_payload(
         "model": getattr(session, "model", ""),
         "context_mode": getattr(session, "context_mode", "v1"),
         "message_count": int(getattr(session, "message_count", 0) or 0),
+        "graph_defaulted": graph_was_defaulted,
+        "graph_db_path": str(getattr(graph, "db_path", "") or ""),
         "summary": {
             "deterministic_fact_count": len(current_facts),
             "superseded_fact_count": len(superseded_facts),

@@ -168,6 +168,41 @@ def test_consumer_memory_state_endpoint_uses_consumer_sessions():
         graph.clear(owner_id=owner_id)
 
 
+def test_session_memory_state_counts_current_facts_beyond_timeline_limit():
+    owner_id = f"memory-long-count-owner-{uuid.uuid4().hex[:8]}"
+    graph = SemanticGraph()
+    graph.clear(owner_id=owner_id)
+
+    with TestClient(app) as client:
+        session = session_manager.create(
+            model="llama3.2",
+            system_prompt="",
+            agent_id="default",
+            owner_id=owner_id,
+        )
+        for index in range(65):
+            graph.add_temporal_fact(
+                session.id,
+                "User",
+                f"preference_{index}",
+                f"value_{index}",
+                turn=index + 1,
+                owner_id=owner_id,
+            )
+
+        response = client.get(f"/sessions/{session.id}/memory-state", params={"owner_id": owner_id})
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["summary"]["deterministic_fact_count"] == 65
+        assert len(payload["deterministic_facts"]) == 65
+        assert payload["graph_defaulted"] is False
+        assert payload["graph_db_path"]
+
+        session_manager.delete(session.id, owner_id=owner_id)
+        graph.clear(owner_id=owner_id)
+
+
 def test_edit_session_message_resets_derived_state_and_exposes_message_metadata(tmp_path):
     owner_id = f"edit-owner-{uuid.uuid4().hex[:8]}"
     graph = SemanticGraph()

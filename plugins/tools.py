@@ -35,6 +35,7 @@ import subprocess
 import textwrap
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -357,6 +358,528 @@ SHOPPING_ADVICE_TOOL = Tool(
     },
     handler=_shopping_advice,
     tags=["shopping", "web", "buyer"],
+    response_format="json",
+)
+
+
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+}
+
+
+def _as_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        return _json_loads_maybe(value)
+    return {}
+
+
+def _as_list(value) -> list:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        parsed = _json_loads_maybe(value)
+        if isinstance(parsed.get("results"), list):
+            return parsed["results"]
+    return []
+
+
+def _host_from_url(url: str) -> str:
+    try:
+        return (urlsplit(str(url or "")).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _result_url(item: dict) -> str:
+    return str(item.get("normalized_url") or item.get("url") or item.get("link") or "").strip().rstrip(".,")
+
+
+def _content_excerpt(text: str, max_chars: int = 1200) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[:max_chars].rstrip() + "..."
+
+
+def _fetch_success_payload(value) -> dict:
+    payload = _as_dict(value)
+    if not payload:
+        return {}
+    if payload.get("type") == "web_fetch_result" and not payload.get("error"):
+        return payload
+    return {}
+
+
+def _normalize_entity(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _extract_number_after(pattern: str, text: str, default: int = 0) -> int:
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    if not match:
+        return default
+    raw = str(match.group(1)).lower()
+    if raw.isdigit():
+        return int(raw)
+    return NUMBER_WORDS.get(raw, default)
+
+
+def _infer_source_contract(objective: str, entities: Optional[list[str]] = None) -> dict:
+    text = str(objective or "")
+    lowered = text.lower()
+    entity_count = len([e for e in (entities or []) if str(e).strip()])
+    top_count = _extract_number_after(r"\btop\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", lowered)
+    if top_count:
+        entity_count = top_count
+    if not entity_count:
+        entity_count = _extract_number_after(
+            r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+            r"(?:stocks|companies|products|items|tools|options|entities|sources)\b",
+            lowered,
+        )
+
+    per_entity = _extract_number_after(
+        r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+        r"(?:relevant\s+)?(?:results?|sources?|urls?|links?|articles?|pages?)\s+(?:for\s+)?(?:each|per)\b",
+        lowered,
+    )
+    total_fetches = _extract_number_after(r"\b(?:fetch|read|open)\s+(?:all\s+)?(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+urls?\b", lowered)
+    if not total_fetches:
+        total_fetches = _extract_number_after(r"\ball\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+urls?\b", lowered)
+    if not per_entity and total_fetches and entity_count:
+        per_entity = max(1, total_fetches // entity_count)
+    if not total_fetches and entity_count and per_entity:
+        total_fetches = entity_count * per_entity
+
+    needs_separate_queries = bool(re.search(r"\b(each|separately|per)\b", lowered))
+    needs_fetch = bool(re.search(r"\b(fetch|read|open|visit)\b", lowered))
+    return {
+        "objective": text.strip(),
+        "entity_count": max(0, min(entity_count, 20)),
+        "results_per_entity": max(0, min(per_entity, 20)),
+        "total_fetches": max(0, min(total_fetches, 100)),
+        "needs_separate_queries": needs_separate_queries,
+        "needs_fetch": needs_fetch,
+        "workflow": [
+            "discover_entities",
+            "lock_entities",
+            "search_each_entity" if needs_separate_queries else "search_sources",
+            "select_urls",
+            "fetch_selected_urls" if needs_fetch else "summarize_sources",
+            "verify_coverage",
+            "answer_from_fetched_sources",
+        ],
+    }
+
+
+async def _source_contract(objective: str, entities: Optional[list[str]] = None, topic: str = "") -> str:
+    """Infer a deterministic source-gathering contract from a user request."""
+    clean_entities = [_normalize_entity(item) for item in (entities or []) if _normalize_entity(item)]
+    contract = _infer_source_contract(objective, clean_entities)
+    query_templates = []
+    if clean_entities:
+        query_templates = [f"{entity} {topic}".strip() for entity in clean_entities]
+    elif topic:
+        query_templates = [topic.strip()]
+    return json.dumps({
+        "type": "source_contract",
+        "success": True,
+        "contract": contract,
+        "locked_entities": clean_entities,
+        "query_templates": query_templates,
+        "rules": [
+            "Do not introduce new entities after lock_entities unless the user changes the objective.",
+            "Fetch only URLs selected from prior search results.",
+            "A final answer may cite only fetched URLs or successful deterministic facts.",
+            "If required slots are missing, call source_next_action instead of guessing.",
+        ],
+    })
+
+
+async def _source_select(
+    search_payloads: Optional[list] = None,
+    entities: Optional[list[str]] = None,
+    per_entity: int = 3,
+    allowed_domains: Optional[list[str]] = None,
+    blocked_domains: Optional[list[str]] = None,
+) -> str:
+    """Select deterministic fetch URLs from one or more web_search payloads."""
+    per_entity = max(1, min(int(per_entity or 3), 20))
+    clean_entities = [_normalize_entity(item) for item in (entities or []) if _normalize_entity(item)]
+    allowed = {str(domain or "").lower().lstrip(".") for domain in (allowed_domains or []) if str(domain or "").strip()}
+    blocked = {str(domain or "").lower().lstrip(".") for domain in (blocked_domains or []) if str(domain or "").strip()}
+    selected: dict[str, list[dict]] = {entity: [] for entity in clean_entities} if clean_entities else {"general": []}
+    seen_urls: set[str] = set()
+    domain_counts: dict[str, int] = {}
+
+    for payload in search_payloads or []:
+        parsed = _as_dict(payload)
+        query = str(parsed.get("query") or "")
+        results = parsed.get("results") if isinstance(parsed.get("results"), list) else _as_list(payload)
+        query_target = ""
+        for entity in clean_entities:
+            if re.search(rf"\b{re.escape(entity)}\b", query, flags=re.IGNORECASE):
+                query_target = entity
+                break
+        target_keys = [query_target] if query_target else (clean_entities or ["general"])
+        for raw in results or []:
+            if not isinstance(raw, dict):
+                continue
+            url = _result_url(raw)
+            host = str(raw.get("host") or _host_from_url(url))
+            if not url.startswith("http") or url in seen_urls:
+                continue
+            if allowed and not any(host == domain or host.endswith(f".{domain}") for domain in allowed):
+                continue
+            if blocked and any(host == domain or host.endswith(f".{domain}") for domain in blocked):
+                continue
+            for key in target_keys:
+                if len(selected.setdefault(key, [])) >= per_entity:
+                    continue
+                selected[key].append({
+                    "url": url,
+                    "host": host,
+                    "title": str(raw.get("title") or "")[:180],
+                    "snippet": re.sub(r"\s+", " ", str(raw.get("snippet") or ""))[:280],
+                    "rank": raw.get("rank"),
+                    "source_query": query,
+                })
+                seen_urls.add(url)
+                domain_counts[host] = domain_counts.get(host, 0) + 1
+                break
+
+    missing = [key for key, urls in selected.items() if len(urls) < per_entity]
+    flattened = [item for urls in selected.values() for item in urls]
+    return json.dumps({
+        "type": "source_selection",
+        "success": bool(flattened),
+        "selected_by_entity": selected,
+        "selected_urls": [item["url"] for item in flattened],
+        "coverage": {
+            "required_per_entity": per_entity,
+            "missing_entities": missing,
+            "domain_counts": domain_counts,
+            "selected_count": len(flattened),
+        },
+        "next_hint": "fetch_selected_urls" if flattened else "run_more_targeted_searches",
+    })
+
+
+async def _source_next_action(
+    objective: str,
+    contract: Optional[dict] = None,
+    entities: Optional[list[str]] = None,
+    searched_queries: Optional[list[str]] = None,
+    selected_urls: Optional[list[str]] = None,
+    fetched_urls: Optional[list[str]] = None,
+    topic: str = "",
+) -> str:
+    """Compute the next deterministic source-gathering action from state."""
+    clean_entities = [_normalize_entity(item) for item in (entities or []) if _normalize_entity(item)]
+    resolved_contract = contract if isinstance(contract, dict) else _infer_source_contract(objective, clean_entities)
+    searched = {str(item or "").lower().strip() for item in (searched_queries or []) if str(item or "").strip()}
+    selected = [str(item or "").strip() for item in (selected_urls or []) if str(item or "").strip()]
+    fetched = {str(item or "").strip() for item in (fetched_urls or []) if str(item or "").strip()}
+    per_entity = max(1, int(resolved_contract.get("results_per_entity") or 1))
+    entity_count = int(resolved_contract.get("entity_count") or len(clean_entities) or 0)
+    total_fetches = int(resolved_contract.get("total_fetches") or (entity_count * per_entity if entity_count else len(selected)))
+
+    if entity_count and len(clean_entities) < entity_count:
+        return json.dumps({
+            "type": "source_next_action",
+            "status": "missing_input",
+            "next_tool": "web_search",
+            "arguments": {"query": topic or objective},
+            "reason": f"Need {entity_count} locked entities before targeted source collection.",
+            "missing_slots": ["locked_entities"],
+        })
+
+    for entity in clean_entities:
+        query = f"{entity} {topic}".strip() or entity
+        if query.lower() not in searched:
+            return json.dumps({
+                "type": "source_next_action",
+                "status": "continue",
+                "next_tool": "web_search",
+                "arguments": {"query": query},
+                "reason": f"Entity '{entity}' has not been searched with the locked query.",
+                "missing_slots": [f"{entity}_search_results"],
+            })
+
+    unfetched = [url for url in selected if url and url not in fetched]
+    if unfetched and len(fetched) < total_fetches:
+        return json.dumps({
+            "type": "source_next_action",
+            "status": "continue",
+            "next_tool": "web_fetch",
+            "arguments": {"url": unfetched[0]},
+            "reason": f"Fetch selected URL {len(fetched) + 1} of {total_fetches}.",
+            "missing_slots": [f"{max(0, total_fetches - len(fetched))}_remaining_fetches"],
+        })
+
+    if len(fetched) < total_fetches:
+        return json.dumps({
+            "type": "source_next_action",
+            "status": "missing_input",
+            "next_tool": "source_select",
+            "arguments": {"entities": clean_entities, "per_entity": per_entity},
+            "reason": "More selected URLs are required before fetch can complete.",
+            "missing_slots": ["selected_urls"],
+        })
+
+    return json.dumps({
+        "type": "source_next_action",
+        "status": "finalize",
+        "next_tool": "",
+        "arguments": {},
+        "reason": "Required source coverage is complete.",
+        "missing_slots": [],
+    })
+
+
+async def _web_fetch_batch(
+    urls: list[str],
+    max_chars_per_url: int = 4000,
+    use_jina: bool = True,
+    max_urls: int = 12,
+) -> str:
+    """Fetch multiple selected URLs sequentially with compact structured output."""
+    max_urls = max(1, min(int(max_urls or 12), 20))
+    max_chars_per_url = max(500, min(int(max_chars_per_url or 4000), 12000))
+    seen: set[str] = set()
+    selected_urls: list[str] = []
+    for raw_url in urls or []:
+        url = str(raw_url or "").strip().rstrip(".,")
+        if not url.startswith("http") or url in seen:
+            continue
+        seen.add(url)
+        selected_urls.append(url)
+        if len(selected_urls) >= max_urls:
+            break
+
+    fetched_sources: list[dict] = []
+    failures: list[dict] = []
+    for url in selected_urls:
+        raw = await _web_fetch(url, max_chars=max_chars_per_url, use_jina=use_jina)
+        payload = _as_dict(raw)
+        success_payload = _fetch_success_payload(payload)
+        if success_payload:
+            content = str(success_payload.get("content") or "")
+            fetched_sources.append({
+                "url": str(success_payload.get("url") or url),
+                "final_url": str(success_payload.get("final_url") or success_payload.get("url") or url),
+                "host": str(success_payload.get("host") or _host_from_url(url)),
+                "title": str(success_payload.get("title") or url)[:180],
+                "status_code": success_payload.get("status_code"),
+                "backend": success_payload.get("backend"),
+                "content_excerpt": _content_excerpt(content, max_chars=1600),
+                "total_length": success_payload.get("total_length"),
+                "truncated": bool(success_payload.get("truncated")),
+            })
+        else:
+            failures.append({
+                "url": url,
+                "error": str(payload.get("error") or "fetch failed"),
+                "type": str(payload.get("type") or "web_fetch_error"),
+            })
+
+    return json.dumps({
+        "type": "web_fetch_batch_result",
+        "success": bool(fetched_sources),
+        "requested_count": len(urls or []),
+        "attempted_count": len(selected_urls),
+        "fetched_count": len(fetched_sources),
+        "failed_count": len(failures),
+        "fetched_urls": [item["url"] for item in fetched_sources],
+        "fetched_sources": fetched_sources,
+        "failures": failures,
+        "answer_rules": [
+            "Cite only fetched_sources.url or fetched_sources.final_url.",
+            "Do not claim details that are not present in content_excerpt.",
+            "If failed_count is nonzero, disclose the fetch gap briefly.",
+        ],
+    })
+
+
+async def _source_coverage(
+    contract: Optional[dict] = None,
+    entities: Optional[list[str]] = None,
+    selected_payload: Optional[dict] = None,
+    fetch_payloads: Optional[list] = None,
+    fetched_urls: Optional[list[str]] = None,
+) -> str:
+    """Verify source-gathering coverage against a deterministic contract."""
+    clean_entities = [_normalize_entity(item) for item in (entities or []) if _normalize_entity(item)]
+    resolved_contract = contract if isinstance(contract, dict) else {}
+    per_entity = max(1, int(resolved_contract.get("results_per_entity") or 1))
+    required_entities = int(resolved_contract.get("entity_count") or len(clean_entities) or 0)
+    total_required = int(resolved_contract.get("total_fetches") or (required_entities * per_entity if required_entities else 0))
+
+    selection = selected_payload if isinstance(selected_payload, dict) else _as_dict(selected_payload)
+    selected_by_entity = selection.get("selected_by_entity") if isinstance(selection.get("selected_by_entity"), dict) else {}
+    selected_urls = [
+        str(url or "").strip()
+        for url in (selection.get("selected_urls") or [])
+        if str(url or "").strip()
+    ]
+    fetched: set[str] = {str(url or "").strip() for url in (fetched_urls or []) if str(url or "").strip()}
+    fetched_sources: list[dict] = []
+    for payload in fetch_payloads or []:
+        parsed = _as_dict(payload)
+        if parsed.get("type") == "web_fetch_batch_result":
+            for source in parsed.get("fetched_sources") or []:
+                if isinstance(source, dict):
+                    fetched_sources.append(source)
+                    if source.get("url"):
+                        fetched.add(str(source.get("url")))
+                    if source.get("final_url"):
+                        fetched.add(str(source.get("final_url")))
+            continue
+        success_payload = _fetch_success_payload(parsed)
+        if success_payload:
+            fetched_sources.append(success_payload)
+            if success_payload.get("url"):
+                fetched.add(str(success_payload.get("url")))
+            if success_payload.get("final_url"):
+                fetched.add(str(success_payload.get("final_url")))
+
+    entity_status: dict[str, dict] = {}
+    missing_slots: list[str] = []
+    for entity in clean_entities:
+        selected_items = selected_by_entity.get(entity) if isinstance(selected_by_entity.get(entity), list) else []
+        entity_selected_urls = [
+            str(item.get("url") or "").strip()
+            for item in selected_items
+            if isinstance(item, dict) and str(item.get("url") or "").strip()
+        ]
+        entity_fetched = [url for url in entity_selected_urls if url in fetched]
+        if len(entity_selected_urls) < per_entity:
+            missing_slots.append(f"{entity}_selected_urls")
+        if len(entity_fetched) < min(per_entity, len(entity_selected_urls) or per_entity):
+            missing_slots.append(f"{entity}_fetched_urls")
+        entity_status[entity] = {
+            "selected": len(entity_selected_urls),
+            "fetched": len(entity_fetched),
+            "required": per_entity,
+            "complete": len(entity_selected_urls) >= per_entity and len(entity_fetched) >= per_entity,
+        }
+
+    if required_entities and len(clean_entities) < required_entities:
+        missing_slots.append("locked_entities")
+    if total_required and len(fetched) < total_required:
+        missing_slots.append("total_fetched_urls")
+
+    complete = not missing_slots
+    next_tool = ""
+    if not complete:
+        if "total_fetched_urls" in missing_slots and selected_urls:
+            unfetched = [url for url in selected_urls if url not in fetched]
+            next_tool = "web_fetch_batch" if unfetched else "source_select"
+        elif any(slot.endswith("_selected_urls") for slot in missing_slots):
+            next_tool = "source_select"
+        else:
+            next_tool = "source_next_action"
+
+    return json.dumps({
+        "type": "source_coverage",
+        "success": True,
+        "complete": complete,
+        "status": "complete" if complete else "incomplete",
+        "missing_slots": list(dict.fromkeys(missing_slots)),
+        "entity_status": entity_status,
+        "required": {
+            "entity_count": required_entities,
+            "results_per_entity": per_entity,
+            "total_fetches": total_required,
+        },
+        "observed": {
+            "locked_entities": len(clean_entities),
+            "selected_urls": len(selected_urls),
+            "fetched_urls": len(fetched),
+            "fetched_sources": len(fetched_sources),
+        },
+        "next_tool": next_tool,
+        "answer_allowed": complete,
+    })
+
+
+SOURCE_CONTRACT_TOOL = Tool(
+    name="source_contract",
+    description=(
+        "Deterministically convert a research/shopping/news request into a source-gathering contract: "
+        "how many entities, how many URLs per entity, whether separate searches are required, and what must be fetched. "
+        "Use before web_search for multi-source workflows."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "objective": {"type": "string", "description": "The user's exact objective."},
+            "entities": {"type": "array", "items": {"type": "string"}, "description": "Already locked entities, if known."},
+            "topic": {"type": "string", "description": "Optional query topic, e.g. 'stock news June 13 2026'."},
+        },
+        "required": ["objective"],
+    },
+    handler=_source_contract,
+    tags=["kernel", "source", "web"],
+    response_format="json",
+)
+
+
+SOURCE_SELECT_TOOL = Tool(
+    name="source_select",
+    description=(
+        "Deterministically select fetch URLs from web_search JSON payloads. Dedupes URLs, tracks host coverage, "
+        "groups by locked entity, and reports missing coverage. Use before web_fetch."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "search_payloads": {"type": "array", "items": {}, "description": "One or more web_search JSON payloads."},
+            "entities": {"type": "array", "items": {"type": "string"}, "description": "Locked entities to group URLs under."},
+            "per_entity": {"type": "integer", "description": "URLs required per entity.", "default": 3},
+            "allowed_domains": {"type": "array", "items": {"type": "string"}, "description": "Optional allowed domains."},
+            "blocked_domains": {"type": "array", "items": {"type": "string"}, "description": "Optional blocked domains."},
+        },
+        "required": ["search_payloads"],
+    },
+    handler=_source_select,
+    tags=["kernel", "source", "web"],
+    response_format="json",
+)
+
+
+SOURCE_NEXT_ACTION_TOOL = Tool(
+    name="source_next_action",
+    description=(
+        "Given the source contract and observed state, deterministically return the next tool call needed "
+        "or finalize. Use when the model is unsure whether to search, select URLs, fetch, or answer."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "objective": {"type": "string", "description": "The user's exact objective."},
+            "contract": {"type": "object", "description": "A source_contract.contract object, if available."},
+            "entities": {"type": "array", "items": {"type": "string"}, "description": "Locked entities."},
+            "searched_queries": {"type": "array", "items": {"type": "string"}, "description": "Queries already searched."},
+            "selected_urls": {"type": "array", "items": {"type": "string"}, "description": "URLs selected for fetch."},
+            "fetched_urls": {"type": "array", "items": {"type": "string"}, "description": "URLs already fetched successfully."},
+            "topic": {"type": "string", "description": "Query suffix to use for entity searches."},
+        },
+        "required": ["objective"],
+    },
+    handler=_source_next_action,
+    tags=["kernel", "source", "web"],
     response_format="json",
 )
 
@@ -2067,6 +2590,9 @@ RAG_SEARCH_TOOL = Tool(
 ALL_TOOLS = [
     WEB_SEARCH_TOOL,
     WEB_FETCH_TOOL,
+    SOURCE_CONTRACT_TOOL,
+    SOURCE_SELECT_TOOL,
+    SOURCE_NEXT_ACTION_TOOL,
     SHOPPING_ADVICE_TOOL,
     IMAGE_SEARCH_TOOL,
     BASH_TOOL,

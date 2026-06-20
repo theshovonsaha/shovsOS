@@ -275,7 +275,14 @@ def _curate_results(raw_results: list[dict], num_results: int) -> tuple[list[dic
         if source and not source.endswith("-error"):
             signal_score += SOURCE_SIGNAL_WEIGHT
 
-        curated: dict[str, Any] = {"title": title, "url": url, "snippet": snippet}
+        host = _extract_host(url)
+        curated: dict[str, Any] = {
+            "title": title,
+            "url": url,
+            "normalized_url": url,
+            "host": host,
+            "snippet": snippet,
+        }
         if source:
             curated["source"] = source
         if item.get("published"):
@@ -287,9 +294,10 @@ def _curate_results(raw_results: list[dict], num_results: int) -> tuple[list[dic
 
     cleaned.sort(key=lambda r: r.get("_signal_score", 0), reverse=True)
     final_results = []
-    for entry in cleaned[:num_results]:
+    for rank, entry in enumerate(cleaned[:num_results], start=1):
         item = dict(entry)
         item.pop("_signal_score", None)
+        item["rank"] = rank
         final_results.append(item)
 
     return final_results, {
@@ -753,6 +761,7 @@ async def _web_search(query: str, num_results: int = 8, backend: str = "auto", s
         "results": curated_results,
         "backend": backend_name,
         "engine": backend_name,
+        "result_count": len(curated_results),
         "context_summary": context_summary,
     })
 

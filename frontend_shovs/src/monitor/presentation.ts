@@ -61,6 +61,17 @@ export interface RunReplayArtifact {
   created_at?: string;
 }
 
+export interface RunReplayEval {
+  eval_id: string;
+  eval_type: string;
+  phase: string;
+  passed: boolean;
+  score?: number | null;
+  detail?: string;
+  metadata?: Record<string, unknown> | null;
+  created_at?: string;
+}
+
 export interface RunReplayCheckpoint {
   checkpoint_id: number;
   phase: string;
@@ -125,6 +136,7 @@ export interface RunReplayResponse {
   checkpoints?: RunReplayCheckpoint[];
   passes?: RunReplayPass[];
   artifacts?: RunReplayArtifact[];
+  evals?: RunReplayEval[];
   evidence?: RunReplayEvidence[];
 }
 
@@ -577,6 +589,24 @@ export function buildReplaySections(
         ),
         detail: artifact.tool_name || undefined,
         tone: 'good',
+      })),
+    });
+  }
+
+  if ((runReplay.evals || []).length > 0) {
+    sections.push({
+      id: 'evals',
+      title: 'Evaluations',
+      entries: (runReplay.evals || []).slice(-4).reverse().map((item) => ({
+        id: item.eval_id,
+        title: item.eval_type.replace(/_/g, ' '),
+        eyebrow: item.phase,
+        summary: clipText(String(item.detail || 'No evaluation detail.'), 180),
+        detail:
+          typeof item.score === 'number'
+            ? `score ${Math.round(item.score * 100)}%`
+            : undefined,
+        tone: item.passed ? 'good' : 'warn',
       })),
     });
   }

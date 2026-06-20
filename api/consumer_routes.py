@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from orchestration.agent_profiles import ProfileManager
 from orchestration.session_manager import SessionManager
 from engine.file_processor import FileProcessor
+from memory.semantic_graph import SemanticGraph
 from llm.adapter_factory import create_adapter
 from plugins.tool_registry import ToolRegistry
 from api.memory_inspector import build_session_memory_payload
@@ -58,6 +59,7 @@ def make_consumer_router(
     consumer_store: ConsumerStoreService,
     tool_registry: ToolRegistry,
     run_engine: RunEngine,
+    graph: Optional[SemanticGraph] = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/consumer", tags=["consumer"])
     _require_owner_id = require_owner_id
@@ -69,6 +71,7 @@ def make_consumer_router(
         openai = create_adapter("openai")
         gemini = create_adapter("gemini")
         anthropic = create_adapter("anthropic")
+        nvidia = create_adapter("nvidia")
         return {
             "status": "ok",
             "providers": {
@@ -77,12 +80,13 @@ def make_consumer_router(
                 "openai": await openai.health(),
                 "gemini": await gemini.health(),
                 "anthropic": await anthropic.health(),
+                "nvidia": await nvidia.health(),
             },
         }
 
     @router.get("/models")
     async def consumer_models():
-        grouped = {"ollama": [], "groq": [], "openai": [], "gemini": [], "anthropic": []}
+        grouped = {"ollama": [], "groq": [], "openai": [], "gemini": [], "anthropic": [], "nvidia": []}
         for provider in grouped:
             try:
                 adapter = create_adapter(provider)
@@ -299,6 +303,7 @@ def make_consumer_router(
             session=session,
             owner_id=owner_id,
             context_preview=lambda raw: [line for line in (raw or "").splitlines() if line.strip()],
+            graph=graph,
         )
 
     @router.get("/sessions")

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable
 
 from engine.candidate_signals import parse_candidate_context
 from memory.semantic_graph import SemanticGraph
@@ -11,7 +11,7 @@ def build_memory_payload(
     session,
     owner_id: str,
     context_preview: Callable[[str], list[str]],
-    graph: Optional[SemanticGraph] = None,
+    graph: SemanticGraph,
     timeline_limit: int = 40,
 ) -> dict:
     """Build the full inspectable memory state for one session.
@@ -21,18 +21,16 @@ def build_memory_payload(
         truncated timeline slice. The timeline limit only bounds the
         history view; it must never make active facts disappear from
         the summary counts.
-      - `graph` should be passed explicitly. Default-constructing one
-        opens the default db_path, which silently diverges from a
-        facade configured with a custom path. We keep the fallback for
-        backward compatibility but flag it in the payload so a mismatch
-        is visible instead of mysterious.
+      - `graph` must be passed explicitly. Default-constructing here would
+        open the default db_path and silently inspect a different database
+        from the facade/runtime that stored the facts.
     """
-    graph_was_defaulted = graph is None
-    graph = graph or SemanticGraph()
+    if graph is None:
+        raise ValueError("build_memory_payload() requires an explicit SemanticGraph instance")
 
     # ── Current truth: authoritative source, no limit applied ──
     if hasattr(graph, "get_current_fact_records"):
-        current_facts = graph.get_current_fact_records(session.id, owner_id=owner_id, limit=200)
+        current_facts = graph.get_current_fact_records(session.id, owner_id=owner_id, limit=None)
     else:
         current_triples = graph.get_current_facts(session.id, owner_id=owner_id)
         current_facts = [
@@ -80,7 +78,7 @@ def build_memory_payload(
         "model": getattr(session, "model", ""),
         "context_mode": getattr(session, "context_mode", "v1"),
         "message_count": int(getattr(session, "message_count", 0) or 0),
-        "graph_defaulted": graph_was_defaulted,
+        "graph_db_path": str(getattr(graph, "db_path", "") or ""),
         "summary": {
             "deterministic_fact_count": len(current_facts),
             "superseded_fact_count": len(superseded_facts),

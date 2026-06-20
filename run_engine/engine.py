@@ -17,6 +17,7 @@ from engine.deterministic_facts import extract_user_stated_fact_updates
 from engine.direct_fact_policy import should_answer_direct_fact_from_memory
 from engine.side_effect_guard import check_plan_for_side_effects, check_side_effect_claims
 from engine.tool_loop_guard import ToolLoopGuard
+from engine.response_guard import guard_final_response, is_small_or_local_model
 from engine.tool_contract import (
     canonical_tool_call,
     clip_text,
@@ -153,6 +154,440 @@ Rules:
 
 
 _REDRAFT_ISSUE_THRESHOLD = 2
+_URL_RE = re.compile(r"https?://[^\s\"'<>),\]]+", re.IGNORECASE)
+_TICKER_RE = re.compile(r"\b[A-Z]{2,5}\b")
+_TICKER_STOPWORDS = {
+    "THE", "AND", "FOR", "WITH", "FROM", "THIS", "THAT", "TODAY", "STOCK",
+    "STOCKS", "NYSE", "NASDAQ", "AMEX", "ETF", "ETFS", "CEO", "CFO", "SEC",
+    "US", "USA", "USD", "AI", "API", "URL", "JSON", "HTTP", "HTTPS",
+}
+
+
+def _safe_json_payload(raw: str) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                parsed = json.loads(text[start:end + 1])
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+    return {}
+
+
+def _tool_success_count(tool_results: list[dict[str, Any]], tool_name: str) -> int:
+    return sum(
+        1
+        for item in tool_results
+        if str(item.get("tool_name") or "") == tool_name and bool(item.get("success"))
+    )
+
+
+def _tool_argument_value(item: dict[str, Any], key: str) -> str:
+    args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+    return str(args.get(key) or "").strip()
+
+
+def _extract_urls_from_tool_results(tool_results: list[dict[str, Any]], *, limit: int = 12) -> list[str]:
+    urls: list[str] = []
+    seen: set[str] = set()
+    for item in tool_results:
+        if not item.get("success"):
+            continue
+        content = str(item.get("content") or "")
+        payload = _safe_json_payload(content)
+        candidates: list[str] = []
+        extracted_urls = item.get("extracted_urls")
+        if isinstance(extracted_urls, list):
+            candidates.extend(str(url) for url in extracted_urls)
+        if payload:
+            if payload.get("url"):
+                candidates.append(str(payload.get("url")))
+            results = payload.get("results") or payload.get("organic_results") or []
+            if isinstance(results, list):
+                for result in results:
+                    if isinstance(result, dict):
+                        candidates.append(str(result.get("url") or result.get("link") or ""))
+        candidates.extend(match.group(0).rstrip(".,") for match in _URL_RE.finditer(content))
+        for url in candidates:
+            clean = url.strip().rstrip(".,")
+            if not clean.startswith("http") or clean in seen:
+                continue
+            seen.add(clean)
+            urls.append(clean)
+            if len(urls) >= limit:
+                return urls
+    return urls
+
+
+def _find_cached_retry_sensitive_result(
+    tool_results: list[dict[str, Any]],
+    *,
+    tool_name: str,
+    arguments: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return a prior successful web result for the same exact tool call."""
+    signature = tool_call_signature(tool_name, arguments or {})
+    for item in reversed(tool_results or []):
+        if not isinstance(item, dict) or not item.get("success"):
+            continue
+        prior_signature = tool_call_signature(
+            str(item.get("tool_name") or ""),
+            item.get("arguments") if isinstance(item.get("arguments"), dict) else {},
+        )
+        if prior_signature == signature:
+            return item
+    return None
+
+
+def _extract_mover_tickers_from_fetched_pages(tool_results: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
+    tickers: list[str] = []
+    seen: set[str] = set()
+    for item in tool_results:
+        if str(item.get("tool_name") or "") != "web_fetch" or not item.get("success"):
+            continue
+        content = str(item.get("content") or "")
+        payload = _safe_json_payload(content)
+        if payload and payload.get("content"):
+            content = str(payload.get("content") or "")
+        if not re.search(r"\b(market movers|top stock market gainers|gainers)\b", content, re.IGNORECASE):
+            continue
+        gainers_block = content
+        gainers_match = re.search(r"##\s*Gainers(?P<body>.*?)(?:##\s*Losers|##\s*Actives|$)", content, re.IGNORECASE | re.DOTALL)
+        if gainers_match:
+            gainers_block = gainers_match.group("body")
+        for line in gainers_block.splitlines():
+            if "|" not in line or "+" not in line:
+                continue
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) < 3:
+                continue
+            stock_cell = cells[1] if len(cells) > 1 else line
+            candidates = [match.group(0).upper() for match in _TICKER_RE.finditer(stock_cell)]
+            if not candidates:
+                candidates = [match.group(1).upper() for match in re.finditer(r"/stocks/[^/)]+/([a-z]{1,5})/quote", stock_cell, re.IGNORECASE)]
+            for ticker in reversed(candidates):
+                if ticker in _TICKER_STOPWORDS or ticker in seen:
+                    continue
+                seen.add(ticker)
+                tickers.append(ticker)
+                if len(tickers) >= limit:
+                    return tickers
+                break
+    return tickers
+
+
+def _select_movers_source_url(urls: list[str]) -> str:
+    if not urls:
+        return ""
+    priority_patterns = (
+        "morningstar.com/markets/movers",
+        "marketwatch.com/tools/stockresearch/marketmap",
+        "bankrate.com/investing/best-performing-stocks",
+        "nasdaq.com/market-activity/stocks/screener",
+    )
+    lowered = [(url, url.lower()) for url in urls]
+    for pattern in priority_patterns:
+        for url, low in lowered:
+            if pattern in low:
+                return url
+    for url, low in lowered:
+        if any(term in low for term in ("movers", "gainers", "best-performing-stocks")):
+            return url
+    return ""
+
+
+def _extract_stock_tickers_from_tool_results(tool_results: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
+    mover_tickers = _extract_mover_tickers_from_fetched_pages(tool_results, limit=limit)
+    if len(mover_tickers) >= limit:
+        return mover_tickers[:limit]
+
+    counts: dict[str, int] = {}
+    for item in tool_results:
+        if str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
+            continue
+        content = str(item.get("content") or "")
+        payload = _safe_json_payload(content)
+        texts: list[str] = []
+        results = payload.get("results") or payload.get("organic_results") or []
+        if isinstance(results, list):
+            for result in results[:10]:
+                if not isinstance(result, dict):
+                    continue
+                texts.extend([
+                    str(result.get("title") or ""),
+                    str(result.get("snippet") or result.get("description") or ""),
+                ])
+        texts.append(content[:3000])
+        for text in texts:
+            for match in _TICKER_RE.finditer(text):
+                ticker = match.group(0).upper()
+                if ticker in _TICKER_STOPWORDS:
+                    continue
+                counts[ticker] = counts.get(ticker, 0) + 1
+    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    return [ticker for ticker, _ in ranked[:limit]]
+
+
+def _explicit_stock_source_workflow_requested(objective: str) -> bool:
+    text = str(objective or "").lower()
+    return (
+        "stock" in text
+        and ("top 3" in text or "three" in text or "3 stocks" in text)
+        and ("separately" in text or "each" in text)
+        and ("web fetch" in text or "fetch" in text)
+        and ("9" in text or "3 relevant" in text or "three relevant" in text)
+    )
+
+
+def _source_collection_contract_from_objective(objective: str) -> dict[str, int]:
+    """Extract the topic-agnostic collection shape from a user request.
+
+    This intentionally captures only the execution contract, not the domain:
+    lock N entities, gather M candidate URLs per entity, then fetch N*M URLs.
+    Domain-specific code may provide the entity extractor, but it must feed
+    this same quota model so search-result noise cannot become new targets.
+    """
+    text = str(objective or "").lower()
+    if not ("fetch" in text and ("url" in text or "source" in text or "result" in text)):
+        return {}
+    if not ("separately" in text or "each" in text or "per " in text):
+        return {}
+
+    entity_count = 0
+    top_match = re.search(r"\btop\s+(\d+)\b", text)
+    if top_match:
+        entity_count = int(top_match.group(1))
+    elif re.search(r"\bthree\b", text):
+        entity_count = 3
+    entity_match = re.search(r"\b(\d+)\s+(?:stocks|companies|products|tools|items|entities)\b", text)
+    if entity_match:
+        entity_count = int(entity_match.group(1))
+
+    per_entity = 0
+    per_match = re.search(
+        r"\b(\d+)\s+(?:relevant\s+)?(?:results?|sources?|urls?|links?|articles?)\s+(?:for\s+)?each\b",
+        text,
+    )
+    if per_match:
+        per_entity = int(per_match.group(1))
+    elif re.search(r"\bthree\s+(?:relevant\s+)?(?:results?|sources?|urls?|links?|articles?)\s+(?:for\s+)?each\b", text):
+        per_entity = 3
+
+    total_urls = 0
+    total_match = re.search(r"\b(?:all\s+)?(\d+)\s+urls?\b", text)
+    if total_match:
+        total_urls = int(total_match.group(1))
+
+    if entity_count <= 0 and total_urls and per_entity:
+        entity_count = max(1, total_urls // per_entity)
+    if per_entity <= 0 and total_urls and entity_count:
+        per_entity = max(1, total_urls // entity_count)
+    if total_urls <= 0 and entity_count and per_entity:
+        total_urls = entity_count * per_entity
+
+    if entity_count <= 0 or per_entity <= 0:
+        return {}
+    return {
+        "entity_count": min(entity_count, 12),
+        "urls_per_entity": min(per_entity, 10),
+        "total_urls": min(total_urls or entity_count * per_entity, 60),
+    }
+
+
+def _default_tool_turn_budget(objective: str, requested_max_turns: Optional[int]) -> int:
+    if requested_max_turns is not None:
+        return max(1, min(int(requested_max_turns), 24))
+    source_contract = _source_collection_contract_from_objective(objective)
+    if source_contract:
+        # discovery + one search per entity + one fetch per required URL + slack
+        return min(24, 3 + source_contract["entity_count"] + source_contract["total_urls"])
+    return 3
+
+
+def _urls_by_entity_from_search_results(
+    *,
+    tool_results: list[dict[str, Any]],
+    entities: list[str],
+    per_entity: int,
+) -> dict[str, list[str]]:
+    by_entity: dict[str, list[str]] = {entity: [] for entity in entities}
+    seen: set[str] = set()
+    for item in tool_results:
+        if str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
+            continue
+        query = _tool_argument_value(item, "query").upper()
+        entity = next((candidate for candidate in entities if re.search(rf"\b{re.escape(candidate)}\b", query)), "")
+        if not entity:
+            continue
+        extracted_urls = item.get("extracted_urls")
+        if isinstance(extracted_urls, list):
+            for extracted_url in extracted_urls:
+                url = str(extracted_url or "").strip().rstrip(".,")
+                if not url.startswith("http") or url in seen:
+                    continue
+                seen.add(url)
+                by_entity[entity].append(url)
+                if len(by_entity[entity]) >= per_entity:
+                    break
+            if len(by_entity[entity]) >= per_entity:
+                continue
+        payload = _safe_json_payload(str(item.get("content") or ""))
+        results = payload.get("results") or payload.get("organic_results") or []
+        if not isinstance(results, list):
+            continue
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url") or result.get("link") or "").strip().rstrip(".,")
+            if not url.startswith("http") or url in seen:
+                continue
+            seen.add(url)
+            by_entity[entity].append(url)
+            if len(by_entity[entity]) >= per_entity:
+                break
+    return by_entity
+
+
+def _stock_source_workflow_override(
+    *,
+    objective: str,
+    allowed_tools: list[dict[str, Any]],
+    tool_results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not _explicit_stock_source_workflow_requested(objective):
+        return {}
+
+    contract = _source_collection_contract_from_objective(objective) or {
+        "entity_count": 3,
+        "urls_per_entity": 3,
+        "total_urls": 9,
+    }
+    entity_count = int(contract["entity_count"])
+    urls_per_entity = int(contract["urls_per_entity"])
+    total_urls = int(contract["total_urls"])
+
+    allowed = {str(item.get("name") or "") for item in allowed_tools if isinstance(item, dict)}
+    tickers = _extract_stock_tickers_from_tool_results(tool_results, limit=entity_count)
+    targeted_queries = [
+        _tool_argument_value(item, "query").upper()
+        for item in tool_results
+        if str(item.get("tool_name") or "") == "web_search" and item.get("success")
+    ]
+    searched_tickers = {
+        ticker
+        for ticker in tickers
+        if any(re.search(rf"\b{re.escape(ticker)}\b", query) for query in targeted_queries)
+    }
+    fetched_urls = {
+        _tool_argument_value(item, "url")
+        for item in tool_results
+        if str(item.get("tool_name") or "") == "web_fetch" and item.get("success")
+    }
+    urls_by_entity = _urls_by_entity_from_search_results(
+        tool_results=tool_results,
+        entities=tickers,
+        per_entity=urls_per_entity,
+    )
+    entity_urls = [
+        url
+        for ticker in tickers
+        for url in urls_by_entity.get(ticker, [])[:urls_per_entity]
+    ]
+    urls = _extract_urls_from_tool_results(tool_results, limit=max(12, total_urls + 3))
+    unfetched_urls = [url for url in entity_urls if url not in fetched_urls]
+    fetched_entity_urls = {url for url in fetched_urls if url in set(entity_urls)}
+    mover_source_fetched = len(_extract_mover_tickers_from_fetched_pages(tool_results, limit=entity_count)) >= entity_count
+
+    if not mover_source_fetched:
+        movers_url = _select_movers_source_url(unfetched_urls)
+        if not movers_url:
+            movers_url = _select_movers_source_url(urls)
+        if movers_url and "web_fetch" in allowed:
+            return {
+                "status": "partial",
+                "selected_tools": ["web_fetch"],
+                "strategy": "Fetch a market movers source before locking ticker entities.",
+                "notes": "Ticker-specific searches must be based on the fetched movers table, not noisy search snippets.",
+                "missing_slots": ["verified_top_3_mover_tickers"],
+                "argument_clues": {"web_fetch": movers_url},
+            }
+        return {
+            "status": "partial",
+            "selected_tools": ["web_search"] if "web_search" in allowed else [],
+            "strategy": "Find a market movers source before source collection.",
+            "notes": "The explicit stock workflow needs a source-backed top-three gainers table before ticker-specific searches.",
+            "missing_slots": ["market_movers_source"],
+            "argument_clues": {"web_search": "Morningstar market movers top stock gainers today"},
+        }
+
+    for ticker in tickers:
+        if ticker not in searched_tickers and "web_search" in allowed:
+            return {
+                "status": "partial",
+                "selected_tools": ["web_search"],
+                "strategy": f"Search {ticker} separately before fetching sources.",
+                "notes": "The user explicitly asked for separate searches for each stock.",
+                "missing_slots": [f"{ticker}_three_relevant_urls"],
+                "argument_clues": {
+                    "web_search": f"{ticker} stock news June 13 2026"
+                },
+                "tickers": tickers,
+                "source_contract": contract,
+            }
+
+    for ticker in tickers:
+        if len(urls_by_entity.get(ticker, [])) < urls_per_entity and "web_search" in allowed:
+            return {
+                "status": "partial",
+                "selected_tools": ["web_search"],
+                "strategy": f"Collect source URLs for {ticker}.",
+                "notes": "Each locked entity needs its own source quota before unrelated URLs can be fetched.",
+                "missing_slots": [f"{ticker}_{urls_per_entity}_urls"],
+                "argument_clues": {
+                    "web_search": f"{ticker} stock news June 13 2026"
+                },
+                "tickers": tickers,
+                "source_contract": contract,
+            }
+
+    if len(fetched_entity_urls) < total_urls:
+        if unfetched_urls and "web_fetch" in allowed:
+            next_url = unfetched_urls[0]
+            return {
+                "status": "partial",
+                "selected_tools": ["web_fetch"],
+                "strategy": f"Fetch source {len(fetched_entity_urls) + 1} of {total_urls}.",
+                "notes": "The user requested all entity-specific URLs to be fetched before the TLDR table.",
+                "missing_slots": [f"{total_urls - len(fetched_entity_urls)}_remaining_web_fetches"],
+                "argument_clues": {"web_fetch": next_url},
+                "tickers": tickers,
+                "fetched_url_count": len(fetched_entity_urls),
+                "source_contract": contract,
+            }
+        if "web_search" in allowed:
+            next_ticker = tickers[min(len(searched_tickers), len(tickers) - 1)]
+            return {
+                "status": "partial",
+                "selected_tools": ["web_search"],
+                "strategy": f"Collect more URLs for {next_ticker}.",
+                "notes": "Need more unique URLs before the 9 fetches can complete.",
+                "missing_slots": ["nine_unique_urls"],
+                "argument_clues": {
+                    "web_search": f"{next_ticker} stock news June 13 2026"
+                },
+                "tickers": tickers,
+                "source_contract": contract,
+            }
+
+    return {}
 
 
 def _should_finalize(
@@ -759,7 +1194,7 @@ class RunEngine:
                 minimum=1,
                 maximum=24,
             )
-            max_turns = max(1, min(int(request.max_turns or 3), 6))
+            max_turns = _default_tool_turn_budget(effective_objective, request.max_turns)
             if normalized_max_tool_calls is not None:
                 max_turns = min(max_turns, normalized_max_tool_calls)
             current_facts = self._context_governor.get_current_facts(
@@ -1476,6 +1911,39 @@ class RunEngine:
                         objective=effective_objective,
                     )
 
+                pre_signature = tool_call_signature(tool_call.tool_name, tool_call.arguments or {})
+                if is_retry_sensitive_tool(tool_call.tool_name) and repeated_tool_signatures.get(pre_signature, 0) >= 1:
+                    workflow_override = _stock_source_workflow_override(
+                        objective=effective_objective,
+                        allowed_tools=allowed_tools_list,
+                        tool_results=tool_results,
+                    )
+                    clue_map = dict(workflow_override.get("argument_clues") or {})
+                    pivot_tool = (workflow_override.get("selected_tools") or [tool_call.tool_name])[0] if workflow_override else tool_call.tool_name
+                    pivot_clue = str(clue_map.get(pivot_tool) or "").strip()
+                    if pivot_tool == "web_search" and pivot_clue:
+                        pivot_args = {"query": pivot_clue}
+                        if request.search_backend and request.search_backend != "auto":
+                            pivot_args["backend"] = request.search_backend
+                        if request.search_engine:
+                            pivot_args["search_engine"] = request.search_engine
+                        tool_call = ToolCall(
+                            tool_name="web_search",
+                            arguments=pivot_args,
+                            raw_json=json.dumps({"tool": "web_search", "arguments": pivot_args}),
+                        )
+                        planned_argument_clues.update(clue_map)
+                    elif pivot_tool == "web_fetch" and pivot_clue:
+                        url_match = _URL_RE.search(pivot_clue)
+                        if url_match:
+                            pivot_args = {"url": url_match.group(0).rstrip(".,")}
+                            tool_call = ToolCall(
+                                tool_name="web_fetch",
+                                arguments=pivot_args,
+                                raw_json=json.dumps({"tool": "web_fetch", "arguments": pivot_args}),
+                            )
+                            planned_argument_clues.update(clue_map)
+
                 tool_call_count += 1
 
                 # ── Hook: tool_selected ──
@@ -1567,39 +2035,67 @@ class RunEngine:
                 if is_retry_sensitive_tool(tool_call.tool_name):
                     repeat_count = repeated_tool_signatures.get(signature, 0)
                     if repeat_count >= 1:
-                        failed_tool_names.add(tool_call.tool_name)
+                        cached_result = _find_cached_retry_sensitive_result(
+                            tool_results,
+                            tool_name=tool_call.tool_name,
+                            arguments=tool_call.arguments or {},
+                        )
                         duplicate_message = (
-                            f"Duplicate {tool_call.tool_name} call suppressed for this run. "
-                            "Use the existing result or pivot to a different query/source."
+                            f"Duplicate {tool_call.tool_name} call reused from this run's cached tool result."
+                            if cached_result
+                            else (
+                                f"Duplicate {tool_call.tool_name} call suppressed for this run. "
+                                "Use the existing result or pivot to a different query/source."
+                            )
+                        )
+                        duplicate_success = bool(cached_result)
+                        if not duplicate_success:
+                            failed_tool_names.add(tool_call.tool_name)
+                        duplicate_content = (
+                            str(cached_result.get("content") or "")
+                            if cached_result
+                            else duplicate_message
                         )
                         result_payload = {
                             "tool_name": tool_call.tool_name,
-                            "success": False,
-                            "content": duplicate_message,
+                            "success": duplicate_success,
+                            "content": duplicate_content,
                             "arguments": dict(tool_call.arguments or {}),
+                            "cached_duplicate": duplicate_success,
                         }
+                        if cached_result and cached_result.get("actor_summary"):
+                            result_payload["actor_summary"] = str(cached_result.get("actor_summary") or "")
+                        if cached_result and isinstance(cached_result.get("extracted_urls"), list):
+                            result_payload["extracted_urls"] = list(cached_result.get("extracted_urls") or [])
                         tool_results.append(result_payload)
                         result_record = ledger.link_tool_result(
                             tool_call_id=tool_call_record.id,
                             tool_name=tool_call.tool_name,
-                            success=False,
-                            status="failed",
+                            success=duplicate_success,
+                            status="cached" if duplicate_success else "failed",
                             summary=clip_text(duplicate_message, 280),
                         )
-                        self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="duplicate_suppressed")
+                        if duplicate_success and is_substantive_tool_result(result_payload):
+                            ledger.add_evidence_from_result(result_record)
+                        self._trace_ledger(
+                            request=request,
+                            run_id=run.run_id,
+                            ledger=ledger,
+                            reason="duplicate_cached" if duplicate_success else "duplicate_suppressed",
+                        )
                         self._record_tool_outcome(
                             request=request,
                             tool_name=tool_call.tool_name,
-                            success=False,
-                            error_kind="duplicate_suppressed",
+                            success=duplicate_success,
+                            error_kind="" if duplicate_success else "duplicate_suppressed",
                         )
-                        _update_plan_step(plan_steps_state, tool_call.tool_name, success=False)
+                        _update_plan_step(plan_steps_state, tool_call.tool_name, success=duplicate_success)
                         ledger.update_plan_steps(plan_steps_state, source="run_engine")
                         self.run_store.save_checkpoint(
                             run_id=run.run_id,
                             phase="acting",
                             tool_turn=tool_turn,
-                            status="duplicate_suppressed",
+                            status="duplicate_cached" if duplicate_success else "duplicate_suppressed",
                             notes=duplicate_message,
                             tools=[tool_call.tool_name],
                             tool_results=summarize_tool_results([result_payload], limit=1, preview_chars=220),
@@ -1611,10 +2107,11 @@ class RunEngine:
                             data={
                                 "tool": tool_call.tool_name,
                                 "tool_name": tool_call.tool_name,
-                                "success": False,
-                                "status": "failed",
-                                "content_length": len(duplicate_message),
-                                "content_preview": clip_text(duplicate_message, 280),
+                                "success": duplicate_success,
+                                "status": "cached" if duplicate_success else "failed",
+                                "content_length": len(duplicate_content),
+                                "content_preview": clip_text(duplicate_content, 280),
+                                "cached_duplicate": duplicate_success,
                                 "turn": tool_turn,
                                 "tool_call_id": tool_call_record.id,
                                 "tool_result_id": result_record.id,
@@ -1624,10 +2121,11 @@ class RunEngine:
                             "type": "tool_result",
                             "tool": tool_call.tool_name,
                             "tool_name": tool_call.tool_name,
-                            "success": False,
-                            "status": "failed",
-                            "content_preview": clip_text(duplicate_message, 280),
-                            "content": duplicate_message,
+                            "success": duplicate_success,
+                            "status": "cached" if duplicate_success else "failed",
+                            "content_preview": clip_text(duplicate_content, 280),
+                            "content": duplicate_content,
+                            "cached_duplicate": duplicate_success,
                             "tool_call_id": tool_call_record.id,
                             "tool_result_id": result_record.id,
                         }
@@ -1635,7 +2133,7 @@ class RunEngine:
                             run_id=run.run_id,
                             phase=ContextPhase.ACTING,
                             tool_turn=tool_turn,
-                            status="duplicate_suppressed",
+                            status="duplicate_cached" if duplicate_success else "duplicate_suppressed",
                             objective=effective_objective,
                             strategy=latest_strategy,
                             notes=duplicate_message,
@@ -1673,6 +2171,28 @@ class RunEngine:
                             compiled_context=observation_packet.content,
                         )
                         normalized_observation = self._normalize_observation_decision(observation)
+                        workflow_override = _stock_source_workflow_override(
+                            objective=effective_objective,
+                            allowed_tools=allowed_tools_list,
+                            tool_results=tool_results,
+                        )
+                        if workflow_override:
+                            self._trace_workflow_override(
+                                request=request,
+                                run_id=run.run_id,
+                                tool_turn=tool_turn,
+                                workflow_override=workflow_override,
+                                source="duplicate_recovery",
+                            )
+                            normalized_observation.update({
+                                "status": workflow_override.get("status", normalized_observation["status"]),
+                                "strategy": workflow_override.get("strategy", normalized_observation["strategy"]),
+                                "notes": workflow_override.get("notes", normalized_observation["notes"]),
+                                "selected_tools": list(workflow_override.get("selected_tools") or []),
+                                "missing_slots": list(workflow_override.get("missing_slots") or []),
+                                "should_continue": bool(workflow_override.get("selected_tools")),
+                            })
+                            planned_argument_clues.update(dict(workflow_override.get("argument_clues") or {}))
                         selected_tools = list(normalized_observation["selected_tools"])
                         latest_strategy = str(normalized_observation["strategy"] or latest_strategy)
                         latest_notes = str(normalized_observation["notes"] or latest_notes)
@@ -1821,6 +2341,16 @@ class RunEngine:
                     "arguments": dict(tool_call.arguments or {}),
                     "tool_call_id": tool_call_record.id,
                 }
+                if tool_result.tool_name in {"web_search", "web_fetch"}:
+                    result_payload["extracted_urls"] = _extract_urls_from_tool_results(
+                        [
+                            {
+                                "success": bool(tool_result.success),
+                                "content": _enriched_content,
+                            }
+                        ],
+                        limit=12,
+                    )
                 tool_results.append(result_payload)
                 result_record = ledger.link_tool_result(
                     tool_call_id=tool_call_record.id,
@@ -2016,6 +2546,28 @@ class RunEngine:
                     compiled_context=observation_packet.content,
                 )
                 normalized_observation = self._normalize_observation_decision(observation)
+                workflow_override = _stock_source_workflow_override(
+                    objective=effective_objective,
+                    allowed_tools=allowed_tools_list,
+                    tool_results=tool_results,
+                )
+                if workflow_override:
+                    self._trace_workflow_override(
+                        request=request,
+                        run_id=run.run_id,
+                        tool_turn=tool_turn,
+                        workflow_override=workflow_override,
+                        source="observation_override",
+                    )
+                    normalized_observation.update({
+                        "status": workflow_override.get("status", normalized_observation["status"]),
+                        "strategy": workflow_override.get("strategy", normalized_observation["strategy"]),
+                        "notes": workflow_override.get("notes", normalized_observation["notes"]),
+                        "selected_tools": list(workflow_override.get("selected_tools") or []),
+                        "missing_slots": list(workflow_override.get("missing_slots") or []),
+                        "should_continue": bool(workflow_override.get("selected_tools")),
+                    })
+                    planned_argument_clues.update(dict(workflow_override.get("argument_clues") or {}))
                 selected_tools = list(normalized_observation["selected_tools"])
                 latest_strategy = str(normalized_observation["strategy"] or latest_strategy)
                 latest_notes = str(normalized_observation["notes"] or latest_notes)
@@ -2108,7 +2660,11 @@ class RunEngine:
                     },
                 )
 
-                if not _gate_finalize and _gate_reason.startswith("pending_steps"):
+                if (
+                    not _gate_finalize
+                    and _gate_reason.startswith("pending_steps")
+                    and not (workflow_override and selected_tools)
+                ):
                     # Force one more actor turn against the first pending step.
                     next_step = next(
                         (s for s in plan_steps_state if s.get("status") == "pending"), None
@@ -2252,6 +2808,8 @@ class RunEngine:
             stream_kwargs: dict[str, Any] = {}
             if request.reasoning_enabled is not None:
                 stream_kwargs["reasoning_enabled"] = request.reasoning_enabled
+            buffer_final_response = is_small_or_local_model(session_model)
+            buffered_tokens: list[str] = []
             async for token in _stream_with_rate_limit_retry(
                 current_adapter,
                 model=clean_model,
@@ -2264,7 +2822,34 @@ class RunEngine:
                     yield token
                     continue
                 final_response += token
-                yield {"type": "token", "content": token}
+                if buffer_final_response:
+                    buffered_tokens.append(token)
+                else:
+                    yield {"type": "token", "content": token}
+
+            guarded_response = guard_final_response(
+                final_response,
+                user_message=request.user_message,
+                model=session_model,
+            )
+            if guarded_response.changed:
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="final_response_guard",
+                    data={
+                        "issues": guarded_response.issues,
+                        "replacement_used": guarded_response.replacement_used,
+                        "buffered": buffer_final_response,
+                    },
+                )
+                if not buffer_final_response:
+                    yield {"type": "retract_last_tokens"}
+                final_response = guarded_response.text
+                yield {"type": "token", "content": final_response}
+            elif buffer_final_response:
+                for token in buffered_tokens:
+                    yield {"type": "token", "content": token}
 
             response_summary = self._build_controller_summary(
                 status=latest_observation_status,
@@ -2483,6 +3068,7 @@ class RunEngine:
                         {"role": "system", "content": constraints_msg}
                     ]
                     final_response = ""
+                    redraft_buffered_tokens: list[str] = []
                     async for token in _stream_with_rate_limit_retry(
                         current_adapter,
                         model=clean_model,
@@ -2495,7 +3081,35 @@ class RunEngine:
                             yield token
                             continue
                         final_response += token
-                        yield {"type": "token", "content": token}
+                        if buffer_final_response:
+                            redraft_buffered_tokens.append(token)
+                        else:
+                            yield {"type": "token", "content": token}
+
+                    guarded_redraft = guard_final_response(
+                        final_response,
+                        user_message=request.user_message,
+                        model=session_model,
+                    )
+                    if guarded_redraft.changed:
+                        self._trace(
+                            request=request,
+                            run_id=run.run_id,
+                            event_type="final_response_guard",
+                            data={
+                                "issues": guarded_redraft.issues,
+                                "replacement_used": guarded_redraft.replacement_used,
+                                "buffered": buffer_final_response,
+                                "redraft": True,
+                            },
+                        )
+                        if not buffer_final_response:
+                            yield {"type": "retract_last_tokens"}
+                        final_response = guarded_redraft.text
+                        yield {"type": "token", "content": final_response}
+                    elif buffer_final_response:
+                        for token in redraft_buffered_tokens:
+                            yield {"type": "token", "content": token}
 
                     # Re-evaluate ONCE — no further redrafts.
                     side_effect_check = check_side_effect_claims(final_response, tool_results)
@@ -2903,6 +3517,26 @@ class RunEngine:
                 "raw_preview": clip_text(raw, 500),
             },
         )
+        if argument_clues:
+            for name in available_names:
+                clue = str(argument_clues.get(name) or "").strip()
+                if not clue:
+                    continue
+                if name in {"web_search", "rag_search"}:
+                    return ToolCall(
+                        tool_name=name,
+                        arguments={"query": clue},
+                        raw_json=json.dumps({"tool": name, "arguments": {"query": clue}}),
+                    )
+                if name == "web_fetch":
+                    url_match = _URL_RE.search(clue)
+                    if url_match:
+                        url = url_match.group(0).rstrip(".,")
+                        return ToolCall(
+                            tool_name=name,
+                            arguments={"url": url},
+                            raw_json=json.dumps({"tool": name, "arguments": {"url": url}}),
+                        )
         fallback_ranked = self._rank_fallback_tool_candidates(effective_objective, available_names)
         if "web_fetch" in available_names and "web_fetch" not in fallback_ranked:
             if re.search(r"https?://[^\s\"'<>),]+", context_block or ""):
@@ -3471,6 +4105,58 @@ class RunEngine:
                 ],
             }
         self._trace(request=request, run_id=run_id, event_type="memory_commit_plan", data=data)
+
+    def _trace_workflow_override(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        tool_turn: int,
+        workflow_override: dict[str, Any],
+        source: str,
+    ) -> None:
+        """Emit a frontend-friendly diagnostic for deterministic workflow control.
+
+        This is deliberately non-authoritative: it mirrors the runtime override
+        so Trace Monitor can later show why the loop pivoted without requiring
+        UI code to parse notes or raw model observations.
+        """
+        if not workflow_override:
+            return
+        status = str(workflow_override.get("status") or "")
+        strategy = str(workflow_override.get("strategy") or "")
+        selected_tools = list(workflow_override.get("selected_tools") or [])
+        missing_slots = list(workflow_override.get("missing_slots") or [])
+        entities = list(workflow_override.get("tickers") or workflow_override.get("entities") or [])
+        log(
+            "run_engine",
+            request.session_id,
+            f"Source contract {status or 'observed'}: {strategy or 'workflow override'}",
+            level=("warn" if status in {"missing", "blocked"} else "info"),
+            owner_id=request.owner_id,
+            run_id=run_id,
+            turn=tool_turn,
+            selected_tools=selected_tools,
+            missing_slots=missing_slots,
+            entities=entities,
+        )
+        self._trace(
+            request=request,
+            run_id=run_id,
+            event_type="source_contract",
+            data={
+                "source": source,
+                "turn": tool_turn,
+                "status": status,
+                "strategy": strategy,
+                "notes": str(workflow_override.get("notes") or ""),
+                "selected_tools": selected_tools,
+                "missing_slots": missing_slots,
+                "argument_clues": dict(workflow_override.get("argument_clues") or {}),
+                "entities": entities,
+                "source_contract": dict(workflow_override.get("source_contract") or {}),
+            },
+        )
 
     def _record_memory_outcome(
         self,

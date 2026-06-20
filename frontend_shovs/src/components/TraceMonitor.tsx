@@ -71,6 +71,17 @@ interface RunReplayArtifact {
   created_at?: string;
 }
 
+interface RunReplayEval {
+  eval_id: string;
+  eval_type: string;
+  phase: string;
+  passed: boolean;
+  score?: number | null;
+  detail?: string;
+  metadata?: Record<string, unknown> | null;
+  created_at?: string;
+}
+
 interface RunReplayCheckpoint {
   checkpoint_id: number;
   phase: string;
@@ -165,6 +176,7 @@ interface RunReplayResponse {
   checkpoints?: RunReplayCheckpoint[];
   passes?: RunReplayPass[];
   artifacts?: RunReplayArtifact[];
+  evals?: RunReplayEval[];
   evidence?: RunReplayEvidence[];
   operator_story?: OperatorStory;
 }
@@ -1511,6 +1523,35 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                                   </div>
                                   <div className='trace-run-card-copy'>
                                     {item.summary || 'No evidence summary.'}
+                                  </div>
+                                </div>
+                              ))}
+                          </div>
+                        )}
+
+                        {(runReplay?.evals?.length || 0) > 0 && (
+                          <div className='trace-run-list'>
+                            {runReplay!
+                              .evals!.slice(-4)
+                              .reverse()
+                              .map((item) => (
+                                <div
+                                  key={item.eval_id}
+                                  className={`trace-run-card ${item.passed ? 'tone-good' : 'tone-warn'}`}
+                                >
+                                  <div className='trace-run-card-head'>
+                                    <span>
+                                      {item.eval_type.replace(/_/g, ' ')}
+                                    </span>
+                                    <span>
+                                      {item.phase}
+                                      {typeof item.score === 'number'
+                                        ? ` · ${Math.round(item.score * 100)}%`
+                                        : ''}
+                                    </span>
+                                  </div>
+                                  <div className='trace-run-card-copy'>
+                                    {item.detail || 'No evaluation detail.'}
                                   </div>
                                 </div>
                               ))}

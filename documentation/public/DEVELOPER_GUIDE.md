@@ -10,19 +10,31 @@ The core structure is:
 
 - session
 - run
+- ledger
 - phase
 - checkpoint
+- tool call
 - tool result
+- evidence record
 - artifact
 - eval
 
 The runtime already supports:
 
-- managed-first execution with `plan -> act -> observe -> verify -> commit`
+- managed-first execution with `plan -> act -> observe -> verify -> memory_commit`
 - phase-aware context compilation
 - model-aware execution profiles and prompt budgets
 - truth-vs-candidate memory lanes
 - run-scoped tracing and persistence
+- scenario-state evaluation for workflows that need exact tool discipline
+
+Public credibility docs:
+
+- [HARNESS.md](../../HARNESS.md) defines the agent harness.
+- [BENCHMARKS.md](../../BENCHMARKS.md) lists deterministic benchmark scenarios.
+- [EVALS.md](../../EVALS.md) explains scenario-state evaluation.
+- [CLAIMS.md](../../CLAIMS.md) separates proven claims from active work.
+- [RESULTS.md](../../RESULTS.md) records the local validation snapshot.
 
 ## Core Modules
 
@@ -30,7 +42,20 @@ The runtime already supports:
 
 - [run_engine/engine.py](../../run_engine/engine.py)
   - managed runtime execution path
-  - phase packet flow, pass ledger writes, and verification-gated memory commit
+  - phase packet flow, run ledger writes, source-contract control, and verification-gated memory commit
+
+- [run_engine/ledger.py](../../run_engine/ledger.py)
+  - canonical run state
+  - plan steps
+  - tool calls and linked results
+  - evidence records
+  - memory writes
+  - verification and continuation records
+
+- [run_engine/scenario_eval.py](../../run_engine/scenario_eval.py)
+  - scenario-state evaluation for workflow correctness
+  - checks the actual tool path against expected entities, searches, fetches, and forbidden drift
+  - useful when a final answer can sound correct even though the workflow was wrong
 
 - [engine/core.py](../../engine/core.py)
   - legacy/native execution kernel
@@ -107,12 +132,85 @@ Characteristics:
 - observation over tool results
 - verification before memory commit
 - persisted loop checkpoints
+- run ledger updates
+- trace events
+- optional run evals
 
 Current public reality:
 
 - `run_engine/engine.py` is the canonical runtime spine
 - `engine/core.py` remains for compatibility and test coverage
 - if you see `single` / `auto` in older surfaces, treat them as compatibility-oriented language, not the main product contract
+
+### Run Ledger Rules
+
+The ledger is the preferred place for run authority.
+
+When adding runtime behavior, prefer structured records over another prompt-only convention.
+
+Use the ledger for:
+
+- plan steps
+- tool-call intent
+- tool result linkage
+- evidence selection
+- memory-write eligibility
+- verification outcome
+- continuation state
+
+Do not let response text claim:
+
+- a tool ran unless there is a matching successful tool result
+- a file was created unless a write tool verified it
+- evidence was fetched unless the URL appears in successful tool results
+- a memory fact was stored unless memory commit accepted it
+
+### Scenario-State Evals
+
+Some failures cannot be caught by reading the final answer.
+
+Example:
+
+1. The user asks for top 3 entities.
+2. The runtime correctly discovers them.
+3. A noisy search result introduces unrelated entities.
+4. The agent searches or fetches the wrong targets.
+5. The final answer still sounds plausible.
+
+That must fail.
+
+Use [run_engine/scenario_eval.py](../../run_engine/scenario_eval.py) for workflows where the path matters. A scenario eval should describe:
+
+- locked entities or targets
+- required searches
+- required fetches
+- allowed URLs or source patterns
+- forbidden drift terms
+- expected quota
+
+Store the result through `RunStore.save_eval(...)` so replay and frontend views can show it.
+
+### Agent Harness Core Benchmark
+
+Run this before claiming a runtime change improves reliability:
+
+```bash
+venv/bin/python -m pytest \
+  tests/test_agent_harness_core_benchmarks.py \
+  tests/test_response_guard.py \
+  tests/test_runtime_e2e_diagnostics.py \
+  tests/test_shovs_memory.py \
+  tests/test_run_ledger.py \
+  tests/test_trace_replay_api.py -q
+```
+
+The core benchmark covers:
+
+- final-answer tool JSON guard
+- source collection without entity drift
+- negative-control drift detection
+- ledger rejection of orphaned tool results
+- memory replacement rollback
 
 ## Context Modes
 

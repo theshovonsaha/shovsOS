@@ -809,6 +809,118 @@ async def test_run_engine_observation_finalize_does_not_emit_followup_plan(tmp_p
     )
 
 
+@pytest.mark.asyncio
+async def test_run_engine_reuses_duplicate_web_result_without_second_network_call(tmp_path):
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(
+        return_value='{"tool_calls": [{"function": {"name": "web_search", "arguments": "{\\"query\\": \\\"find run engine\\\"}"}}]}'
+    )
+    adapter.stream = MagicMock(return_value=AsyncIter(["Final answer."]))
+
+    orchestrator = MagicMock()
+    orchestrator.plan_with_context = AsyncMock(
+        return_value={
+            "strategy": "Search first.",
+            "tools": [{"name": "web_search", "priority": "high", "reason": "Need evidence."}],
+            "confidence": 0.9,
+        }
+    )
+    orchestrator.observe_with_context = AsyncMock(
+        side_effect=[
+            {
+                "status": "continue",
+                "strategy": "Repeat search to simulate actor drift.",
+                "tools": [{"name": "web_search", "priority": "high", "reason": "Actor repeats same query."}],
+                "notes": "Continue once.",
+                "confidence": 0.6,
+            },
+            {
+                "status": "finalize",
+                "strategy": "Cached evidence is enough.",
+                "tools": [],
+                "notes": "Answer from cached result.",
+                "confidence": 0.9,
+            },
+        ]
+    )
+    orchestrator.verify_with_context = AsyncMock(
+        return_value={"supported": True, "issues": [], "confidence": 0.95}
+    )
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    call_count = 0
+
+    async def web_search(query: str, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return {
+            "type": "web_search_results",
+            "query": query,
+            "results": [{"title": "Run Engine", "url": "https://example.com/run-engine"}],
+        }
+
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="web_search",
+            description="Search the web.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query."}},
+                "required": ["query"],
+            },
+            handler=web_search,
+            response_format="json",
+        )
+    )
+
+    runs = RunStore(db_path=str(tmp_path / "runs.db"))
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=registry,
+        run_store=runs,
+        trace_store=traces,
+        orchestrator=orchestrator,
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="run-engine-duplicate-web-cache",
+                owner_id="owner-run-engine",
+                agent_id="default",
+                user_message="Research run engine and summarize it.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_search",),
+                use_planner=True,
+                max_tool_calls=3,
+            )
+        )
+    ]
+
+    tool_results = [event for event in events if event.get("type") == "tool_result"]
+    assert call_count == 1
+    assert len(tool_results) >= 2
+    assert tool_results[0]["status"] == "ok"
+    assert tool_results[1]["status"] == "cached"
+    assert tool_results[1]["cached_duplicate"] is True
+    assert not any(
+        event["event_type"] == "tool_result"
+        and event["data"].get("status") == "failed"
+        and "Duplicate web_search" in str(event["data"].get("content_preview") or "")
+        for event in traces.events
+    )
+
+
 def test_build_phase_packet_includes_guidance_and_memory_items():
     context_engine = MagicMock()
     context_engine.build_context_items.return_value = [
