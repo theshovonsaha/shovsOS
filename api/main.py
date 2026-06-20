@@ -225,6 +225,7 @@ def _seed_standard_profiles():
             model=cfg.DEFAULT_MODEL,
             tools=[
                 "source_contract", "source_select", "source_next_action",
+                "web_fetch_batch", "source_coverage",
                 "web_search", "web_fetch", "rag_search", "query_memory", "store_memory",
             ],
             system_prompt=(
@@ -258,7 +259,11 @@ def _seed_standard_profiles():
             name="Consumer Assistant",
             description="Plain-language assistant for the consumer chat surface.",
             model="groq:moonshotai/kimi-k2-instruct",
-            tools=["source_contract", "source_select", "source_next_action", "web_search", "web_fetch", "query_memory"],
+            tools=[
+                "source_contract", "source_select", "source_next_action",
+                "web_fetch_batch", "source_coverage",
+                "web_search", "web_fetch", "query_memory",
+            ],
             system_prompt=(
                 "You are a clear, calm assistant for the consumer product surface. "
                 "Prefer plain text, avoid internal execution chatter, and only use tools when they materially improve accuracy or complete the task."
@@ -275,6 +280,7 @@ def _seed_standard_profiles():
             model=cfg.DEFAULT_MODEL,
             tools=[
                 "shopping_advice", "source_contract", "source_select", "source_next_action",
+                "web_fetch_batch", "source_coverage",
                 "web_search", "web_fetch", "query_memory", "store_memory",
             ],
             system_prompt=(

@@ -1,6 +1,6 @@
 # ShovsOS Agent Harness
 
-ShovsOS is an agent harness. That means it sits around a language model and controls the work the model is allowed to do.
+ShovsOS is a research agent harness. That means it sits around a language model and experiments with controlling the work the model is allowed to do.
 
 It does not try to make the model smarter by adding longer prompts. It gives the model a smaller, clearer job at each step, then checks the work with structured state.
 
@@ -41,7 +41,7 @@ flowchart LR
 - It is not a benchmark claim without local tests.
 - It is not a promise that every model will follow every instruction.
 
-The practical claim is narrower: the harness catches common agent failures before they become user-visible output.
+The practical claim is narrower: local tests show the harness can catch several common agent failures in controlled scenarios before they become user-visible output.
 
 ## Core Runtime Shape
 
@@ -54,13 +54,14 @@ stateDiagram-v2
     observe --> act: more evidence needed
     observe --> verify: enough evidence
     verify --> memory_commit: supported
-    verify --> act: missing or contradicted evidence
+    verify --> continue_or_done: missing or contradicted evidence
     memory_commit --> respond
     respond --> continue_or_done
+    continue_or_done --> intake: next turn resumes if continuation state exists
     continue_or_done --> [*]
 ```
 
-Each state has expected inputs and allowed outputs. If a state is missing data, the runtime should emit a typed missing-input event instead of letting the model guess.
+Each state has expected inputs and allowed outputs. In the current implementation, acting and observation can loop within a run. Final verification can recommend replanning and persist continuation state for the next turn; it does not yet automatically re-enter the acting loop after the final response.
 
 ## Why This Matters
 
@@ -73,4 +74,3 @@ Most agent failures look reasonable in the final answer. The trace is where the 
 - Raw tool JSON leaked into chat.
 
 ShovsOS treats those as runtime problems, not just prompt problems.
-

@@ -1,14 +1,14 @@
 # Shovs LLM OS
 
-A local-first runtime for building agents that can plan, use tools, remember, verify, and explain what happened.
+A local-first research runtime for studying agents that plan, use tools, remember, verify, and explain what happened.
 
-Shovs is not a chat wrapper. It is not only a RAG pipeline. It is a runtime that turns a user request into structured state, runs explicit phases over that state, records every important handoff, and only then asks the model to speak.
+Shovs is not a finished product and not a broad benchmark claim. It is a working research codebase that explores whether structured runtime state can make agent behavior easier to inspect and test.
 
 The core idea is simple:
 
 > The model can generate language. The runtime should hold the state.
 
-That means Shovs separates trusted facts from guesses, keeps tool calls linked to tool results, checks whether work is actually done, and exposes traces, checkpoints, artifacts, memory state, and evals so a human can inspect the run.
+That means Shovs experiments with separating trusted facts from guesses, linking tool calls to tool results, checking whether work is actually done, and exposing traces, checkpoints, artifacts, memory state, and evals so a human can inspect the run.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.10%2B-green.svg)
@@ -23,9 +23,9 @@ If you are evaluating Shovs quickly, read these in order:
 | File | Purpose |
 | --- | --- |
 | [HARNESS.md](HARNESS.md) | Defines the agent harness in simple terms, with runtime diagrams. |
-| [BENCHMARKS.md](BENCHMARKS.md) | Shows the deterministic benchmark suite and what each scenario proves. |
+| [BENCHMARKS.md](BENCHMARKS.md) | Shows the deterministic benchmark suite and what each scenario checks. |
 | [EVALS.md](EVALS.md) | Explains scenario-state evaluation and why final-answer-only judging is not enough. |
-| [CLAIMS.md](CLAIMS.md) | Separates proven claims from active research and product work. |
+| [CLAIMS.md](CLAIMS.md) | Separates locally validated claims from active research and product work. |
 | [RESULTS.md](RESULTS.md) | Records the latest local validation snapshot and live smoke checks. |
 
 Core benchmark command:
@@ -36,7 +36,7 @@ venv/bin/python -m pytest tests/test_agent_harness_core_benchmarks.py -q
 
 The example result shape is in [benchmarks/agent_harness_core](benchmarks/agent_harness_core).
 
-The operator UI also includes a **Harness** workspace tab. It exposes the same idea interactively:
+The operator UI also includes a **Harness** workspace tab. It exposes the same research idea interactively:
 
 - compare plain model, model plus tools, observed Shovs, and enforced Shovs modes
 - inspect each wedge and its limitation
@@ -62,21 +62,21 @@ Shovs takes a different approach. It treats language as input and output, but no
 
 Each phase gets a compiled packet built from that state. Planning sees the objective and constraints. Acting sees the next tool requirement. Observation sees tool results and missing slots. Verification checks claims against evidence. Memory commit only writes eligible facts.
 
-Five ideas make this different from a prompt wrapper:
+Five research ideas make this different from a prompt wrapper:
 
 | Idea | Plain meaning |
 | --- | --- |
 | **Run ledger** | Every important action in a run gets a durable record: plan, tool call, result, evidence, memory write, verification, and continuation state. |
 | **Phase packets** | The model does not see one giant blob. It sees the right context for the current phase. |
 | **Fact guard** | User-stated facts and corrections become structured memory. Guesses stay in a candidate lane until verified. |
-| **Tool honesty** | The runtime does not let the agent claim a tool succeeded unless there is a successful tool result. Write tools must verify expected paths. |
+| **Tool honesty** | The runtime has guards that can reject or warn on unsupported tool-success claims in tested paths. Write tools must verify expected paths. |
 | **Scenario evals** | The system can judge the path taken, not only the final answer. If the agent searched the wrong ticker or fetched the wrong URL, the run can fail even if the response sounds plausible. |
 
 ---
 
 ## Agent Harness Core
 
-The smallest credible Shovs wedge is the agent harness core:
+The smallest testable Shovs wedge is the agent harness core:
 
 ```mermaid
 flowchart LR
@@ -93,7 +93,7 @@ flowchart LR
   B --> L["Trace replay + evals"]
 ```
 
-This is the part that should be easy to adopt inside another agent system:
+This is the part being shaped toward possible reuse inside another agent system:
 
 - use the ledger to hold task state
 - use phase packets to reduce prompt drift
@@ -112,10 +112,10 @@ flowchart TD
   classDef storage fill:#fff3e0,stroke:#ffcc80,stroke-width:2px,color:#333
   classDef tech fill:#e3f2fd,stroke:#90caf9,stroke-width:2px,color:#333
 
-  subgraph FRONTEND["🖥️ Product Surfaces (The Hook)"]
+  subgraph FRONTEND["Frontend Surfaces"]
     direction LR
-    A1["🛠️ Shovs OS (Operator)<br/>Workspace & Builder"]:::tech
-    A2["✨ Consumer UI<br/>Viral 'Magic' Chat Surface"]:::magic
+    A1["Shovs OS Operator<br/>Workspace & Builder"]:::tech
+    A2["Consumer UI<br/>Simplified Chat Surface"]:::tech
   end
 
   subgraph FastAPI_ENTRYPOINTS["🚪 API Gateways"]
@@ -132,10 +132,10 @@ flowchart TD
     
     C2 -.-> C6["Tool Sandbox"]
     C4 -.-> C8["🛡️ Side-Effect Guard<br/>(Trust & Correctness)"]:::guard
-    C5 -.-> C9["🧠 Convergent Memory Pipeline<br/>(Retention & Wow-Factor)"]:::magic
+    C5 -.-> C9["Convergent Memory Pipeline<br/>(Facts, Candidates, Corrections)"]:::tech
   end
 
-  subgraph CONTEXT_GOVERNOR["🧠 Context Governor (The Secret Sauce)"]
+  subgraph CONTEXT_GOVERNOR["Context Governor"]
     D1["ContextEngineV3 — Unified Convergent Memory"]:::tech
     D2["Phase-Aware Packet Compiler"]:::tech
     D1 --> D2

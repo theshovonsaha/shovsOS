@@ -1,14 +1,14 @@
 # Claims
 
-This file separates proven claims from active work.
+This file separates locally validated claims from active work.
 
-## Proven By Local Tests
+## Validated By Local Tests
 
 | Claim | Evidence |
 | --- | --- |
 | Tool results must link to known tool calls. | `RunLedger.link_tool_result` rejects orphaned results. |
 | Source-collection drift can be detected from trace state. | `SourceCollectionEval` catches forbidden query drift and missing fetch quotas. |
-| Small/local final-answer JSON leaks can be guarded. | `guard_final_response` converts tool-shaped JSON into clean user-facing text or a safe fallback. |
+| Small/local final-answer JSON leaks can be guarded in tested paths. | `guard_final_response` converts tool-shaped JSON into clean user-facing text or a safe fallback. |
 | Memory fact replacement is rollback-safe. | `SemanticGraph.replace_temporal_facts` keeps the old fact if the replacement fails. |
 | The memory inspector reports real current fact counts, not only the last timeline page. | Inspector tests count facts beyond the timeline limit. |
 
@@ -33,4 +33,3 @@ This file separates proven claims from active work.
 - Third-party reproduction instructions.
 - UI screenshots tied to the same trace IDs used in tests.
 - A small hosted demo that solves one narrow workflow end to end.
-

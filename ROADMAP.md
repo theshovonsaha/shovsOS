@@ -1,20 +1,20 @@
 # Roadmap
 
-This roadmap tracks the path from a working managed runtime to a publish-grade, inspectable platform.
+This roadmap tracks the path from a working managed runtime to a publishable, inspectable research prototype.
 
 ## Phase 1: Runtime Convergence
 
 Goal:
-- keep best legacy behavior while making `run_engine` and the run ledger the only normal execution story
+- preserve useful legacy behavior while making `run_engine` and the run ledger the normal execution story
 
 Milestones:
 1. tool-calling behavior parity and canonical web-tool registration
 2. memory commit and verification gating parity
 3. frontend-visible phase/log event parity
 4. consumer and delegation paths routed through canonical runtime contract
-5. managed runtime as the product default, with legacy paths treated as compatibility/test substrate
+5. managed runtime as the default path, with legacy paths treated as compatibility/test substrate
 
-## Phase 2: Explainability as Product Surface
+## Phase 2: Explainability as Runtime Surface
 
 Goal:
 - make logs and traces understandable for non-experts and auditable for experts

@@ -22,7 +22,7 @@ Managed mode supports:
 - `verify`
 - `memory_commit`
 
-This happens inside one run. It is not a default multi-agent swarm. The runtime can delegate through tools or templates, but the normal product path is one managed run with observable phases.
+This happens inside one run. It is not a default multi-agent swarm. The runtime can delegate through tools or templates, but the normal path is one managed run with observable phases.
 
 ### 3. Run Ledger and Run Model
 
@@ -118,12 +118,12 @@ Shovs Platform already includes:
 
 The value of the system is not only "many tools" or "many providers."
 
-The differentiator is:
+The research bet is:
 
 - explicit execution structure
 - truthful state transitions
 - smaller, cleaner prompt payloads
-- better coherence for smaller local models
+- more coherent behavior for smaller local models in tested paths
 - failures that can be replayed and understood
 
 The public credibility path is:
@@ -150,11 +150,11 @@ The first public benchmark surface is [Agent Harness Core](../../benchmarks/agen
 
 ### 3. External Adapter Parity In Practice
 
-The contract exists and managed runtime is default, but provider-specific behavior still needs broader long-run validation in heterogeneous deployments.
+The contract exists and managed runtime is default, but provider-specific behavior still needs broader long-run testing across heterogeneous deployments.
 
 ### 4. Runtime Decomposition
 
-The behavior is right, but too much control logic still lives in [engine/core.py](../../engine/core.py).
+The behavior is converging, but too much control logic still lives in [engine/core.py](../../engine/core.py).
 
 ### 5. Stronger Small-Model Tool Obedience
 
@@ -190,9 +190,9 @@ The builder is functional in Shovs Platform Dashboard, but the same controls sho
 - validate the managed-loop contract on more real non-native runtimes
 - improve model listing, health reporting, and capability discovery
 
-### Product Planes
+### UI Planes
 
-- further tighten consumer behavior on top of the kernel
+- further tighten consumer behavior on top of the runtime
 - keep Shovs Platform focused, mobile-friendly, operator-readable, and builder-capable
 
 ## Longer-Term Direction
@@ -203,6 +203,6 @@ The long-term direction remains:
 - multiple planes
 - plural context
 - explicit runs and phases
-- local-first and enterprise-ready deployment options
+- local-first deployment and enterprise-readiness research
 
 That is the actual project direction for Shovs LLM OS.

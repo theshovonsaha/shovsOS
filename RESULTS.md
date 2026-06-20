@@ -1,14 +1,14 @@
 # Results
 
-This is a local validation snapshot. It should be updated when the benchmark suite changes.
+This is a local validation snapshot, not a certification or broad benchmark claim. It should be updated when the benchmark suite or branch state changes.
 
-## Local Snapshot
+## Recorded Local Snapshot
 
-Date: 2026-06-19
+Date recorded: 2026-06-19
 
 | Check | Result |
 | --- | --- |
-| Full Python test suite | `450 passed, 20 skipped` |
+| Full Python test suite | `450 passed, 20 skipped` on the recorded local branch state |
 | Response guard tests | Passed |
 | Runtime E2E diagnostics | Passed |
 | Shovs memory tests | Passed |
@@ -20,7 +20,7 @@ Date: 2026-06-19
 
 Raw trace logs can retain the original model token for audit. The UI/runtime also receives retraction and clean replacement events when the response guard changes output.
 
-For small local models, the managed runtime buffers final response text before showing it to the user. This prevents raw tool JSON from flashing in chat.
+For small local models, the managed runtime buffers final response text before showing it to the user in the tested managed path. The goal is to prevent raw tool JSON from flashing in chat; before citing this publicly, rerun the response-guard tests on the current branch.
 
 ## Baseline Core Results
 

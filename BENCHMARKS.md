@@ -46,12 +46,12 @@ The bottom layers should be fast and deterministic. Public demos should be built
 
 ## Current Core Scenarios
 
-| Scenario | What it proves | Primary tests |
+| Scenario | What it checks | Primary tests |
 | --- | --- | --- |
 | Source collection contract | The agent keeps selected entities locked and fetches the requested sources instead of drifting. | `tests/test_runtime_e2e_diagnostics.py`, `tests/test_agent_harness_core_benchmarks.py` |
-| Tool hallucination guard | Final responses cannot pass tool-call-shaped JSON as user-facing text. | `tests/test_response_guard.py` |
-| Ledger linking | Tool results cannot exist without a known tool call. | `tests/test_run_ledger.py`, `tests/test_agent_harness_core_benchmarks.py` |
-| Memory rollback | Replacing facts does not destroy the old fact if the new fact fails to store. | `tests/test_shovs_memory.py` |
+| Tool hallucination guard | Tested final-response paths reject or clean tool-call-shaped JSON before user-facing output. | `tests/test_response_guard.py` |
+| Ledger linking | Ledger helpers reject tool results without a known tool call. | `tests/test_run_ledger.py`, `tests/test_agent_harness_core_benchmarks.py` |
+| Memory rollback | Tested replacement paths avoid destroying the old fact if the new fact fails to store. | `tests/test_shovs_memory.py` |
 | Trace replay | Stored traces can be read as workflow state, not only raw logs. | `tests/test_trace_replay_api.py` |
 | Harness Lab API | The UI can load wedge metadata and run deterministic benchmark results. | `tests/test_harness_lab_api.py` |
 

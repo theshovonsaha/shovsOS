@@ -3,10 +3,10 @@
 `shovs-memory` is the deterministic fact + correction layer extracted from the
 Shovs runtime. It is the smallest part of Shovs that can be used on its own.
 
-It is not a general-purpose agent memory system. It is a narrow guarantee:
-explicit user statements get extracted by rule, older facts get voided when
-new ones supersede them, and unverified guesses are quarantined as candidates
-instead of graduating into trusted state.
+It is not a general-purpose agent memory system. It is a narrow fact-handling
+layer: explicit user statements get extracted by rule, older facts get voided
+when new ones supersede them, and unverified guesses are quarantined as
+candidates instead of graduating into trusted state.
 
 In simple terms: it remembers what the user clearly said, invalidates stale
 facts when corrected, and keeps guesses out of trusted memory.
@@ -131,7 +131,7 @@ inspection = memory.inspect()        # trusted + candidates + conflict/dispute l
 
 Pick `shovs-memory` when you want:
 
-- hard guarantees about what counts as "remembered"
+- strict, testable rules about what counts as "remembered"
 - corrections that actually invalidate, not just shadow
 - a clear separation between trusted state and unverified guesses
 - an inspectable view you can show a user or auditor

@@ -119,6 +119,69 @@ async def test_run_engine_multi_turn_profile_converges_current_facts_over_long_c
 
 
 @pytest.mark.asyncio
+async def test_run_engine_trivial_greeting_bypasses_cognitive_lanes_with_history(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["The model should not be called."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    session = sessions.create(
+        model="llama3.2",
+        system_prompt="You are Shovs.",
+        agent_id="default",
+        session_id="trivial-hi-history",
+        owner_id="owner-trivial",
+    )
+    sessions.append_message(session.id, "user", "hi")
+    sessions.append_message(session.id, "assistant", "Hi.")
+    sessions.append_message(session.id, "user", "hi")
+    sessions.append_message(session.id, "assistant", "Hi.")
+
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=None,
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id=session.id,
+                owner_id="owner-trivial",
+                agent_id="default",
+                user_message="hi",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_search", "query_memory"),
+                use_planner=True,
+            )
+        )
+    ]
+
+    assert "".join(event.get("content", "") for event in events if event.get("type") == "token") == "Hi."
+    assert any(event.get("type") == "done" for event in events)
+    adapter.stream.assert_not_called()
+    assert not any(event.get("type") == "conversation_tension" for event in events)
+    assert not any(event["event_type"] == "conversation_tension" for event in traces.events)
+    assert not any(event["event_type"] == "deterministic_fact_extractor" for event in traces.events)
+    assert any(
+        event["event_type"] == "route_decision"
+        and event["data"].get("route_type") == "trivial_chat"
+        for event in traces.events
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_engine_executes_plan_tool_and_streams_response(tmp_path):
     adapter = MagicMock()
     adapter.complete = AsyncMock(
@@ -1452,6 +1515,59 @@ async def test_run_engine_passes_provider_qualified_model_to_context_compression
 
     assert any(event["type"] == "done" for event in events)
     assert context_engine.compress_exchange.await_args.kwargs["model"] == "groq:llama-3.3-70b-versatile"
+
+
+@pytest.mark.asyncio
+async def test_run_engine_skill_discovery_uses_allowed_tools_not_missing_tools_attr(tmp_path):
+    workspace = tmp_path / "workspace"
+    skill_dir = workspace / ".agent" / "skills" / "research"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: Research\n"
+        "description: Research helper\n"
+        "triggers: research\n"
+        "requirements: web_search\n"
+        "---\n"
+        "Use web_search for current research.\n",
+        encoding="utf-8",
+    )
+
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Acknowledged."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=FakeTraceStore(),
+        orchestrator=None,
+        context_engine=context_engine,
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="skill-discovery-request-tools-regression",
+                owner_id="owner-skill-route",
+                agent_id="default",
+                user_message="research this topic",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_search",),
+                use_planner=False,
+                workspace_path=str(workspace),
+            )
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
 
 
 @pytest.mark.asyncio
