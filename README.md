@@ -1,4 +1,4 @@
-# Shovs LLM OS
+# Shovs OS - LLM Runtime Agent Harness
 
 A local-first runtime for building agents that can plan, use tools, remember, verify, and explain what happened.
 
