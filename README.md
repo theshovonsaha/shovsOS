@@ -43,6 +43,17 @@ The operator UI also includes a **Harness** workspace tab. It exposes the same r
 - run the deterministic Agent Harness Core benchmark from the browser
 - see related research references beside the actual runtime features
 
+The UI now also includes a **Workflows** workspace tab. This is the beginning of a product-facing platform layer over the same runtime pieces:
+
+- choose a typed workflow such as Research Brief, Shopping Comparison, Local Recommendation, Memory Fact Guard, or Coding Patch Eval
+- inspect the workflow steps, required inputs, allowed tools, memory policy, completion gates, and output schema
+- run a deterministic contract-backed workflow preview
+- run an optional live `RunEngine` workflow under the same API envelope
+- inspect status events and the result contract
+- copy the API request shape that another frontend app could use
+
+The workflow layer is intentionally contract-first. It is not a free-form node canvas yet. Its current purpose is to make ShovsOS features composable and inspectable through stable workflow definitions, durable run records, status polling, event history, and result contracts.
+
 ---
 
 ## Why this exists
@@ -53,6 +64,8 @@ Shovs takes a different approach. It treats language as input and output, but no
 
 - the user's objective
 - the current plan
+- workflow contract, when the request has a recognizable work shape
+- pass graph, which names the specialist passes needed for the workflow
 - allowed tools
 - tool calls and tool results
 - evidence gathered so far
@@ -62,12 +75,21 @@ Shovs takes a different approach. It treats language as input and output, but no
 
 Each phase gets a compiled packet built from that state. Planning sees the objective and constraints. Acting sees the next tool requirement. Observation sees tool results and missing slots. Verification checks claims against evidence. Memory commit only writes eligible facts.
 
-Five research ideas make this different from a prompt wrapper:
+Shovs also infers a workflow contract for recognizable task shapes, builds a pass graph of specialist roles, then computes a small runtime attention snapshot before packet compilation. This is not neural attention inside the model. It is deterministic scoring over ledger records so the runtime can show which objective, workflow contract, pass graph, plan step, tool result, evidence item, verification issue, or memory write is most relevant for the current phase.
+
+Core research ideas make this different from a prompt wrapper:
 
 | Idea | Plain meaning |
 | --- | --- |
 | **Run ledger** | Every important action in a run gets a durable record: plan, tool call, result, evidence, memory write, verification, and continuation state. |
+| **Workflow contracts** | Recognizable tasks become explicit constraints: workflow shape, entity locks, evidence requirements, tool policy, completion gate, and continuation policy. |
+| **Workflow Lab** | Product-facing workflow definitions expose inputs, steps, tools, memory policy, trace events, result schemas, and API contracts. |
+| **Deterministic source compiler** | `source_collect` turns multi-source tasks into one inspectable contract, coverage report, fetch queue, and final-answer gate. |
+| **Search query boundary** | The rich user objective stays in the ledger; `web_search.query` is compiled into a compact retrieval probe before execution. |
+| **Pass framework** | Each workflow maps to specialist passes such as retrieval, reasoning, scoring, evaluation, summarization, and orchestration. |
+| **Runtime attention** | The runtime scores ledger records by phase before building context, then records the weights for trace/UI inspection. |
 | **Phase packets** | The model does not see one giant blob. It sees the right context for the current phase. |
+| **Ledger-authority tools** | Managed deterministic tools should read prior successful ledger results by ID instead of trusting model-supplied payloads. |
 | **Fact guard** | User-stated facts and corrections become structured memory. Guesses stay in a candidate lane until verified. |
 | **Tool honesty** | The runtime has guards that can reject or warn on unsupported tool-success claims in tested paths. Write tools must verify expected paths. |
 | **Scenario evals** | The system can judge the path taken, not only the final answer. If the agent searched the wrong ticker or fetched the wrong URL, the run can fail even if the response sounds plausible. |
@@ -81,7 +103,10 @@ The smallest testable Shovs wedge is the agent harness core:
 ```mermaid
 flowchart LR
   A["User objective"] --> B["Run ledger"]
-  B --> C["Phase packets"]
+  B --> BC["Workflow contract"]
+  BC --> BD["Pass graph"]
+  BD --> BA["Runtime attention"]
+  BA --> C["Phase packets"]
   C --> D["Model"]
   D --> E["Tool call draft"]
   E --> F["Tool registry"]
@@ -96,7 +121,11 @@ flowchart LR
 This is the part being shaped toward possible reuse inside another agent system:
 
 - use the ledger to hold task state
+- use workflow contracts to preserve the structure of multi-step work
+- use pass graphs to make specialist roles and stop conditions explicit
+- use runtime attention to rank phase-relevant state before packet compilation
 - use phase packets to reduce prompt drift
+- use ledger-authority tool inputs so models cannot invent prior search/fetch payloads
 - use evidence IDs to ground final answers
 - use memory lanes to avoid stale facts
 - use replay evals to catch wrong paths
@@ -119,16 +148,23 @@ flowchart TD
   end
 
   subgraph FastAPI_ENTRYPOINTS["🚪 API Gateways"]
-    B1["/chat/stream"]
-    B2["/consumer/chat/stream"]
-    B3["/sessions/* · /agents/* · /memory/* · /rag/*"]
+  B1["/chat/stream"]
+  B2["/consumer/chat/stream"]
+  B3["/sessions/* · /agents/* · /memory/* · /rag/*"]
+  B4["/workflow-lab/*"]
   end
 
   subgraph RunEngine["⚙️ Managed Runtime"]
     direction TB
     C0["Run Ledger"]:::tech
+    C01["Workflow Contract<br/>(shape, locks, requirements, gate)"]:::tech
+    C02["Pass Graph<br/>(specialist passes + stop condition)"]:::tech
+    C00["Runtime Attention<br/>(phase-weighted ledger scoring)"]:::tech
     C1{"1. PLAN"} --> C2("2. ACT") --> C3{"3. OBSERVE"} --> C4("4. VERIFY") --> C5[/"5. MEMORY COMMIT"/]:::magic
-    C0 -.-> C1 & C2 & C3 & C4 & C5
+    C0 -.-> C01
+    C01 -.-> C02
+    C02 -.-> C00
+    C00 -.-> C1 & C2 & C3 & C4 & C5
     
     C2 -.-> C6["Tool Sandbox"]
     C4 -.-> C8["🛡️ Side-Effect Guard<br/>(Trust & Correctness)"]:::guard
@@ -158,7 +194,7 @@ flowchart TD
   %% Flow
   A1 -->|Admin| B1
   A2 -->|End-User| B2
-  B1 & B2 & B3 --> RunEngine
+  B1 & B2 & B3 & B4 --> RunEngine
   
   RunEngine -->|Drives| PROVIDERS
   RunEngine -->|Persists| STORAGE_TOPOLOGY
@@ -300,9 +336,14 @@ ANTHROPIC_API_KEY=sk-ant-...
 GROQ_API_KEY=gsk_...
 GEMINI_API_KEY=AIza...
 NVIDIA_API_KEY=nvapi-...
+
+# Optional image generation
+IMAGE_GENERATION_MODEL=gpt-image-1
 ```
 
 Embedding transport auto-detects `/api/embed` (current Ollama) and `/api/embeddings` (legacy); LM Studio / llama.cpp / OpenAI-compatible servers use `/v1/embeddings`.
+
+Image generation is exposed both as an agent tool (`image_generate`) and as `POST /images/generate`. Generated files are saved under the sandbox and served from `/sandbox/generated/images/...`. If `OPENAI_API_KEY` is missing, the tool returns a typed failure instead of pretending an image was created.
 
 ---
 

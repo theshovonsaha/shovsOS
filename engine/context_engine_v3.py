@@ -41,6 +41,7 @@ from engine.context_engine_v2 import ContextEngineV2, DEFAULT_RESONANCE_WEIGHT
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
+from engine.context_hygiene import should_skip_memory_compression
 
 
 # Defaults chosen for an interactive multi-turn agent on a typical 32k-128k context.
@@ -200,6 +201,9 @@ class ContextEngineV3:
         model: str = None,
         grounding_text: str = "",
     ) -> tuple[str, list[dict], list[dict]]:
+        if should_skip_memory_compression(user_message, assistant_response):
+            return current_context, [], []
+
         durable_context, convergent_context = self._split_context(current_context)
         use_model = model or self.compression_model
 
@@ -211,14 +215,31 @@ class ContextEngineV3:
             model=use_model,
             grounding_text=grounding_text,
         )
-        convergent_updated, convergent_facts, convergent_voids = await self._v2.compress_exchange(
-            user_message=user_message,
-            assistant_response=assistant_response,
-            current_context=convergent_context,
-            is_first_exchange=is_first_exchange,
-            model=use_model,
-            grounding_text=grounding_text,
+
+        # Convergent ranking (the part that actually surfaces context) lives in
+        # the non-LLM build_context_block. V2.compress_exchange, by contrast, runs
+        # goal + module extraction (2-3 LLM calls) every turn. Only refresh the
+        # convergent registry on turns that carry new durable signal — first
+        # exchange, an empty registry needing bootstrap, or a turn where V1
+        # extracted new facts. Other turns reuse the persisted registry; ranking
+        # still runs at packet-build, so nothing user-visible is lost.
+        should_refresh_convergent = (
+            is_first_exchange
+            or bool(durable_facts)
+            or not convergent_context.strip()
         )
+        if should_refresh_convergent:
+            convergent_updated, convergent_facts, convergent_voids = await self._v2.compress_exchange(
+                user_message=user_message,
+                assistant_response=assistant_response,
+                current_context=convergent_context,
+                is_first_exchange=is_first_exchange,
+                model=use_model,
+                grounding_text=grounding_text,
+            )
+        else:
+            convergent_updated = convergent_context
+            convergent_facts, convergent_voids = [], []
 
         serialized = self._serialize_context(durable_updated, convergent_updated)
         facts = self._dedupe_fact_records(durable_facts + convergent_facts)

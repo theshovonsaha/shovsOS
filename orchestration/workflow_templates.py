@@ -48,6 +48,8 @@ WORKFLOW_TEMPLATES: dict[str, WorkflowTemplate] = {
         tools=(
             "web_search",
             "web_fetch",
+            "image_search",
+            "image_generate",
             "query_memory",
             "store_memory",
             "shovs_memory_query",
@@ -66,7 +68,7 @@ WORKFLOW_TEMPLATES: dict[str, WorkflowTemplate] = {
         id="research_agent_v1",
         label="Research Agent",
         description="Evidence-first web and memory research with source chaining and verification.",
-        tools=("web_search", "web_fetch", "query_memory", "store_memory", "shovs_memory_query", "shovs_memory_store"),
+        tools=("web_search", "web_fetch", "image_search", "image_generate", "query_memory", "store_memory", "shovs_memory_query", "shovs_memory_store"),
         system_prompt=(
             "Act as a rigorous research agent. Prefer primary sources, preserve exact URLs, "
             "follow READ_MORE with a precise fetch, and distinguish evidence from inference."

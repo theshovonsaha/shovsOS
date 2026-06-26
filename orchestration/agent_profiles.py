@@ -28,6 +28,7 @@ DEFAULT_AGENT_TOOLS = [
     "web_search",
     "web_fetch",
     "image_search",
+    "image_generate",
     "weather_fetch",
     "places_search",
     "places_map",

@@ -68,7 +68,9 @@ GROQ_KEY     = os.getenv("GROQ_API_KEY", "")
 EXA_SEARCH_TYPE = (os.getenv("EXA_SEARCH_TYPE", "auto") or "auto").strip().lower()
 EXA_TEXT_MAX_CHARACTERS = max(500, _env_int("EXA_TEXT_MAX_CHARACTERS", 20000))
 
-HTTP_TIMEOUT = 20.0
+HTTP_TIMEOUT = 20.0          # default for search backends
+JINA_TIMEOUT = 8.0           # Jina is fast when it works; fail fast when it doesn't
+HTTPX_FETCH_TIMEOUT = 15.0   # direct httpx fetch fallback
 MAX_WEB_FETCH_CHARS = 50000
 MIN_WEB_FETCH_CHARS = 500
 WEB_FETCH_ALLOW_PRIVATE = (os.getenv("WEB_FETCH_ALLOW_PRIVATE", "false") or "false").strip().lower() == "true"
@@ -181,6 +183,10 @@ def _validate_fetch_url(url: str) -> tuple[bool, str, str, str]:
     raw = str(url or "").strip()
     if not raw:
         return False, "empty URL", "", ""
+    if any(marker in raw for marker in ("...", "…", "[", "]", "{", "}")):
+        return False, f"invalid URL '{raw}' — looks truncated or display-formatted", "", ""
+    if re.search(r"\s", raw):
+        return False, f"invalid URL '{raw}' — contains whitespace", "", ""
 
     normalized = _normalize_url(raw)
     try:
@@ -194,6 +200,10 @@ def _validate_fetch_url(url: str) -> tuple[bool, str, str, str]:
     host = _extract_host(normalized)
     if not host:
         return False, f"invalid URL '{raw}' — missing hostname", "", ""
+    if any(marker in host for marker in ("...", "…")):
+        return False, f"invalid URL '{raw}' — hostname looks truncated", normalized, host
+    if "." not in host and host != "localhost":
+        return False, f"invalid URL '{raw}' — hostname is not fully qualified", normalized, host
 
     if not WEB_FETCH_ALLOW_PRIVATE and _is_private_or_local_host(host):
         return False, f"blocked URL host '{host}' (private/local not allowed)", normalized, host
@@ -238,6 +248,16 @@ def _estimate_unique_candidates(raw_results: list[dict]) -> int:
 
 def _curate_results(raw_results: list[dict], num_results: int) -> tuple[list[dict], dict]:
     """Clean, deduplicate, and score results for better LLM context quality."""
+    # Pre-filter: drop pure error markers (e.g. {"source": "groq-error"}) before
+    # dedup/scoring. They otherwise leak past the title/snippet keep-check below
+    # and surface as fake search results. Fall back to the raw pool only if every
+    # entry was an error, so an all-failed search still reports something.
+    non_error = [
+        item for item in (raw_results or [])
+        if not str(item.get("source", "")).endswith("-error")
+    ]
+    raw_results = non_error if non_error else (raw_results or [])
+
     cleaned: list[dict] = []
     seen: set[str] = set()
     domain_counts: dict[str, int] = {}
@@ -897,12 +917,12 @@ async def _web_fetch(url: str, max_chars: int = 8000, use_jina: bool = True) -> 
         jina_url = f"https://r.jina.ai/{normalized_url}"
         try:
             async with httpx.AsyncClient(
-                timeout=HTTP_TIMEOUT,
+                timeout=JINA_TIMEOUT,
                 follow_redirects=True,
                 headers={
                     **HTTP_HEADERS,
                     "X-Return-Format": "markdown",
-                    "X-Timeout":       "15",
+                    "X-Timeout":       "6",
                 },
             ) as client:
                 resp = await client.get(jina_url)
@@ -929,7 +949,7 @@ async def _web_fetch(url: str, max_chars: int = 8000, use_jina: bool = True) -> 
     # ── httpx + HTML strip (Fallback) ─────────────────────────────────────────
     try:
         async with httpx.AsyncClient(
-            timeout=HTTP_TIMEOUT,
+            timeout=HTTPX_FETCH_TIMEOUT,
             follow_redirects=True,
             headers=HTTP_HEADERS,
         ) as client:

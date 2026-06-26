@@ -290,6 +290,19 @@ function tracePhase(event: TraceEventSummary): string {
       return 'tool';
     case 'run_ledger':
       return 'ledger';
+    case 'control_policy':
+    case 'policy_selected':
+    case 'policy_violation':
+      return 'policy';
+    case 'pass_graph_execution':
+    case 'pass_node_started':
+    case 'pass_node_completed':
+    case 'pass_node_failed':
+      return 'graph';
+    case 'recovery_started':
+      return 'recovery';
+    case 'completion_gate':
+      return 'completion';
     case 'verification_result':
     case 'verification_warning':
       return 'verification';
@@ -313,6 +326,7 @@ function traceSeverity(event: TraceEventSummary): Exclude<TraceSeverity, 'all'> 
   const preview = String(event.preview || '').toLowerCase();
   if (
     eventType.includes('warning') ||
+    eventType.includes('policy_violation') ||
     status.includes('warn') ||
     preview.includes('warning')
   )
@@ -326,7 +340,7 @@ function traceSeverity(event: TraceEventSummary): Exclude<TraceSeverity, 'all'> 
     return 'error';
   if (status.includes('blocked') || eventType.includes('blocked'))
     return 'blocked';
-  if (status.includes('retry') || eventType.includes('redraft'))
+  if (status.includes('retry') || eventType.includes('redraft') || eventType.includes('recovery'))
     return 'retrying';
   if (
     status.includes('complete') ||
@@ -569,8 +583,11 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
   const fallbackLanes = useMemo<OperatorStoryLane[]>(() => {
     const stageMap: Array<{ id: string; label: string; types: string[] }> = [
       { id: 'plan', label: 'Plan', types: ['plan', 'plan_steps', 'continuation_gate'] },
+      { id: 'policy', label: 'Policy', types: ['control_policy', 'policy_selected', 'policy_violation'] },
+      { id: 'graph', label: 'Graph', types: ['pass_graph_execution', 'pass_node_started', 'pass_node_completed', 'pass_node_failed'] },
       { id: 'context', label: 'Context', types: ['phase_packet', 'phase_context', 'compiled_context'] },
       { id: 'tool', label: 'Tools', types: ['tool_call', 'tool_result'] },
+      { id: 'recovery', label: 'Recovery', types: ['recovery_started', 'completion_gate'] },
       { id: 'verify', label: 'Verify', types: ['verification_result', 'verification_warning'] },
       { id: 'response', label: 'Response', types: ['assistant_response'] },
     ];

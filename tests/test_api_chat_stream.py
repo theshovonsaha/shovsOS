@@ -58,6 +58,46 @@ def test_chat_stream_ignores_extra_runtime_path_field(monkeypatch):
     assert "managed" in response.text
 
 
+def test_api_prefixed_chat_stream_reaches_run_engine(monkeypatch):
+    seen: dict[str, object] = {}
+
+    async def fake_stream(request):
+        seen["request"] = request
+        yield {"type": "session", "session_id": request.session_id, "run_id": "run-api-prefix-1"}
+        yield {"type": "token", "content": "api-prefixed"}
+        yield {"type": "done", "session_id": request.session_id, "run_id": "run-api-prefix-1"}
+
+    monkeypatch.setattr(run_engine, "stream", fake_stream)
+
+    client = TestClient(app)
+    response = client.post(
+        "/api/chat/stream",
+        data={
+            "message": "hello through frontend path",
+            "owner_id": "api-prefix-owner",
+            "model": "llama3.2",
+        },
+    )
+
+    assert response.status_code == 200
+    assert seen.get("request") is not None
+    assert "api-prefixed" in response.text
+
+
+def test_runtime_health_reports_frontend_relevant_features():
+    client = TestClient(app)
+
+    response = client.get("/api/runtime/health")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["runtime"] == "run_engine"
+    assert payload["tools"]["image_generate"] is True
+    assert payload["features"]["harness_lab"] is True
+    assert payload["features"]["api_prefix_compatibility"] is True
+
+
 def test_chat_stream_ignores_unknown_runtime_path_field(monkeypatch):
     seen: dict[str, object] = {}
 

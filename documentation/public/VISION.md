@@ -13,6 +13,9 @@ Shovs does this through:
 - controlled context assembly
 - explicit execution phases
 - a canonical run ledger
+- workflow contracts for recognizable multi-step task shapes
+- typed pass graphs for specialist retrieval, reasoning, scoring, evaluation, summarization, and orchestration roles
+- runtime attention over structured run state
 - verified tool grounding
 - structured fact and candidate lanes
 - checkpoints, artifacts, traces, and evals
@@ -57,6 +60,9 @@ Shovs is being built as a runtime with:
 
 - a managed `plan -> act -> observe -> verify -> memory_commit` loop
 - a run ledger for plan steps, tool calls, tool results, evidence, memory writes, verification, and continuation state
+- workflow contracts for entity locks, evidence requirements, tool policy, completion gates, and continuation policy
+- pass graphs that make workflow decomposition, context strategy, and stop conditions inspectable
+- runtime attention snapshots that score which ledger records matter for the current phase
 - phase-aware context compilation
 - deterministic fact vs candidate-signal lanes
 - side-effect guards for tool claims

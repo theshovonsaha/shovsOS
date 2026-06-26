@@ -21,6 +21,8 @@ class Config:
     # ── LLM Models ────────────────────────────────────────────────────────
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "auto")  # auto|ollama|openai|groq|gemini
     DEFAULT_MODEL: str = os.getenv("DEFAULT_MODEL", "qwen2.5-coder:latest")
+    VISION_MODEL: str = os.getenv("VISION_MODEL", "")
+    IMAGE_GENERATION_MODEL: str = os.getenv("IMAGE_GENERATION_MODEL", "gpt-image-1")
     
     # Provider-Specific Fallbacks
     OLLAMA_DEFAULT_MODEL: str = os.getenv("OLLAMA_DEFAULT_MODEL", "qwen2.5-coder:latest")

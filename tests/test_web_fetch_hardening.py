@@ -23,6 +23,14 @@ async def test_web_fetch_blocks_private_host_by_default():
 
 
 @pytest.mark.asyncio
+async def test_web_fetch_blocks_truncated_display_url():
+    result = await tools_web._web_fetch("https://fi...")
+    data = json.loads(result)
+    assert data["type"] == "web_fetch_error"
+    assert "truncated" in data["error"] or "display-formatted" in data["error"]
+
+
+@pytest.mark.asyncio
 async def test_web_fetch_groq_path_includes_metadata(monkeypatch):
     async def fake_fetch_groq(_url: str, _max_chars: int):
         return "Sample fetched body from model tool."

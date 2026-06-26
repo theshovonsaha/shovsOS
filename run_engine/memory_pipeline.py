@@ -7,6 +7,7 @@ from engine.candidate_signals import has_correction_signal, merge_candidate_sign
 from engine.compression_fact_policy import finalize_compression_fact_records
 from engine.deterministic_facts import merge_fact_records, merge_void_records
 from memory.vector_engine import VectorEngine
+from run_engine.memory_governor import govern_memory_commit
 
 try:  # soft import so the pipeline stays usable in isolation/tests
     from engine.conversation_tension import ConversationTension
@@ -42,6 +43,7 @@ class MemoryCommitPlan:
     tension_storage_action: str = "none"
     tension_voids: list[dict[str, Any]] = field(default_factory=list)
     tension_demotions: list[dict[str, Any]] = field(default_factory=list)
+    memory_decisions: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -179,10 +181,15 @@ def plan_memory_commit(
         current_turn=current_turn,
     )
     rendered_candidate_context = render_candidate_signals(candidate_signals) if candidate_signals else merge_candidate_context(existing_candidate_context, blocked_keyed_facts)
+    governed = govern_memory_commit(
+        facts=merge_fact_records(deterministic_keyed_facts, compression_keyed_facts),
+        voids=merge_void_records(deterministic_voids, compression_voids, tension_voids),
+        current_facts=current_facts,
+    )
     return MemoryCommitPlan(
         new_context=str(new_context or ""),
-        merged_facts=merge_fact_records(deterministic_keyed_facts, compression_keyed_facts),
-        merged_voids=merge_void_records(deterministic_voids, compression_voids, tension_voids),
+        merged_facts=governed.facts,
+        merged_voids=governed.voids,
         blocked_keyed_facts=blocked_keyed_facts,
         candidate_signals=candidate_signals,
         candidate_context=rendered_candidate_context,
@@ -193,6 +200,7 @@ def plan_memory_commit(
         tension_storage_action=tension_action,
         tension_voids=tension_voids,
         tension_demotions=tension_demotions,
+        memory_decisions=governed.decision_payloads(),
     )
 
 
@@ -219,10 +227,15 @@ def build_deterministic_memory_commit(
         current_turn=current_turn,
     )
     rendered_candidate_context = render_candidate_signals(candidate_signals) if candidate_signals else str(existing_candidate_context or "")
+    governed = govern_memory_commit(
+        facts=merge_fact_records(deterministic_keyed_facts),
+        voids=merge_void_records(deterministic_voids, tension_voids),
+        current_facts=[],
+    )
     return MemoryCommitPlan(
         new_context="",
-        merged_facts=merge_fact_records(deterministic_keyed_facts),
-        merged_voids=merge_void_records(deterministic_voids, tension_voids),
+        merged_facts=governed.facts,
+        merged_voids=governed.voids,
         blocked_keyed_facts=[],
         candidate_signals=candidate_signals,
         candidate_context=rendered_candidate_context,
@@ -233,6 +246,7 @@ def build_deterministic_memory_commit(
         tension_storage_action=tension_action,
         tension_voids=tension_voids,
         tension_demotions=tension_demotions,
+        memory_decisions=governed.decision_payloads(),
     )
 
 

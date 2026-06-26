@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 
 from engine.tool_contract import format_tool_result_line, summarize_arguments
 from plugins.tool_registry import ToolCall, ToolRegistry
+from run_engine.search_query import compile_web_search_query
 
 
 def build_actor_request_content(
@@ -105,7 +106,7 @@ def fallback_tool_call(tool_name: str, user_message: str) -> Optional[ToolCall]:
     arguments: dict[str, Any]
     lowered = (user_message or "").strip()
     if tool_name in {"web_search", "rag_search"}:
-        arguments = {"query": lowered}
+        arguments = {"query": compile_web_search_query(lowered)}
     elif tool_name == "query_memory":
         arguments = {"topic": lowered}
     elif tool_name == "web_fetch":
@@ -115,6 +116,8 @@ def fallback_tool_call(tool_name: str, user_message: str) -> Optional[ToolCall]:
         arguments = {"url": url_match.group(0).rstrip('.,)')}
     elif tool_name == "weather_fetch":
         arguments = {"location": lowered}
+    elif tool_name == "image_generate":
+        arguments = {"prompt": lowered}
     elif tool_name == "delegate_to_agent":
         arguments = {"task": lowered}
     else:

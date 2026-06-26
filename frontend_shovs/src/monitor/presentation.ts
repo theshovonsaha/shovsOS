@@ -161,6 +161,16 @@ const HUMAN_EVENT_LABELS: Record<string, string> = {
   prompt_components: 'Prompt Built',
   assistant_response: 'Answer Ready',
   route_decision: 'Route Selected',
+  control_policy: 'Control Policy',
+  policy_selected: 'Policy Selected',
+  policy_violation: 'Policy Violation',
+  pass_graph: 'Pass Graph',
+  pass_graph_execution: 'Graph Progress',
+  pass_node_started: 'Graph Step Started',
+  pass_node_completed: 'Graph Step Done',
+  pass_node_failed: 'Graph Step Failed',
+  recovery_started: 'Recovery Started',
+  completion_gate: 'Completion Gate',
   verification_result: 'Verification Result',
   verification_warning: 'Verification Warning',
   manager_observation: 'Observation',
@@ -242,6 +252,47 @@ export function describeTraceEvent(event: TraceEventSummary): string {
       return `Loop mode is ${data.effective || data.requested || 'unknown'}.`;
     case 'route_decision':
       return `The runtime chose the ${data.route_type || 'unknown'} route.`;
+    case 'control_policy':
+    case 'policy_selected':
+      return `Policy ${data.policy || data.control_policy || data.id || data.selected_policy || 'not recorded'} is active${data.ledger_mode ? ` · ${data.ledger_mode}` : ''}.`;
+    case 'policy_violation': {
+      const violation = String(data.violation || data.reason || data.error || 'policy violation').trim();
+      const expected = data.expected_tool || data.expected_action || data.allowed_next_tool;
+      return `Policy blocked drift · ${violation}${expected ? ` · expected ${expected}` : ''}.`;
+    }
+    case 'pass_graph':
+      return `Graph harness loaded${data.graph_id ? ` · ${data.graph_id}` : ''}.`;
+    case 'pass_graph_execution': {
+      const summary = asObject(data.execution?.summary || data.summary);
+      const completed = summary.completed ?? data.completed;
+      const total = summary.total ?? data.total;
+      const node = asObject(data.node);
+      const title = node.label || node.id || 'current step';
+      const progress =
+        completed !== undefined && total !== undefined
+          ? ` · ${completed}/${total} done`
+          : '';
+      return `Graph step tracked · ${title}${progress}.`;
+    }
+    case 'pass_node_started': {
+      const node = asObject(data.node);
+      return `Graph step started · ${node.label || node.id || 'not recorded'}.`;
+    }
+    case 'pass_node_completed': {
+      const node = asObject(data.node);
+      return `Graph step completed · ${node.label || node.id || 'not recorded'}.`;
+    }
+    case 'pass_node_failed': {
+      const node = asObject(data.node);
+      const issue = String(data.issue || node.issue || 'not recorded').trim();
+      return `Graph step failed · ${node.label || node.id || 'not recorded'} · ${issue}.`;
+    }
+    case 'recovery_started':
+      return `Recovery started · ${data.recovery_class || data.reason || 'not recorded'}${data.next_action ? ` · ${data.next_action}` : ''}.`;
+    case 'completion_gate':
+      return data.allowed === false || data.complete === false
+        ? `Completion blocked${Array.isArray(data.missing) && data.missing.length ? ` · ${data.missing[0]}` : ''}.`
+        : 'Completion gate passed.';
     case 'conversation_tension': {
       const summary = String(data.summary || event.preview || '').trim();
       const challenge = String(data.challenge_level || 'low').trim();

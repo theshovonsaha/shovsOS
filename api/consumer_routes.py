@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile
@@ -12,6 +13,8 @@ from orchestration.session_manager import SessionManager
 from engine.file_processor import FileProcessor
 from memory.semantic_graph import SemanticGraph
 from llm.adapter_factory import create_adapter
+from llm.model_capabilities import capability_flags
+from config.config import cfg
 from plugins.tool_registry import ToolRegistry
 from api.memory_inspector import build_session_memory_payload
 from api.owner import require_owner_id
@@ -95,7 +98,17 @@ def make_consumer_router(
                     grouped[provider] = models
             except Exception:
                 pass
-        return {"models": grouped}
+        capabilities = {
+            f"{provider}:{model}": capability_flags(f"{provider}:{model}")
+            for provider, models in grouped.items()
+            for model in models
+        }
+        return {
+            "models": grouped,
+            "capabilities": capabilities,
+            "vision_model": cfg.VISION_MODEL,
+            "image_generation_model": cfg.IMAGE_GENERATION_MODEL,
+        }
 
     @router.get("/options")
     async def get_consumer_options():
@@ -243,6 +256,7 @@ def make_consumer_router(
                 ledger_mode=getattr(profile, "ledger_mode", "shadow"),
                 workspace_path=getattr(profile, "workspace_path", None),
                 reasoning_enabled=reasoning_enabled,
+                memory_commit_mode=os.getenv("SHOVSOS_MEMORY_COMMIT_MODE", "async"),
             )
             async for event in run_engine.stream(run_request):
                 event_type = event.get("type")

@@ -1,0 +1,10 @@
+[project]
+name = "shovs-harness-core"
+version = "0.1.0"
+description = "A small, testable agent harness kernel extracted from ShovsOS."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

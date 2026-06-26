@@ -705,6 +705,18 @@ class SemanticGraph:
         insert cannot leave the old fact voided with no current replacement.
         """
         now = datetime.now().isoformat()
+        prepared_facts: list[dict] = []
+        for fact in facts:
+            subject = str(fact.get("subject") or "").strip()
+            predicate = str(fact.get("predicate") or "").strip()
+            raw_object = fact.get("object") if "object" in fact else fact.get("object_")
+            if not isinstance(raw_object, (str, int, float, bool)):
+                raise AttributeError("temporal fact object must be a scalar value")
+            object_ = str(raw_object).strip()
+            if not subject or not predicate:
+                continue
+            prepared_facts.append({**fact, "subject": subject, "predicate": predicate, "object": object_})
+
         with sqlite3.connect(self.db_path) as conn:
             for void in voids:
                 subject = str(void.get("subject") or "").strip()
@@ -731,10 +743,10 @@ class SemanticGraph:
                         (turn, session_id, owner_id, subject, predicate),
                     )
 
-            for fact in facts:
+            for fact in prepared_facts:
                 subject = str(fact.get("subject") or "").strip()
                 predicate = str(fact.get("predicate") or "").strip()
-                object_ = (fact.get("object") if "object" in fact else fact.get("object_")).strip()
+                object_ = str(fact.get("object") or "").strip()
                 if not subject or not predicate:
                     continue
                 fact_locus_id = str(fact.get("locus_id") or "").strip() or locus_id

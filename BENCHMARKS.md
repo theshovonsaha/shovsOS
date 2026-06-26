@@ -49,6 +49,10 @@ The bottom layers should be fast and deterministic. Public demos should be built
 | Scenario | What it checks | Primary tests |
 | --- | --- | --- |
 | Source collection contract | The agent keeps selected entities locked and fetches the requested sources instead of drifting. | `tests/test_runtime_e2e_diagnostics.py`, `tests/test_agent_harness_core_benchmarks.py` |
+| Workflow contract inference | Topic-agnostic source-collection requests become explicit quotas, tool policy, and completion gates. | `tests/test_workflow_contracts_runtime.py` |
+| Pass framework | Workflow contracts map to specialist passes, context strategies, and stop conditions. | `tests/test_pass_framework.py` |
+| Ledger-authority tool inputs | Managed source selection rejects fake model-supplied search payloads and resolves successful ledger result IDs. | `tests/test_web_search_context.py`, `tests/test_run_engine_contract.py` |
+| Runtime attention | Phase-specific ledger scoring is deterministic and selects pending/evidence records differently by phase. | `tests/test_run_ledger.py` |
 | Tool hallucination guard | Tested final-response paths reject or clean tool-call-shaped JSON before user-facing output. | `tests/test_response_guard.py` |
 | Ledger linking | Ledger helpers reject tool results without a known tool call. | `tests/test_run_ledger.py`, `tests/test_agent_harness_core_benchmarks.py` |
 | Memory rollback | Tested replacement paths avoid destroying the old fact if the new fact fails to store. | `tests/test_shovs_memory.py` |

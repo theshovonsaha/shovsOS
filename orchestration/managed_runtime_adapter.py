@@ -35,7 +35,7 @@ class ManagedRuntimeInstance:
         owner_id = kw.get("owner_id", context.owner_id)
         requested_agent_id = agent_id or context.agent_id
         effective_model = model or context.model_override or context.profile.model
-        resolved_context_mode = kw.get("context_mode") or getattr(context.profile, "default_context_mode", "v2")
+        resolved_context_mode = kw.get("context_mode") or getattr(context.profile, "default_context_mode", "v3")
         request = RunEngineRequest(
             session_id=session_id or str(uuid.uuid4()),
             owner_id=str(owner_id or ""),
@@ -59,6 +59,11 @@ class ManagedRuntimeInstance:
             search_backend=search_backend,
             search_engine=search_engine,
             agent_revision=getattr(context.profile, "revision", None),
+            workflow_template=getattr(context.profile, "workflow_template", "general_operator_v1"),
+            prompt_version=getattr(context.profile, "prompt_version", "role_contracts_v1"),
+            risk_policy=getattr(context.profile, "risk_policy", "standard"),
+            ledger_mode=getattr(context.profile, "ledger_mode", "shadow"),
+            control_policy=kw.get("loop_mode") or getattr(context.profile, "default_loop_mode", "auto"),
             forced_tools=tuple(str(item) for item in (forced_tools or []) if isinstance(item, str)),
         )
 
@@ -107,11 +112,11 @@ class ManagedAgentRuntimeAdapter:
         loop_mode: Optional[str] = None,
         run_metadata: Optional[dict[str, Any]] = None,
     ) -> str:
-        del loop_mode, parent_run_id, run_metadata
+        del parent_run_id, run_metadata
         owner_id = str(context.owner_id or "")
         child_sid = f"delegated_{uuid.uuid4().hex[:8]}"
         effective_model = context.model_override or context.profile.model
-        resolved_context_mode = getattr(context.profile, "default_context_mode", "v2")
+        resolved_context_mode = getattr(context.profile, "default_context_mode", "v3")
 
         if parent_id:
             parent_session = context.sessions.get(parent_id, owner_id=context.owner_id)
@@ -138,6 +143,11 @@ class ManagedAgentRuntimeAdapter:
             context_mode=resolved_context_mode,
             allowed_tools=tuple(getattr(context.profile, "tools", []) or []),
             use_planner=bool(getattr(context.profile, "default_use_planner", True)),
+            workflow_template=getattr(context.profile, "workflow_template", "general_operator_v1"),
+            prompt_version=getattr(context.profile, "prompt_version", "role_contracts_v1"),
+            risk_policy=getattr(context.profile, "risk_policy", "standard"),
+            ledger_mode=getattr(context.profile, "ledger_mode", "shadow"),
+            control_policy=loop_mode or getattr(context.profile, "default_loop_mode", "auto"),
             agent_revision=getattr(context.profile, "revision", None),
         )
 

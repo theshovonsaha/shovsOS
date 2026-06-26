@@ -1,3 +1,5 @@
+import json
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -8,8 +10,9 @@ from memory.semantic_graph import SemanticGraph
 from orchestration.run_store import RunStore
 from orchestration.session_manager import SessionManager
 from plugins.tool_registry import Tool, ToolRegistry
+from plugins.tools import register_tools
 from run_engine.context_packets import PacketBuildInputs, build_phase_packet
-from run_engine.engine import RunEngine
+from run_engine.engine import RunEngine, _extract_urls_from_tool_results
 from run_engine.tool_contract import canonical_tool_result
 from run_engine.types import RunEngineRequest
 
@@ -451,6 +454,119 @@ async def test_run_engine_direct_fact_turn_skips_planner_and_tools_when_determin
         any(item["item_id"] == "deterministic_facts" for item in event["data"]["included"])
         for event in phase_context_events
     )
+
+
+@pytest.mark.asyncio
+async def test_run_engine_simple_chat_skips_planner_tools_and_memory_commit(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Hi."]))
+
+    orchestrator = MagicMock()
+    orchestrator.plan_with_context = AsyncMock()
+    orchestrator.observe_with_context = AsyncMock()
+    orchestrator.verify_with_context = AsyncMock(return_value={"supported": True, "issues": [], "confidence": 0.99})
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = "stale source workflow context"
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=orchestrator,
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="simple-chat-runtime",
+                owner_id="owner-simple-chat",
+                agent_id="default",
+                user_message="hi again",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_search", "web_fetch"),
+                use_planner=True,
+            )
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
+    assert not any(event["type"] == "tool_call" for event in events)
+    orchestrator.plan_with_context.assert_not_awaited()
+    context_engine.compress_exchange.assert_not_awaited()
+    assert any(
+        event["event_type"] == "memory_commit_skipped"
+        and event["data"].get("reason") == "low_value_social_turn"
+        for event in traces.events
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_engine_async_memory_commit_does_not_block_done_event(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Saved that preference."]))
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_compress_exchange(**_kwargs):
+        started.set()
+        await release.wait()
+        return ("- User prefers concise answers", [], [])
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(side_effect=delayed_compress_exchange)
+
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=None,
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="async-memory-runtime",
+                owner_id="owner-async-memory",
+                agent_id="default",
+                user_message="Remember that I prefer concise answers.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=(),
+                use_planner=False,
+                memory_commit_mode="async",
+            )
+        )
+    ]
+
+    event_types = [event["type"] for event in events]
+    assert event_types.index("memory_commit_deferred") < event_types.index("done")
+    assert any(
+        event["event_type"] == "memory_commit_deferred"
+        for event in traces.events
+    )
+
+    release.set()
+    pending = list(engine._background_memory_tasks)
+    if pending:
+        await asyncio.gather(*pending)
+    assert context_engine.compress_exchange.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -984,6 +1100,100 @@ async def test_run_engine_reuses_duplicate_web_result_without_second_network_cal
     )
 
 
+@pytest.mark.asyncio
+async def test_run_engine_stops_when_duplicate_recovery_has_no_new_action(tmp_path):
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(
+        return_value='{"tool_calls": [{"function": {"name": "web_search", "arguments": "{\\"query\\": \\\"find run engine\\\"}"}}]}'
+    )
+    adapter.stream = MagicMock(return_value=AsyncIter(["Partial answer."]))
+
+    orchestrator = MagicMock()
+    orchestrator.plan_with_context = AsyncMock(
+        return_value={
+            "strategy": "Search first.",
+            "tools": [{"name": "web_search", "priority": "high", "reason": "Need evidence."}],
+            "confidence": 0.9,
+        }
+    )
+    orchestrator.observe_with_context = AsyncMock(
+        return_value={
+            "status": "continue",
+            "strategy": "Repeat search again.",
+            "tools": [{"name": "web_search", "priority": "high", "reason": "Repeat same query."}],
+            "notes": "Continue loop.",
+            "confidence": 0.5,
+        }
+    )
+    orchestrator.verify_with_context = AsyncMock(
+        return_value={"supported": False, "issues": ["duplicate_loop"], "confidence": 0.3}
+    )
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    call_count = 0
+
+    async def web_search(query: str, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return {
+            "type": "web_search_results",
+            "query": query,
+            "results": [{"title": "Run Engine", "url": "https://example.com/run-engine"}],
+        }
+
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="web_search",
+            description="Search the web.",
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Search query."}},
+                "required": ["query"],
+            },
+            handler=web_search,
+            response_format="json",
+        )
+    )
+
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=orchestrator,
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="run-engine-duplicate-stagnation",
+                owner_id="owner-run-engine",
+                agent_id="default",
+                user_message="Research run engine and summarize it.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=("web_search",),
+                use_planner=True,
+                max_tool_calls=4,
+            )
+        )
+    ]
+
+    assert call_count == 1
+    assert any(event.get("type") == "loop_stagnation" for event in events)
+    assert any(event["event_type"] == "loop_stagnation" for event in traces.events)
+    assert orchestrator.observe_with_context.await_count == 2
+
+
 def test_build_phase_packet_includes_guidance_and_memory_items():
     context_engine = MagicMock()
     context_engine.build_context_items.return_value = [
@@ -1038,6 +1248,57 @@ def test_build_phase_packet_includes_guidance_and_memory_items():
     assert "Strategy: Search first, then synthesize." in packet.content
     assert "Notes: Focus on verified sources." in packet.content
     assert "Stored fact for this session." in packet.content
+
+
+def test_build_phase_packet_includes_runtime_attention_lane():
+    session = SimpleNamespace(
+        first_message="Original user goal.",
+        sliding_window=[],
+    )
+    request = RunEngineRequest(
+        session_id="packet-attention",
+        owner_id="owner-1",
+        agent_id="default",
+        user_message="Search ROKU and fetch exact sources.",
+        model="llama3.2",
+        system_prompt="You are Shovs.",
+        allowed_tools=("web_search", "web_fetch"),
+    )
+    from run_engine.ledger import RunLedger
+
+    ledger = RunLedger(
+        run_id="run-attention",
+        session_id="packet-attention",
+        turn_id="turn-1",
+        objective=request.user_message,
+        allowed_tools=["web_search", "web_fetch"],
+    )
+    ledger.set_plan([
+        {"id": "step_1", "description": "Search ROKU news", "tool": "web_search", "status": "pending"},
+    ])
+
+    packet = build_phase_packet(
+        context_engine=None,
+        inputs=PacketBuildInputs(
+            request=request,
+            session=session,
+            phase=ContextPhase.ACTING,
+            system_prompt=request.system_prompt,
+            current_context="",
+            allowed_tools=[{"name": "web_search", "description": "Search the web."}],
+            tool_results=[],
+            run_ledger=ledger,
+        ),
+    )
+
+    assert "Runtime Attention:" in packet.content
+    assert "plan:step_1" in packet.content
+    attention_items = [
+        item for item in packet.trace["included"]
+        if item["item_id"] == "runtime_attention"
+    ]
+    assert attention_items
+    assert attention_items[0]["provenance"]["policy"] == "ledger_phase_weighted"
 
 
 def test_build_final_messages_includes_controller_reminder(tmp_path):
@@ -1404,6 +1665,121 @@ async def test_run_engine_honors_max_tool_calls_limit(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_engine_rejects_model_fabricated_source_select_payloads(tmp_path):
+    """Messy frontend-like run: model tries to smuggle fake source state.
+
+    This simulates a fast Gemini/Flash-style actor output: the model skips
+    ledger result IDs and passes invented search_payloads directly to
+    source_select. The managed runtime must not let deterministic tools treat
+    that as real evidence.
+    """
+
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(
+        return_value=json.dumps({
+            "tool": "source_select",
+            "arguments": {
+                "search_payloads": [
+                    {
+                        "query": "top 3 sushi restaurants in Toronto",
+                        "results": [
+                            {"title": "Fake sushi page", "url": "https://www.example.com/toronto-sushi"}
+                        ],
+                    }
+                ],
+                "per_entity": 3,
+            },
+        })
+    )
+    adapter.stream = MagicMock(return_value=AsyncIter(["I could not verify the requested sources."]))
+
+    orchestrator = MagicMock()
+    orchestrator.plan_with_context = AsyncMock(
+        return_value={
+            "strategy": "Select URLs from prior search evidence.",
+            "tools": [{"name": "source_select", "priority": "high", "reason": "Select fetched sources."}],
+            "confidence": 0.8,
+        }
+    )
+    orchestrator.observe_with_context = AsyncMock(
+        return_value={
+            "status": "finalize",
+            "strategy": "Stop after rejected source selection.",
+            "tools": [],
+            "notes": "The selection payload was not ledger-backed.",
+            "confidence": 0.5,
+        }
+    )
+    orchestrator.verify_with_context = AsyncMock(
+        return_value={"supported": True, "issues": [], "confidence": 0.8}
+    )
+
+    registry = ToolRegistry()
+    register_tools(registry, "source_select")
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("", [], []))
+
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=orchestrator,
+        context_engine=context_engine,
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="messy-source-select",
+                owner_id="owner-1",
+                agent_id="default",
+                user_message=(
+                    "top 3 sushi places in toronto, then search each, fetch 3 URLs each "
+                    "to get intel and then give a summary tldr table only"
+                ),
+                model="gemini-3-flash-test",
+                system_prompt="You are Shovs.",
+                allowed_tools=("source_select",),
+                use_planner=True,
+                max_tool_calls=1,
+            )
+        )
+    ]
+
+    tool_results = [event for event in events if event.get("type") == "tool_result"]
+    assert tool_results
+    assert tool_results[0]["success"] is False
+    assert "rejected_untrusted_payload" in tool_results[0]["content"]
+    assert not any("https://www.example.com/toronto-sushi" in str(event) and event.get("success") is True for event in events)
+
+
+def test_engine_url_extraction_ignores_truncated_display_urls():
+    urls = _extract_urls_from_tool_results(
+        [
+            {
+                "tool_name": "web_search",
+                "success": True,
+                "content": json.dumps({
+                    "type": "web_search_results",
+                    "results": [
+                        {"url": "https://fi..."},
+                        {"url": "https://news.example/roku"},
+                    ],
+                }),
+            }
+        ]
+    )
+
+    assert urls == ["https://news.example/roku"]
+
+
+@pytest.mark.asyncio
 async def test_run_engine_injects_search_routing_and_embed_model_context(tmp_path):
     adapter = MagicMock()
     adapter.complete = AsyncMock(
@@ -1515,6 +1891,105 @@ async def test_run_engine_passes_provider_qualified_model_to_context_compression
 
     assert any(event["type"] == "done" for event in events)
     assert context_engine.compress_exchange.await_args.kwargs["model"] == "groq:llama-3.3-70b-versatile"
+
+
+@pytest.mark.asyncio
+async def test_run_engine_rejects_images_on_nonvision_model_without_fallback(tmp_path, monkeypatch):
+    from config.config import cfg
+
+    monkeypatch.setattr(cfg, "VISION_MODEL", "", raising=False)
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Should not run."]))
+
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=FakeTraceStore(),
+        orchestrator=None,
+        context_engine=None,
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="vision-required-no-fallback",
+                owner_id="owner-vision",
+                agent_id="default",
+                user_message="Describe this image.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=(),
+                use_planner=False,
+                images=["base64-image"],
+            )
+        )
+    ]
+
+    assert events == [
+        {
+            "type": "error",
+            "message": (
+                "Image input requires a vision-capable model. Select a vision model "
+                "or set VISION_MODEL to a provider-prefixed vision model such as "
+                "gemini:gemini-1.5-flash, openai:gpt-4o-mini, or ollama:llava."
+            ),
+        }
+    ]
+    adapter.stream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_engine_routes_images_to_configured_vision_model(tmp_path, monkeypatch):
+    from config.config import cfg
+
+    monkeypatch.setattr(cfg, "VISION_MODEL", "llava:latest", raising=False)
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Image answer."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=None,
+        context_engine=context_engine,
+    )
+    engine._resolve_adapter = MagicMock(return_value=adapter)
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="vision-fallback-model",
+                owner_id="owner-vision",
+                agent_id="default",
+                user_message="Describe this image.",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=(),
+                use_planner=False,
+                images=["base64-image"],
+            )
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
+    assert adapter.stream.call_args.kwargs["model"] == "llava:latest"
+    assert adapter.stream.call_args.kwargs["images"] == ["base64-image"]
+    assert any(
+        event["event_type"] == "model_capability_violation"
+        and event["data"]["fallback"] == "llava:latest"
+        for event in traces.events
+    )
 
 
 @pytest.mark.asyncio

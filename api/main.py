@@ -52,10 +52,12 @@ from api.voice_endpoint import setup_voice_routes
 from api.rag_routes import make_rag_router            # ← NEW
 from api.consumer_routes import make_consumer_router
 from api.harness_lab import make_harness_lab_router
+from api.workflow_lab import make_workflow_lab_router
 from api.memory_inspector import build_session_memory_payload
 from api.owner import require_owner_id
 from services.storage_admin import StorageAdminService, StoreSelection
 from services.consumer_store import ConsumerStoreService
+from services.image_generation import generate_image
 from plugins.shovs_meta_gateway import inject_gateway_dependencies, register_gateway_tools
 
 from guardrails import GuardrailMiddleware
@@ -66,6 +68,7 @@ from run_engine import RunEngine, RunEngineRequest
 
 from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
+from llm.model_capabilities import capability_flags
 FALLBACK_CHAT_MODEL = cfg.DEFAULT_MODEL
 CHAT_RATE_LIMIT = os.getenv("CHAT_RATE_LIMIT", "30/minute")
 
@@ -224,9 +227,10 @@ def _seed_standard_profiles():
             name="Research Specialist",
             model=cfg.DEFAULT_MODEL,
             tools=[
+                "source_collect",
                 "source_contract", "source_select", "source_next_action",
                 "web_fetch_batch", "source_coverage",
-                "web_search", "web_fetch", "rag_search", "query_memory", "store_memory",
+                "web_search", "web_fetch", "image_search", "image_generate", "rag_search", "query_memory", "store_memory",
             ],
             system_prompt=(
                 "You are a meticulous research agent. Always verify claims across multiple sources. "
@@ -260,9 +264,10 @@ def _seed_standard_profiles():
             description="Plain-language assistant for the consumer chat surface.",
             model="groq:moonshotai/kimi-k2-instruct",
             tools=[
+                "source_collect",
                 "source_contract", "source_select", "source_next_action",
                 "web_fetch_batch", "source_coverage",
-                "web_search", "web_fetch", "query_memory",
+                "web_search", "web_fetch", "image_search", "image_generate", "query_memory",
             ],
             system_prompt=(
                 "You are a clear, calm assistant for the consumer product surface. "
@@ -279,7 +284,7 @@ def _seed_standard_profiles():
             description="Verifies product pages, prices, and tradeoffs before recommending.",
             model=cfg.DEFAULT_MODEL,
             tools=[
-                "shopping_advice", "source_contract", "source_select", "source_next_action",
+                "shopping_advice", "source_collect", "source_contract", "source_select", "source_next_action",
                 "web_fetch_batch", "source_coverage",
                 "web_search", "web_fetch", "query_memory", "store_memory",
             ],
@@ -326,11 +331,36 @@ app = FastAPI(title="shovs", version="0.6.0", lifespan=lifespan)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.middleware("http")
+async def api_prefix_compatibility(request: Request, call_next):
+    """Allow frontend/static deployments to call /api/* without a dev proxy.
+
+    Vite strips /api during local development, but a production/static backend
+    may receive /api/models or /api/chat/stream directly. Rewriting here keeps
+    both deployment shapes equivalent without duplicating every route.
+    """
+    path = request.scope.get("path", "")
+    if path == "/api":
+        request.scope["path"] = "/"
+    elif isinstance(path, str) and path.startswith("/api/"):
+        request.scope["path"] = path[4:]
+    return await call_next(request)
+
+
 setup_log_routes(app)
 setup_voice_routes(app, run_engine=run_engine, profile_manager=profile_manager)
 app.include_router(make_guardrail_router(guardrail_middleware), prefix="/guardrails")
 app.include_router(make_rag_router(), prefix="/rag")          # ← NEW
 app.include_router(make_harness_lab_router())
+app.include_router(
+    make_workflow_lab_router(
+        run_engine=run_engine,
+        profile_manager=profile_manager,
+        default_model=FALLBACK_CHAT_MODEL,
+    )
+)
 app.include_router(
     make_consumer_router(
         profile_manager=profile_manager,
@@ -377,6 +407,15 @@ class StorageActionPayload(StorageSelectionPayload):
 
 class StorageBackupPayload(StorageSelectionPayload):
     backup_label: str = ""
+
+
+class ImageGenerationPayload(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=8000)
+    model: str = ""
+    size: str = "1024x1024"
+    quality: str = "auto"
+    background: str = "auto"
+    output_format: str = "png"
 
 
 class MemorySearchPayload(BaseModel):
@@ -454,11 +493,73 @@ async def list_models():
         "openai:text-embedding-ada-002"
     ])
     
-    return {"models": grouped, "embeddings": list(set(embeddings))}
+    capabilities: dict[str, dict[str, Any]] = {}
+    for provider, provider_models in grouped.items():
+        for model_name in provider_models:
+            full_name = f"{provider}:{model_name}"
+            capabilities[full_name] = capability_flags(full_name)
+    for embedding_model in set(embeddings):
+        capabilities[embedding_model] = capability_flags(embedding_model)
+    return {
+        "models": grouped,
+        "embeddings": list(set(embeddings)),
+        "capabilities": capabilities,
+        "vision_model": cfg.VISION_MODEL,
+        "image_generation_model": cfg.IMAGE_GENERATION_MODEL,
+    }
 
 @app.get("/tools")
 async def list_tools():
     return {"tools": tool_registry.list_tools()}
+
+
+@app.get("/runtime/health")
+async def runtime_health():
+    tools = tool_registry.list_tools()
+    tool_names = [str(tool.get("name") or "") for tool in tools]
+    return {
+        "status": "ok",
+        "runtime": "run_engine",
+        "tool_count": len(tools),
+        "tools": {
+            "web_search": "web_search" in tool_names,
+            "web_fetch": "web_fetch" in tool_names,
+            "image_generate": "image_generate" in tool_names,
+            "image_search": "image_search" in tool_names,
+        },
+        "models": {
+            "default_model": cfg.DEFAULT_MODEL,
+            "vision_model": cfg.VISION_MODEL,
+            "image_generation_model": cfg.IMAGE_GENERATION_MODEL,
+        },
+        "features": {
+            "harness_lab": True,
+            "workflow_lab": True,
+            "api_prefix_compatibility": True,
+            "sandbox_static": True,
+        },
+        "requirements": {
+            "image_generation": "OPENAI_API_KEY" if not cfg.OPENAI_API_KEY else "configured",
+        },
+    }
+
+
+@app.post("/images/generate")
+async def generate_image_endpoint(payload: ImageGenerationPayload):
+    try:
+        return await generate_image(
+            prompt=payload.prompt,
+            model=payload.model,
+            size=payload.size,
+            quality=payload.quality,
+            background=payload.background,
+            output_format=payload.output_format,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
 
 @app.post("/chat/stream")
 @limiter.limit(CHAT_RATE_LIMIT)
@@ -594,9 +695,11 @@ async def chat_stream(
                 prompt_version=getattr(profile, "prompt_version", "role_contracts_v1"),
                 risk_policy=getattr(profile, "risk_policy", "standard"),
                 ledger_mode=getattr(profile, "ledger_mode", "shadow"),
+                control_policy=loop_mode or getattr(profile, "default_loop_mode", "auto"),
                 forced_tools=tuple(str(item) for item in forced_tools if isinstance(item, str)),
                 workspace_path=getattr(profile, "workspace_path", None),
                 reasoning_enabled=reasoning_enabled,
+                memory_commit_mode=os.getenv("SHOVSOS_MEMORY_COMMIT_MODE", "async"),
             )
             async for event in run_engine.stream(run_request):
                 yield f"data: {json.dumps(event)}\n\n"

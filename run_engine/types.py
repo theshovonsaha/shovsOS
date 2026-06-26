@@ -30,12 +30,17 @@ class RunEngineRequest:
     prompt_version: str = "role_contracts_v1"
     risk_policy: str = "standard"
     ledger_mode: str = "shadow"
+    control_policy: str = "auto"
     forced_tools: tuple[str, ...] = field(default_factory=tuple)
     workspace_path: Optional[str] = None
     # None = let the adapter decide (default for the model). True/False explicitly
     # overrides — mainly meaningful for Ollama thinking models, where False sets
     # think:false in the API payload to suppress reasoning generation entirely.
     reasoning_enabled: Optional[bool] = None
+    # sync = wait for compression/indexing before done. async = respond first,
+    # then run memory maintenance in a guarded background task. skip = no
+    # memory maintenance for this turn.
+    memory_commit_mode: str = "sync"
 
 
 @dataclass(frozen=True)

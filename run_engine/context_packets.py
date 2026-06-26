@@ -25,9 +25,11 @@ from engine.conversation_tension import (
 )
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from run_engine.evidence_lane import build_working_evidence_block, build_working_evidence_snapshot
+from run_engine.context_ladder import build_context_ladder, render_context_ladder
 from run_engine.meta_context import build_meta_context_block, build_meta_context_snapshot
 from run_engine.tool_contract import format_tool_result_line
 from run_engine.types import CompiledPassPacket, RunEngineRequest
+from run_engine.workflow_contracts import classify_workflow_shape
 from memory.task_tracker import get_session_task_tracker
 
 
@@ -92,6 +94,8 @@ def build_phase_packet(
     items: list[ContextItem] = []
     request = inputs.request
     session = inputs.session
+    workflow_shape = _packet_workflow_shape(inputs)
+    sparse_simple_chat = workflow_shape == "simple_chat"
 
     items.append(
         build_runtime_metadata_item(
@@ -111,7 +115,7 @@ def build_phase_packet(
     if instruction_item is not None:
         items.append(instruction_item)
 
-    if inputs.run_ledger is not None and hasattr(inputs.run_ledger, "render_for_phase"):
+    if not sparse_simple_chat and inputs.run_ledger is not None and hasattr(inputs.run_ledger, "render_for_phase"):
         try:
             ledger_content = str(inputs.run_ledger.render_for_phase(inputs.phase) or "").strip()
             ledger_packet = inputs.run_ledger.to_phase_packet(inputs.phase) if hasattr(inputs.run_ledger, "to_phase_packet") else {}
@@ -146,6 +150,75 @@ def build_phase_packet(
                     }),
                 )
             )
+        if hasattr(inputs.run_ledger, "render_attention_for_phase"):
+            try:
+                attention_content = str(inputs.run_ledger.render_attention_for_phase(inputs.phase) or "").strip()
+                attention_packet = (ledger_packet.get("runtime_attention") or {}) if isinstance(ledger_packet, dict) else {}
+            except Exception:
+                attention_content = ""
+                attention_packet = {}
+            if attention_content:
+                items.append(
+                    ContextItem(
+                        item_id="runtime_attention",
+                        kind=ContextKind.META,
+                        title="Runtime Attention",
+                        content=attention_content,
+                        source="runtime_attention",
+                        priority=32,
+                        max_chars=1800,
+                        trace_id="run_engine:runtime_attention",
+                        provenance={
+                            "version": str(attention_packet.get("version") or ""),
+                            "phase": str(attention_packet.get("phase") or inputs.phase.value),
+                            "item_count": len(attention_packet.get("items") or []),
+                            "omitted_count": int(attention_packet.get("omitted_count") or 0),
+                            "policy": str((attention_packet.get("policy") or {}).get("name") or ""),
+                        },
+                        phase_visibility=frozenset({
+                            ContextPhase.PLANNING,
+                            ContextPhase.ACTING,
+                            ContextPhase.RESPONSE,
+                            ContextPhase.MEMORY_COMMIT,
+                            ContextPhase.VERIFICATION,
+                        }),
+                    )
+                )
+        try:
+            ladder = build_context_ladder(
+                query=inputs.effective_objective or request.user_message,
+                compact_memory=inputs.current_context or "",
+                evidence_refs=(ledger_packet.get("evidence_items") or []) if isinstance(ledger_packet, dict) else [],
+                raw_payloads=(ledger_packet.get("tool_results") or []) if isinstance(ledger_packet, dict) else [],
+                include_raw=False,
+                limit=6,
+            )
+        except Exception:
+            ladder = {}
+        if ladder.get("steps"):
+            items.append(
+                ContextItem(
+                    item_id="context_ladder",
+                    kind=ContextKind.RUNTIME,
+                    title="Context Ladder",
+                    content=render_context_ladder(ladder),
+                    source="context_ladder",
+                    priority=24,
+                    max_chars=1800,
+                    trace_id="run_engine:context_ladder",
+                    provenance={
+                        "version": str(ladder.get("version") or ""),
+                        "step_count": len(ladder.get("steps") or []),
+                        "include_raw": bool(ladder.get("include_raw")),
+                    },
+                    phase_visibility=frozenset({
+                        ContextPhase.PLANNING,
+                        ContextPhase.ACTING,
+                        ContextPhase.RESPONSE,
+                        ContextPhase.VERIFICATION,
+                    }),
+                )
+            )
 
     items.append(
         ContextItem(
@@ -170,6 +243,37 @@ def build_phase_packet(
             trace_id="run_engine:current_objective",
         )
     )
+
+    if sparse_simple_chat:
+        compiled = compile_context_items(
+            items,
+            phase=inputs.phase,
+            char_budget=min(DEFAULT_PHASE_CHAR_BUDGETS[inputs.phase], 4000),
+            truncate_section=_truncate_section,
+        )
+        trace = compiled.to_trace_payload()
+        trace["content"] = compiled.content
+        trace["runtime_path"] = "run_engine"
+        trace["trace_scope"] = "phase_packet"
+        trace["canonical_event"] = "phase_context"
+        trace["packet_contract_version"] = "phase-packet-v1"
+        trace["model"] = request.model
+        trace["history"] = {
+            "retained_count": 0,
+            "truncated_count": 0,
+            "input_count": len(getattr(session, "sliding_window", []) or []),
+            "max_chars_per_window_msg": 0,
+        }
+        trace["governed_memory"] = {
+            "mode": "sparse_simple_chat",
+            "historical_suppressed": True,
+            "memory_item_count": 0,
+        }
+        return CompiledPassPacket(
+            phase=inputs.phase,
+            content=compiled.content,
+            trace=trace,
+        )
 
     if inputs.active_skill_context.strip():
         skill_name = inputs.active_skill_name or "unknown"
@@ -840,6 +944,23 @@ def build_phase_packet(
         content=compiled.content,
         trace=trace,
     )
+
+
+def _packet_workflow_shape(inputs: PacketBuildInputs) -> str:
+    ledger = inputs.run_ledger
+    contract = getattr(ledger, "workflow_contract", None) if ledger is not None else None
+    shape = str(getattr(contract, "workflow_shape", "") or "").strip()
+    if shape:
+        return shape
+    try:
+        packet = ledger.to_phase_packet(inputs.phase) if ledger is not None and hasattr(ledger, "to_phase_packet") else {}
+        workflow_contract = packet.get("workflow_contract") if isinstance(packet, dict) else {}
+        shape = str((workflow_contract or {}).get("workflow_shape") or "").strip()
+        if shape:
+            return shape
+    except Exception:
+        pass
+    return classify_workflow_shape(inputs.effective_objective or inputs.request.user_message)
 
 
 def _build_working_state(inputs: PacketBuildInputs) -> str:

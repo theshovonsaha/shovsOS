@@ -44,12 +44,14 @@ from plugins.tool_registry import Tool, ToolRegistry
 from plugins.tools_web import (
     WEB_FETCH_TOOL as CANONICAL_WEB_FETCH_TOOL,
     WEB_SEARCH_TOOL as CANONICAL_WEB_SEARCH_TOOL,
+    _validate_fetch_url,
     _web_fetch as _canonical_web_fetch,
     _web_search as _canonical_web_search,
 )
 from config.logger import log
 from memory.task_tracker import get_session_task_tracker
 from orchestration.session_manager import SessionManager
+from services.image_generation import generate_image
 
 if TYPE_CHECKING:
     from orchestration.agent_manager import AgentManager
@@ -405,6 +407,11 @@ def _result_url(item: dict) -> str:
     return str(item.get("normalized_url") or item.get("url") or item.get("link") or "").strip().rstrip(".,")
 
 
+def _valid_fetch_url(url: str) -> str:
+    ok, _error, normalized, _host = _validate_fetch_url(url)
+    return normalized if ok else ""
+
+
 def _content_excerpt(text: str, max_chars: int = 1200) -> str:
     cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
     if len(cleaned) <= max_chars:
@@ -423,6 +430,20 @@ def _fetch_success_payload(value) -> dict:
 
 def _normalize_entity(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _looks_like_locked_entity(value: str) -> bool:
+    text = _normalize_entity(value)
+    lowered = text.lower()
+    if not text or len(text) > 80:
+        return False
+    if "..." in text or "http://" in lowered or "https://" in lowered:
+        return False
+    if re.search(r"\btop\s+\d+\b", lowered):
+        return False
+    if lowered.startswith(("the best ", "best ")) and " in " in lowered:
+        return False
+    return True
 
 
 def _extract_number_after(pattern: str, text: str, default: int = 0) -> int:
@@ -459,7 +480,14 @@ def _infer_source_contract(objective: str, entities: Optional[list[str]] = None)
         total_fetches = _extract_number_after(r"\ball\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+urls?\b", lowered)
     if not per_entity and total_fetches and entity_count:
         per_entity = max(1, total_fetches // entity_count)
-    if not total_fetches and entity_count and per_entity:
+    if entity_count and per_entity and (
+        not total_fetches
+        or (
+            total_fetches == per_entity
+            and bool(re.search(r"\b(each|per|separately)\b", lowered))
+            and not re.search(r"\ball\s+\d+\s+urls?\b", lowered)
+        )
+    ):
         total_fetches = entity_count * per_entity
 
     needs_separate_queries = bool(re.search(r"\b(each|separately|per)\b", lowered))
@@ -485,8 +513,22 @@ def _infer_source_contract(objective: str, entities: Optional[list[str]] = None)
 
 async def _source_contract(objective: str, entities: Optional[list[str]] = None, topic: str = "") -> str:
     """Infer a deterministic source-gathering contract from a user request."""
-    clean_entities = [_normalize_entity(item) for item in (entities or []) if _normalize_entity(item)]
-    contract = _infer_source_contract(objective, clean_entities)
+    proposed_entities = [
+        _normalize_entity(item)
+        for item in (entities or [])
+        if _normalize_entity(item) and _looks_like_locked_entity(str(item))
+    ]
+    contract = _infer_source_contract(objective, proposed_entities)
+    required_entities = int(contract.get("entity_count") or 0)
+    clean_entities = proposed_entities
+    rejected_entities = [
+        _normalize_entity(item)
+        for item in (entities or [])
+        if _normalize_entity(item) and _normalize_entity(item) not in set(proposed_entities)
+    ]
+    if required_entities and len(clean_entities) != required_entities:
+        rejected_entities.extend(clean_entities)
+        clean_entities = []
     query_templates = []
     if clean_entities:
         query_templates = [f"{entity} {topic}".strip() for entity in clean_entities]
@@ -497,7 +539,9 @@ async def _source_contract(objective: str, entities: Optional[list[str]] = None,
         "success": True,
         "contract": contract,
         "locked_entities": clean_entities,
+        "rejected_entities": list(dict.fromkeys(rejected_entities)),
         "query_templates": query_templates,
+        "missing_slots": [] if clean_entities or not required_entities else ["locked_entities"],
         "rules": [
             "Do not introduce new entities after lock_entities unless the user changes the objective.",
             "Fetch only URLs selected from prior search results.",
@@ -509,10 +553,13 @@ async def _source_contract(objective: str, entities: Optional[list[str]] = None,
 
 async def _source_select(
     search_payloads: Optional[list] = None,
+    tool_result_ids: Optional[list[str]] = None,
     entities: Optional[list[str]] = None,
     per_entity: int = 3,
     allowed_domains: Optional[list[str]] = None,
     blocked_domains: Optional[list[str]] = None,
+    _ledger_tool_results: Optional[list[dict]] = None,
+    _ledger_authority: bool = False,
 ) -> str:
     """Select deterministic fetch URLs from one or more web_search payloads."""
     per_entity = max(1, min(int(per_entity or 3), 20))
@@ -522,6 +569,63 @@ async def _source_select(
     selected: dict[str, list[dict]] = {entity: [] for entity in clean_entities} if clean_entities else {"general": []}
     seen_urls: set[str] = set()
     domain_counts: dict[str, int] = {}
+    ledger_results = [item for item in (_ledger_tool_results or []) if isinstance(item, dict)]
+    requested_ids = {str(item).strip() for item in (tool_result_ids or []) if str(item).strip()}
+    if ledger_results or _ledger_authority:
+        resolved_payloads: list[dict] = []
+        for item in ledger_results:
+            if str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
+                continue
+            result_id = str(item.get("tool_result_id") or item.get("id") or "").strip()
+            call_id = str(item.get("tool_call_id") or "").strip()
+            if requested_ids and result_id not in requested_ids and call_id not in requested_ids:
+                continue
+            content = _as_dict(item.get("content"))
+            if not content:
+                content = _as_dict(item)
+            if content:
+                resolved_payload = dict(content)
+                if not resolved_payload.get("query"):
+                    args = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+                    if args.get("query"):
+                        resolved_payload["query"] = args.get("query")
+                resolved_payloads.append(resolved_payload)
+        if requested_ids and not resolved_payloads:
+            return json.dumps({
+                "type": "source_selection",
+                "success": False,
+                "status": "missing_input",
+                "error": "No successful ledger web_search results matched tool_result_ids.",
+                "missing_slots": ["ledger_web_search_results"],
+                "selected_by_entity": selected,
+                "selected_urls": [],
+                "coverage": {
+                    "required_per_entity": per_entity,
+                    "missing_entities": list(selected.keys()),
+                    "domain_counts": {},
+                    "selected_count": 0,
+                },
+                "next_hint": "run_more_targeted_searches",
+            })
+        if resolved_payloads:
+            search_payloads = resolved_payloads
+        elif search_payloads:
+            return json.dumps({
+                "type": "source_selection",
+                "success": False,
+                "status": "rejected_untrusted_payload",
+                "error": "source_select received model-supplied search_payloads during a ledger-backed run. Use tool_result_ids from successful web_search results.",
+                "missing_slots": ["ledger_tool_result_ids"],
+                "selected_by_entity": selected,
+                "selected_urls": [],
+                "coverage": {
+                    "required_per_entity": per_entity,
+                    "missing_entities": list(selected.keys()),
+                    "domain_counts": {},
+                    "selected_count": 0,
+                },
+                "next_hint": "source_select_with_tool_result_ids",
+            })
 
     for payload in search_payloads or []:
         parsed = _as_dict(payload)
@@ -536,9 +640,9 @@ async def _source_select(
         for raw in results or []:
             if not isinstance(raw, dict):
                 continue
-            url = _result_url(raw)
+            url = _valid_fetch_url(_result_url(raw))
             host = str(raw.get("host") or _host_from_url(url))
-            if not url.startswith("http") or url in seen_urls:
+            if not url or url in seen_urls:
                 continue
             if allowed and not any(host == domain or host.endswith(f".{domain}") for domain in allowed):
                 continue
@@ -589,8 +693,18 @@ async def _source_next_action(
     clean_entities = [_normalize_entity(item) for item in (entities or []) if _normalize_entity(item)]
     resolved_contract = contract if isinstance(contract, dict) else _infer_source_contract(objective, clean_entities)
     searched = {str(item or "").lower().strip() for item in (searched_queries or []) if str(item or "").strip()}
-    selected = [str(item or "").strip() for item in (selected_urls or []) if str(item or "").strip()]
-    fetched = {str(item or "").strip() for item in (fetched_urls or []) if str(item or "").strip()}
+    selected = [
+        url
+        for item in (selected_urls or [])
+        for url in [_valid_fetch_url(str(item or "").strip())]
+        if url
+    ]
+    fetched = {
+        url
+        for item in (fetched_urls or [])
+        for url in [_valid_fetch_url(str(item or "").strip())]
+        if url
+    }
     per_entity = max(1, int(resolved_contract.get("results_per_entity") or 1))
     entity_count = int(resolved_contract.get("entity_count") or len(clean_entities) or 0)
     total_fetches = int(resolved_contract.get("total_fetches") or (entity_count * per_entity if entity_count else len(selected)))
@@ -660,8 +774,8 @@ async def _web_fetch_batch(
     seen: set[str] = set()
     selected_urls: list[str] = []
     for raw_url in urls or []:
-        url = str(raw_url or "").strip().rstrip(".,")
-        if not url.startswith("http") or url in seen:
+        url = _valid_fetch_url(str(raw_url or "").strip().rstrip(".,"))
+        if not url or url in seen:
             continue
         seen.add(url)
         selected_urls.append(url)
@@ -814,6 +928,220 @@ async def _source_coverage(
     })
 
 
+def _queries_from_search_payloads(search_payloads: Optional[list]) -> list[str]:
+    queries: list[str] = []
+    for payload in search_payloads or []:
+        parsed = _as_dict(payload)
+        query = str(parsed.get("query") or "").strip()
+        if query:
+            queries.append(query)
+    return list(dict.fromkeys(queries))
+
+
+def _fetched_urls_from_payloads(fetch_payloads: Optional[list], fetched_urls: Optional[list[str]]) -> list[str]:
+    urls: list[str] = [
+        url
+        for item in (fetched_urls or [])
+        for url in [_valid_fetch_url(str(item or "").strip())]
+        if url
+    ]
+    for payload in fetch_payloads or []:
+        parsed = _as_dict(payload)
+        if parsed.get("type") == "web_fetch_batch_result":
+            for source in parsed.get("fetched_sources") or []:
+                if not isinstance(source, dict):
+                    continue
+                for key in ("url", "final_url"):
+                    url = _valid_fetch_url(str(source.get(key) or "").strip())
+                    if url:
+                        urls.append(url)
+            continue
+        success_payload = _fetch_success_payload(parsed)
+        if success_payload:
+            for key in ("url", "final_url"):
+                url = _valid_fetch_url(str(success_payload.get(key) or "").strip())
+                if url:
+                    urls.append(url)
+    return list(dict.fromkeys(urls))
+
+
+async def _source_collect(
+    objective: str,
+    entities: Optional[list[str]] = None,
+    topic: str = "",
+    contract: Optional[dict] = None,
+    search_payloads: Optional[list] = None,
+    tool_result_ids: Optional[list[str]] = None,
+    selected_payload: Optional[dict] = None,
+    fetch_payloads: Optional[list] = None,
+    fetched_urls: Optional[list[str]] = None,
+    searched_queries: Optional[list[str]] = None,
+    per_entity: int = 0,
+    allowed_domains: Optional[list[str]] = None,
+    blocked_domains: Optional[list[str]] = None,
+    _ledger_tool_results: Optional[list[dict]] = None,
+    _ledger_authority: bool = False,
+) -> str:
+    """Compile source collection state into one deterministic contract, queue, and gate."""
+    clean_entities = [
+        _normalize_entity(item)
+        for item in (entities or [])
+        if _normalize_entity(item) and _looks_like_locked_entity(str(item))
+    ]
+    rejected_entities = [
+        _normalize_entity(item)
+        for item in (entities or [])
+        if _normalize_entity(item) and _normalize_entity(item) not in set(clean_entities)
+    ]
+    resolved_contract = dict(contract) if isinstance(contract, dict) else _infer_source_contract(objective, clean_entities)
+    if per_entity:
+        safe_per_entity = max(1, min(int(per_entity), 20))
+        resolved_contract["results_per_entity"] = safe_per_entity
+        entity_count = int(resolved_contract.get("entity_count") or len(clean_entities) or 0)
+        if entity_count:
+            resolved_contract["total_fetches"] = entity_count * safe_per_entity
+
+    if int(resolved_contract.get("entity_count") or 0) and len(clean_entities) < int(resolved_contract.get("entity_count") or 0):
+        clean_entities = []
+
+    selected = selected_payload if isinstance(selected_payload, dict) else {}
+    if not selected and (search_payloads or tool_result_ids or _ledger_tool_results or _ledger_authority):
+        raw_selection = await _source_select(
+            search_payloads=search_payloads,
+            tool_result_ids=tool_result_ids,
+            entities=clean_entities,
+            per_entity=int(resolved_contract.get("results_per_entity") or per_entity or 3),
+            allowed_domains=allowed_domains,
+            blocked_domains=blocked_domains,
+            _ledger_tool_results=_ledger_tool_results,
+            _ledger_authority=_ledger_authority,
+        )
+        selected = _as_dict(raw_selection)
+
+    selected_urls = [
+        url
+        for item in selected.get("selected_urls", []) if isinstance(selected, dict)
+        for url in [_valid_fetch_url(str(item or "").strip())]
+        if url
+    ]
+    observed_fetches = _fetched_urls_from_payloads(fetch_payloads, fetched_urls)
+    observed_queries = list(dict.fromkeys([
+        *(str(item or "").strip() for item in (searched_queries or []) if str(item or "").strip()),
+        *_queries_from_search_payloads(search_payloads),
+    ]))
+    for item in _ledger_tool_results or []:
+        if not isinstance(item, dict) or str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
+            continue
+        requested = {str(value).strip() for value in (tool_result_ids or []) if str(value).strip()}
+        result_id = str(item.get("tool_result_id") or item.get("id") or "").strip()
+        call_id = str(item.get("tool_call_id") or "").strip()
+        if requested and result_id not in requested and call_id not in requested:
+            continue
+        content = _as_dict(item.get("content"))
+        query = str(content.get("query") or (item.get("arguments") or {}).get("query") or "").strip()
+        if query:
+            observed_queries.append(query)
+    observed_queries = list(dict.fromkeys(observed_queries))
+
+    coverage = _as_dict(await _source_coverage(
+        contract=resolved_contract,
+        entities=clean_entities,
+        selected_payload=selected,
+        fetch_payloads=fetch_payloads,
+        fetched_urls=observed_fetches,
+    ))
+    next_action = _as_dict(await _source_next_action(
+        objective,
+        contract=resolved_contract,
+        entities=clean_entities,
+        searched_queries=observed_queries,
+        selected_urls=selected_urls,
+        fetched_urls=observed_fetches,
+        topic=topic,
+    ))
+
+    unfetched = [url for url in selected_urls if url not in set(observed_fetches)]
+    if coverage.get("answer_allowed"):
+        next_action = {
+            "type": "source_next_action",
+            "status": "finalize",
+            "next_tool": "",
+            "arguments": {},
+            "reason": "Required source coverage is complete.",
+            "missing_slots": [],
+        }
+    elif unfetched and coverage.get("next_tool") == "web_fetch_batch":
+        next_action = {
+            "type": "source_next_action",
+            "status": "continue",
+            "next_tool": "web_fetch_batch",
+            "arguments": {"urls": unfetched[:20]},
+            "reason": "Fetch selected source URLs in a deterministic batch.",
+            "missing_slots": coverage.get("missing_slots") or [],
+        }
+
+    missing_slots = list(dict.fromkeys([
+        *(coverage.get("missing_slots") or []),
+        *(next_action.get("missing_slots") or []),
+    ]))
+    status = "complete" if coverage.get("answer_allowed") else str(next_action.get("status") or "continue")
+    success = not (selected.get("success") is False and selected.get("status") in {"rejected_untrusted_payload", "missing_input"})
+    return json.dumps({
+        "type": "source_collect",
+        "success": bool(success),
+        "status": status,
+        "objective": str(objective or "").strip(),
+        "contract": resolved_contract,
+        "locked_entities": clean_entities,
+        "rejected_entities": list(dict.fromkeys(rejected_entities)),
+        "searched_queries": observed_queries,
+        "selected_payload": selected,
+        "fetch_queue": unfetched,
+        "coverage": coverage,
+        "next_action": next_action,
+        "answer_allowed": bool(coverage.get("answer_allowed")),
+        "missing_slots": missing_slots,
+        "answer_rules": [
+            "Use source_collect.next_action as the next step; do not improvise a broader query when it names an exact tool.",
+            "Final answers are allowed only when answer_allowed is true.",
+            "Cite only fetched source URLs or successful deterministic facts.",
+            "If locked_entities is empty, discover and lock entities before selecting/fetching URLs.",
+        ],
+    })
+
+
+SOURCE_COLLECT_TOOL = Tool(
+    name="source_collect",
+    description=(
+        "Deterministic source-workflow compiler. Given an objective plus current search/select/fetch state, "
+        "returns one contract, source coverage report, exact next tool/action, fetch queue, and answer gate. "
+        "Use this for multi-entity research, local recommendations, shopping comparisons, and any 'search each then fetch N URLs' workflow."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "objective": {"type": "string", "description": "The user's exact objective."},
+            "entities": {"type": "array", "items": {"type": "string"}, "description": "Locked entities, if already known."},
+            "topic": {"type": "string", "description": "Query suffix for entity searches, e.g. 'stock news June 13 2026'."},
+            "contract": {"type": "object", "description": "Optional existing source contract."},
+            "tool_result_ids": {"type": "array", "items": {"type": "string"}, "description": "Successful web_search result IDs from the ledger."},
+            "search_payloads": {"type": "array", "items": {}, "description": "Standalone-only web_search payloads. Managed runs should prefer tool_result_ids."},
+            "selected_payload": {"type": "object", "description": "Optional source_select payload."},
+            "fetch_payloads": {"type": "array", "items": {}, "description": "web_fetch or web_fetch_batch payloads observed so far."},
+            "fetched_urls": {"type": "array", "items": {"type": "string"}, "description": "Known fetched URLs if payloads are unavailable."},
+            "searched_queries": {"type": "array", "items": {"type": "string"}, "description": "Queries already searched."},
+            "per_entity": {"type": "integer", "description": "Override URLs required per entity."},
+            "allowed_domains": {"type": "array", "items": {"type": "string"}, "description": "Optional allowed domains."},
+            "blocked_domains": {"type": "array", "items": {"type": "string"}, "description": "Optional blocked domains."},
+        },
+        "required": ["objective"],
+    },
+    handler=_source_collect,
+    tags=["kernel", "source", "web", "deterministic"],
+    response_format="json",
+)
+
+
 SOURCE_CONTRACT_TOOL = Tool(
     name="source_contract",
     description=(
@@ -839,19 +1167,20 @@ SOURCE_CONTRACT_TOOL = Tool(
 SOURCE_SELECT_TOOL = Tool(
     name="source_select",
     description=(
-        "Deterministically select fetch URLs from web_search JSON payloads. Dedupes URLs, tracks host coverage, "
-        "groups by locked entity, and reports missing coverage. Use before web_fetch."
+        "Deterministically select fetch URLs from prior web_search results. In managed runs, pass "
+        "tool_result_ids from successful web_search results; raw search_payloads are only for standalone use."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "search_payloads": {"type": "array", "items": {}, "description": "One or more web_search JSON payloads."},
+            "tool_result_ids": {"type": "array", "items": {"type": "string"}, "description": "Successful web_search result IDs from the run ledger."},
+            "search_payloads": {"type": "array", "items": {}, "description": "Standalone-only web_search JSON payloads. Managed runs should use tool_result_ids."},
             "entities": {"type": "array", "items": {"type": "string"}, "description": "Locked entities to group URLs under."},
             "per_entity": {"type": "integer", "description": "URLs required per entity.", "default": 3},
             "allowed_domains": {"type": "array", "items": {"type": "string"}, "description": "Optional allowed domains."},
             "blocked_domains": {"type": "array", "items": {"type": "string"}, "description": "Optional blocked domains."},
         },
-        "required": ["search_payloads"],
+        "required": [],
     },
     handler=_source_select,
     tags=["kernel", "source", "web"],
@@ -1021,6 +1350,93 @@ IMAGE_SEARCH_TOOL = Tool(
     },
     handler=_image_search,
     tags=["web", "images"],
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  IMAGE GENERATION  —  OpenAI image API, persisted to /sandbox
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def _image_generate(
+    prompt: str,
+    model: str = "",
+    size: str = "1024x1024",
+    quality: str = "auto",
+    background: str = "auto",
+    output_format: str = "png",
+) -> str:
+    try:
+        payload = await generate_image(
+            prompt=prompt,
+            model=model,
+            size=size,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+        )
+        return json.dumps(payload)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "type": "image_generation_error",
+                "success": False,
+                "error": str(exc),
+                "prompt": prompt,
+                "model": model,
+                "size": size,
+            }
+        )
+
+
+IMAGE_GENERATE_TOOL = Tool(
+    name="image_generate",
+    description=(
+        "Generate one image from a text prompt and return a sandbox URL. "
+        "Use for user requests to create an image, mockup, illustration, "
+        "visual concept, or bitmap asset. Returns JSON with url, path, model, "
+        "size, and byte count. Requires OPENAI_API_KEY."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "Detailed prompt describing the image to generate.",
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional image model. Defaults to IMAGE_GENERATION_MODEL.",
+            },
+            "size": {
+                "type": "string",
+                "enum": ["1024x1024", "1024x1536", "1536x1024", "auto"],
+                "description": "Output size. Default 1024x1024.",
+                "default": "1024x1024",
+            },
+            "quality": {
+                "type": "string",
+                "enum": ["auto", "low", "medium", "high"],
+                "description": "Output quality. Default auto.",
+                "default": "auto",
+            },
+            "background": {
+                "type": "string",
+                "enum": ["auto", "transparent", "opaque"],
+                "description": "Background behavior when supported by the model.",
+                "default": "auto",
+            },
+            "output_format": {
+                "type": "string",
+                "enum": ["png", "jpeg", "webp"],
+                "description": "File format. Default png.",
+                "default": "png",
+            },
+        },
+        "required": ["prompt"],
+    },
+    handler=_image_generate,
+    tags=["images", "generation", "creative"],
+    response_format="json",
 )
 
 
@@ -1846,6 +2262,24 @@ def _normalize_memory_subject(subject: Optional[str]) -> str:
     return value or "User"
 
 
+_PLACEHOLDER_MEMORY_VALUES = {
+    "", "unknown", "n/a", "na", "none", "null", "nil", "tbd", "?", "??",
+    "undefined", "not provided", "not specified", "no name", "not sure",
+    "i don't know", "i dont know", "idk", "unspecified", "value", "object",
+}
+
+
+def _is_placeholder_memory_value(value: str) -> bool:
+    """A guard against storing junk facts like ``User --is_named--> unknown``.
+
+    The actor sometimes calls store_memory before the user has actually
+    supplied a value, writing a placeholder that then pollutes recall. We refuse
+    those writes so memory only ever holds real, user-supplied values.
+    """
+    normalized = " ".join(str(value or "").strip().lower().split())
+    return normalized in _PLACEHOLDER_MEMORY_VALUES
+
+
 def _resolve_runtime_turn(session_id: Optional[str], owner_id: Optional[str]) -> int:
     if not session_id:
         return 1
@@ -1871,6 +2305,12 @@ async def _store_memory(
         normalized_subject = _normalize_memory_subject(subject)
         normalized_predicate = normalize_memory_predicate(predicate)
         normalized_object = str(object_ or "").strip()
+        if _is_placeholder_memory_value(normalized_object):
+            return (
+                "Skipped storing memory: refusing to write placeholder value "
+                f"'{normalized_object or '(empty)'}' for [{normalized_subject}] "
+                f"--[{normalized_predicate}]-->. Ask the user for the real value first."
+            )
         await graph.add_triplet(
             normalized_subject,
             normalized_predicate,
@@ -1905,6 +2345,12 @@ async def _update_memory(
         normalized_subject = _normalize_memory_subject(subject)
         normalized_predicate = normalize_memory_predicate(predicate)
         normalized_object = str(object_ or "").strip()
+        if _is_placeholder_memory_value(normalized_object):
+            return (
+                "Skipped memory update: refusing to write placeholder value "
+                f"'{normalized_object or '(empty)'}' for [{normalized_subject}] "
+                f"--[{normalized_predicate}]-->. Ask the user for the real value first."
+            )
 
         if session_id:
             turn = _resolve_runtime_turn(session_id, owner_id)
@@ -2634,6 +3080,7 @@ RAG_SEARCH_TOOL = Tool(
 ALL_TOOLS = [
     WEB_SEARCH_TOOL,
     WEB_FETCH_TOOL,
+    SOURCE_COLLECT_TOOL,
     SOURCE_CONTRACT_TOOL,
     SOURCE_SELECT_TOOL,
     SOURCE_NEXT_ACTION_TOOL,
@@ -2641,6 +3088,7 @@ ALL_TOOLS = [
     SOURCE_COVERAGE_TOOL,
     SHOPPING_ADVICE_TOOL,
     IMAGE_SEARCH_TOOL,
+    IMAGE_GENERATE_TOOL,
     BASH_TOOL,
     FILE_CREATE_TOOL,
     FILE_VIEW_TOOL,

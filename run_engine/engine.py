@@ -6,6 +6,7 @@ import json
 import os
 import re
 from typing import Any, AsyncIterator, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from config.logger import log
 from engine.candidate_signals import extract_stance_signals
@@ -13,6 +14,7 @@ from engine.conversation_tension import analyze_conversation_tension, conversati
 from engine.tokenization import get_token_encoding as _get_token_encoding
 from engine.context_schema import ContextPhase
 from engine.context_governor import ContextGovernor
+from engine.context_hygiene import should_skip_memory_compression
 from engine.deterministic_facts import extract_user_stated_fact_updates
 from engine.direct_fact_policy import should_answer_direct_fact_from_memory
 from engine.side_effect_guard import check_plan_for_side_effects, check_side_effect_claims
@@ -31,7 +33,7 @@ from engine.tool_contract import (
 )
 from llm.adapter_factory import create_adapter, strip_provider_prefix
 from plugins.hook_registry import hooks
-from llm.base_adapter import BaseLLMAdapter, RateLimitError
+from llm.base_adapter import BaseLLMAdapter, RateLimitError, ProviderError
 from memory.semantic_graph import SemanticGraph
 from orchestration.orchestrator import AgenticOrchestrator
 from orchestration.run_store import RunStore
@@ -40,6 +42,7 @@ from orchestration.capability_cards import render_capability_cards
 from orchestration.workflow_patterns import get_workflow_pattern
 from orchestration.workflow_templates import get_workflow_template
 from plugins.tool_registry import ToolCall, ToolRegistry
+from plugins.tools_web import _validate_fetch_url
 from run_engine.context_packets import PacketBuildInputs, build_phase_packet
 from run_engine.code_intent import CodeIntent, classify_code_intent, check_research_ambiguity
 from run_engine.evidence_lane import (
@@ -52,6 +55,8 @@ from run_engine.evidence_lane import (
     tool_result_matches_exact_target,
 )
 from run_engine.memory_pipeline import build_grounding_text
+from run_engine.pass_framework import build_pass_graph
+from run_engine.search_query import compile_web_search_query
 from run_engine.skill_loader import list_available_skills, load_skill_context
 from run_engine.tool_selection import (
     build_actor_request_content,
@@ -60,7 +65,23 @@ from run_engine.tool_selection import (
     summarize_arguments,
 )
 from run_engine.types import CompiledPassPacket, RunEngineRequest
-from run_engine.ledger import RunLedger, ToolCallDraft
+from run_engine.ledger import RunLedger, ToolCallDraft, recovery_policy_for
+from run_engine.workflow_contracts import infer_workflow_contract, update_contract_from_tool_results
+from run_engine.control_policies import resolve_control_policy
+from run_engine.turn_policy import resolve_turn_policy
+from run_engine.workflow_plugins import (
+    default_tool_turn_budget as _plugin_default_tool_turn_budget,
+    extract_mover_tickers_from_fetched_pages as _plugin_extract_mover_tickers_from_fetched_pages,
+    extract_stock_tickers_from_tool_results as _plugin_extract_stock_tickers_from_tool_results,
+    extract_urls_from_tool_results as _plugin_extract_urls_from_tool_results,
+    explicit_stock_source_workflow_requested as _plugin_explicit_stock_source_workflow_requested,
+    select_movers_source_url as _plugin_select_movers_source_url,
+    select_workflow_override,
+    select_workflow_plugin_contract,
+    source_collection_contract_from_objective as _plugin_source_collection_contract_from_objective,
+    stock_source_workflow_override as _plugin_stock_source_workflow_override,
+    urls_by_entity_from_search_results as _plugin_urls_by_entity_from_search_results,
+)
 
 
 async def _stream_with_rate_limit_retry(
@@ -74,6 +95,21 @@ async def _stream_with_rate_limit_retry(
         async for chunk in adapter.stream(model=model, messages=messages, **kwargs):
             yield chunk
     except RateLimitError as exc:
+        # First choice: fail OVER to another provider/model (a daily-quota 429 is
+        # not fixed by waiting). Only fires when SHOVS_PROVIDER_FALLBACK_CHAIN is
+        # configured; otherwise we fall back to the wait-and-retry-same behavior.
+        from llm.adapter_factory import get_failover_adapter, get_default_model
+        provider = model.split(":", 1)[0].lower() if ":" in model else ""
+        failover = get_failover_adapter(provider) if provider else None
+        if failover is not None:
+            f_model = get_default_model(failover)
+            yield {
+                "type": "activity_short",
+                "text": f"Rate limited on {provider or model} — failing over to {f_model}...",
+            }
+            async for chunk in failover.stream(model=f_model, messages=messages, **kwargs):
+                yield chunk
+            return
         match = re.search(r"retry in (\d+(?:\.\d+)?)s", str(exc), re.IGNORECASE)
         wait = float(match.group(1)) if match else 10.0
         wait = min(wait, 60.0)
@@ -195,36 +231,38 @@ def _tool_argument_value(item: dict[str, Any], key: str) -> str:
     return str(args.get(key) or "").strip()
 
 
+def _valid_fetch_url(url: str) -> str:
+    ok, _error, normalized, _host = _validate_fetch_url(str(url or "").strip().rstrip(".,"))
+    return normalized if ok else ""
+
+
+def _canonical_fetch_url_for_loop(url: str) -> str:
+    normalized = _valid_fetch_url(url)
+    if not normalized:
+        return ""
+    try:
+        parts = urlsplit(normalized)
+        path = parts.path or ""
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        return urlunsplit((parts.scheme, parts.netloc.lower(), path, parts.query, ""))
+    except Exception:
+        return normalized.rstrip("/")
+
+
+def _canonical_tool_arguments_for_loop(tool_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
+    args = dict(arguments or {})
+    if tool_name == "web_fetch":
+        url = _canonical_fetch_url_for_loop(str(args.get("url") or ""))
+        if url:
+            args["url"] = url
+    elif tool_name == "web_search" and args.get("query") is not None:
+        args["query"] = compile_web_search_query(str(args.get("query") or ""))
+    return args
+
+
 def _extract_urls_from_tool_results(tool_results: list[dict[str, Any]], *, limit: int = 12) -> list[str]:
-    urls: list[str] = []
-    seen: set[str] = set()
-    for item in tool_results:
-        if not item.get("success"):
-            continue
-        content = str(item.get("content") or "")
-        payload = _safe_json_payload(content)
-        candidates: list[str] = []
-        extracted_urls = item.get("extracted_urls")
-        if isinstance(extracted_urls, list):
-            candidates.extend(str(url) for url in extracted_urls)
-        if payload:
-            if payload.get("url"):
-                candidates.append(str(payload.get("url")))
-            results = payload.get("results") or payload.get("organic_results") or []
-            if isinstance(results, list):
-                for result in results:
-                    if isinstance(result, dict):
-                        candidates.append(str(result.get("url") or result.get("link") or ""))
-        candidates.extend(match.group(0).rstrip(".,") for match in _URL_RE.finditer(content))
-        for url in candidates:
-            clean = url.strip().rstrip(".,")
-            if not clean.startswith("http") or clean in seen:
-                continue
-            seen.add(clean)
-            urls.append(clean)
-            if len(urls) >= limit:
-                return urls
-    return urls
+    return _plugin_extract_urls_from_tool_results(tool_results, limit=limit)
 
 
 def _find_cached_retry_sensitive_result(
@@ -248,168 +286,61 @@ def _find_cached_retry_sensitive_result(
 
 
 def _extract_mover_tickers_from_fetched_pages(tool_results: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
-    tickers: list[str] = []
-    seen: set[str] = set()
-    for item in tool_results:
-        if str(item.get("tool_name") or "") != "web_fetch" or not item.get("success"):
-            continue
-        content = str(item.get("content") or "")
-        payload = _safe_json_payload(content)
-        if payload and payload.get("content"):
-            content = str(payload.get("content") or "")
-        if not re.search(r"\b(market movers|top stock market gainers|gainers)\b", content, re.IGNORECASE):
-            continue
-        gainers_block = content
-        gainers_match = re.search(r"##\s*Gainers(?P<body>.*?)(?:##\s*Losers|##\s*Actives|$)", content, re.IGNORECASE | re.DOTALL)
-        if gainers_match:
-            gainers_block = gainers_match.group("body")
-        for line in gainers_block.splitlines():
-            if "|" not in line or "+" not in line:
-                continue
-            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-            if len(cells) < 3:
-                continue
-            stock_cell = cells[1] if len(cells) > 1 else line
-            candidates = [match.group(0).upper() for match in _TICKER_RE.finditer(stock_cell)]
-            if not candidates:
-                candidates = [match.group(1).upper() for match in re.finditer(r"/stocks/[^/)]+/([a-z]{1,5})/quote", stock_cell, re.IGNORECASE)]
-            for ticker in reversed(candidates):
-                if ticker in _TICKER_STOPWORDS or ticker in seen:
-                    continue
-                seen.add(ticker)
-                tickers.append(ticker)
-                if len(tickers) >= limit:
-                    return tickers
-                break
-    return tickers
+    return _plugin_extract_mover_tickers_from_fetched_pages(tool_results, limit=limit)
 
 
 def _select_movers_source_url(urls: list[str]) -> str:
-    if not urls:
-        return ""
-    priority_patterns = (
-        "morningstar.com/markets/movers",
-        "marketwatch.com/tools/stockresearch/marketmap",
-        "bankrate.com/investing/best-performing-stocks",
-        "nasdaq.com/market-activity/stocks/screener",
-    )
-    lowered = [(url, url.lower()) for url in urls]
-    for pattern in priority_patterns:
-        for url, low in lowered:
-            if pattern in low:
-                return url
-    for url, low in lowered:
-        if any(term in low for term in ("movers", "gainers", "best-performing-stocks")):
-            return url
-    return ""
+    return _plugin_select_movers_source_url(urls)
 
 
 def _extract_stock_tickers_from_tool_results(tool_results: list[dict[str, Any]], *, limit: int = 3) -> list[str]:
-    mover_tickers = _extract_mover_tickers_from_fetched_pages(tool_results, limit=limit)
-    if len(mover_tickers) >= limit:
-        return mover_tickers[:limit]
-
-    counts: dict[str, int] = {}
-    for item in tool_results:
-        if str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
-            continue
-        content = str(item.get("content") or "")
-        payload = _safe_json_payload(content)
-        texts: list[str] = []
-        results = payload.get("results") or payload.get("organic_results") or []
-        if isinstance(results, list):
-            for result in results[:10]:
-                if not isinstance(result, dict):
-                    continue
-                texts.extend([
-                    str(result.get("title") or ""),
-                    str(result.get("snippet") or result.get("description") or ""),
-                ])
-        texts.append(content[:3000])
-        for text in texts:
-            for match in _TICKER_RE.finditer(text):
-                ticker = match.group(0).upper()
-                if ticker in _TICKER_STOPWORDS:
-                    continue
-                counts[ticker] = counts.get(ticker, 0) + 1
-    ranked = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
-    return [ticker for ticker, _ in ranked[:limit]]
+    return _plugin_extract_stock_tickers_from_tool_results(tool_results, limit=limit)
 
 
 def _explicit_stock_source_workflow_requested(objective: str) -> bool:
-    text = str(objective or "").lower()
-    return (
-        "stock" in text
-        and ("top 3" in text or "three" in text or "3 stocks" in text)
-        and ("separately" in text or "each" in text)
-        and ("web fetch" in text or "fetch" in text)
-        and ("9" in text or "3 relevant" in text or "three relevant" in text)
-    )
+    return _plugin_explicit_stock_source_workflow_requested(objective)
 
 
 def _source_collection_contract_from_objective(objective: str) -> dict[str, int]:
-    """Extract the topic-agnostic collection shape from a user request.
-
-    This intentionally captures only the execution contract, not the domain:
-    lock N entities, gather M candidate URLs per entity, then fetch N*M URLs.
-    Domain-specific code may provide the entity extractor, but it must feed
-    this same quota model so search-result noise cannot become new targets.
-    """
-    text = str(objective or "").lower()
-    if not ("fetch" in text and ("url" in text or "source" in text or "result" in text)):
-        return {}
-    if not ("separately" in text or "each" in text or "per " in text):
-        return {}
-
-    entity_count = 0
-    top_match = re.search(r"\btop\s+(\d+)\b", text)
-    if top_match:
-        entity_count = int(top_match.group(1))
-    elif re.search(r"\bthree\b", text):
-        entity_count = 3
-    entity_match = re.search(r"\b(\d+)\s+(?:stocks|companies|products|tools|items|entities)\b", text)
-    if entity_match:
-        entity_count = int(entity_match.group(1))
-
-    per_entity = 0
-    per_match = re.search(
-        r"\b(\d+)\s+(?:relevant\s+)?(?:results?|sources?|urls?|links?|articles?)\s+(?:for\s+)?each\b",
-        text,
-    )
-    if per_match:
-        per_entity = int(per_match.group(1))
-    elif re.search(r"\bthree\s+(?:relevant\s+)?(?:results?|sources?|urls?|links?|articles?)\s+(?:for\s+)?each\b", text):
-        per_entity = 3
-
-    total_urls = 0
-    total_match = re.search(r"\b(?:all\s+)?(\d+)\s+urls?\b", text)
-    if total_match:
-        total_urls = int(total_match.group(1))
-
-    if entity_count <= 0 and total_urls and per_entity:
-        entity_count = max(1, total_urls // per_entity)
-    if per_entity <= 0 and total_urls and entity_count:
-        per_entity = max(1, total_urls // entity_count)
-    if total_urls <= 0 and entity_count and per_entity:
-        total_urls = entity_count * per_entity
-
-    if entity_count <= 0 or per_entity <= 0:
-        return {}
-    return {
-        "entity_count": min(entity_count, 12),
-        "urls_per_entity": min(per_entity, 10),
-        "total_urls": min(total_urls or entity_count * per_entity, 60),
-    }
+    return _plugin_source_collection_contract_from_objective(objective)
 
 
 def _default_tool_turn_budget(objective: str, requested_max_turns: Optional[int]) -> int:
-    if requested_max_turns is not None:
-        return max(1, min(int(requested_max_turns), 24))
-    source_contract = _source_collection_contract_from_objective(objective)
-    if source_contract:
-        # discovery + one search per entity + one fetch per required URL + slack
-        return min(24, 3 + source_contract["entity_count"] + source_contract["total_urls"])
-    return 3
+    return _plugin_default_tool_turn_budget(objective, requested_max_turns)
+
+
+_DISCLOSURE_OPENER_RE = re.compile(
+    r"^\s*(?:i\s*am|i'?m|i\s+have|i\s+like|i\s+love|i\s+prefer|i\s+enjoy|"
+    r"my\s+\w+(?:\s+\w+){0,3}\s+(?:is|are|was)|call\s+me)\b",
+    re.IGNORECASE,
+)
+_RESEARCH_INTENT_RE = re.compile(
+    r"\b(search|find|look(?:ing)?\s*(?:up|for)|lookup|google|research|investigate|compare|"
+    r"recommend|suggest|need|want|how\s+(?:do|to|can|should)|what(?:'s|\s+is|\s+are|\s+should)|"
+    r"where|when|who|which|why|best|top|news|price|prices|latest|current|today|trending|"
+    r"help\s+me|show\s+me|give\s+me|fetch|get\s+me|tell\s+me\s+about|ideas|options|resources|"
+    r"tutorial|guide|tips|advice)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_personal_disclosure_only(message: str) -> bool:
+    """True for a first-person statement of fact/preference that should be
+    remembered, not web-searched (e.g. "I am a photographer", "I like blue").
+
+    Conservative on purpose: any question mark or research/request verb disables
+    it, so genuine research intents ("I am looking for the best DAW") keep their
+    web tools. The deterministic extractor still captures the fact regardless;
+    this only suppresses a spurious web_search the planner may have chosen.
+    """
+    text = str(message or "").strip()
+    if not text or "?" in text:
+        return False
+    if not _DISCLOSURE_OPENER_RE.search(text):
+        return False
+    if _RESEARCH_INTENT_RE.search(text):
+        return False
+    return len(text.split()) <= 12
 
 
 def _urls_by_entity_from_search_results(
@@ -418,42 +349,11 @@ def _urls_by_entity_from_search_results(
     entities: list[str],
     per_entity: int,
 ) -> dict[str, list[str]]:
-    by_entity: dict[str, list[str]] = {entity: [] for entity in entities}
-    seen: set[str] = set()
-    for item in tool_results:
-        if str(item.get("tool_name") or "") != "web_search" or not item.get("success"):
-            continue
-        query = _tool_argument_value(item, "query").upper()
-        entity = next((candidate for candidate in entities if re.search(rf"\b{re.escape(candidate)}\b", query)), "")
-        if not entity:
-            continue
-        extracted_urls = item.get("extracted_urls")
-        if isinstance(extracted_urls, list):
-            for extracted_url in extracted_urls:
-                url = str(extracted_url or "").strip().rstrip(".,")
-                if not url.startswith("http") or url in seen:
-                    continue
-                seen.add(url)
-                by_entity[entity].append(url)
-                if len(by_entity[entity]) >= per_entity:
-                    break
-            if len(by_entity[entity]) >= per_entity:
-                continue
-        payload = _safe_json_payload(str(item.get("content") or ""))
-        results = payload.get("results") or payload.get("organic_results") or []
-        if not isinstance(results, list):
-            continue
-        for result in results:
-            if not isinstance(result, dict):
-                continue
-            url = str(result.get("url") or result.get("link") or "").strip().rstrip(".,")
-            if not url.startswith("http") or url in seen:
-                continue
-            seen.add(url)
-            by_entity[entity].append(url)
-            if len(by_entity[entity]) >= per_entity:
-                break
-    return by_entity
+    return _plugin_urls_by_entity_from_search_results(
+        tool_results=tool_results,
+        entities=entities,
+        per_entity=per_entity,
+    )
 
 
 def _stock_source_workflow_override(
@@ -462,132 +362,11 @@ def _stock_source_workflow_override(
     allowed_tools: list[dict[str, Any]],
     tool_results: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    if not _explicit_stock_source_workflow_requested(objective):
-        return {}
-
-    contract = _source_collection_contract_from_objective(objective) or {
-        "entity_count": 3,
-        "urls_per_entity": 3,
-        "total_urls": 9,
-    }
-    entity_count = int(contract["entity_count"])
-    urls_per_entity = int(contract["urls_per_entity"])
-    total_urls = int(contract["total_urls"])
-
-    allowed = {str(item.get("name") or "") for item in allowed_tools if isinstance(item, dict)}
-    tickers = _extract_stock_tickers_from_tool_results(tool_results, limit=entity_count)
-    targeted_queries = [
-        _tool_argument_value(item, "query").upper()
-        for item in tool_results
-        if str(item.get("tool_name") or "") == "web_search" and item.get("success")
-    ]
-    searched_tickers = {
-        ticker
-        for ticker in tickers
-        if any(re.search(rf"\b{re.escape(ticker)}\b", query) for query in targeted_queries)
-    }
-    fetched_urls = {
-        _tool_argument_value(item, "url")
-        for item in tool_results
-        if str(item.get("tool_name") or "") == "web_fetch" and item.get("success")
-    }
-    urls_by_entity = _urls_by_entity_from_search_results(
+    return _plugin_stock_source_workflow_override(
+        objective=objective,
+        allowed_tools=allowed_tools,
         tool_results=tool_results,
-        entities=tickers,
-        per_entity=urls_per_entity,
     )
-    entity_urls = [
-        url
-        for ticker in tickers
-        for url in urls_by_entity.get(ticker, [])[:urls_per_entity]
-    ]
-    urls = _extract_urls_from_tool_results(tool_results, limit=max(12, total_urls + 3))
-    unfetched_urls = [url for url in entity_urls if url not in fetched_urls]
-    fetched_entity_urls = {url for url in fetched_urls if url in set(entity_urls)}
-    mover_source_fetched = len(_extract_mover_tickers_from_fetched_pages(tool_results, limit=entity_count)) >= entity_count
-
-    if not mover_source_fetched:
-        movers_url = _select_movers_source_url(unfetched_urls)
-        if not movers_url:
-            movers_url = _select_movers_source_url(urls)
-        if movers_url and "web_fetch" in allowed:
-            return {
-                "status": "partial",
-                "selected_tools": ["web_fetch"],
-                "strategy": "Fetch a market movers source before locking ticker entities.",
-                "notes": "Ticker-specific searches must be based on the fetched movers table, not noisy search snippets.",
-                "missing_slots": ["verified_top_3_mover_tickers"],
-                "argument_clues": {"web_fetch": movers_url},
-            }
-        return {
-            "status": "partial",
-            "selected_tools": ["web_search"] if "web_search" in allowed else [],
-            "strategy": "Find a market movers source before source collection.",
-            "notes": "The explicit stock workflow needs a source-backed top-three gainers table before ticker-specific searches.",
-            "missing_slots": ["market_movers_source"],
-            "argument_clues": {"web_search": "Morningstar market movers top stock gainers today"},
-        }
-
-    for ticker in tickers:
-        if ticker not in searched_tickers and "web_search" in allowed:
-            return {
-                "status": "partial",
-                "selected_tools": ["web_search"],
-                "strategy": f"Search {ticker} separately before fetching sources.",
-                "notes": "The user explicitly asked for separate searches for each stock.",
-                "missing_slots": [f"{ticker}_three_relevant_urls"],
-                "argument_clues": {
-                    "web_search": f"{ticker} stock news June 13 2026"
-                },
-                "tickers": tickers,
-                "source_contract": contract,
-            }
-
-    for ticker in tickers:
-        if len(urls_by_entity.get(ticker, [])) < urls_per_entity and "web_search" in allowed:
-            return {
-                "status": "partial",
-                "selected_tools": ["web_search"],
-                "strategy": f"Collect source URLs for {ticker}.",
-                "notes": "Each locked entity needs its own source quota before unrelated URLs can be fetched.",
-                "missing_slots": [f"{ticker}_{urls_per_entity}_urls"],
-                "argument_clues": {
-                    "web_search": f"{ticker} stock news June 13 2026"
-                },
-                "tickers": tickers,
-                "source_contract": contract,
-            }
-
-    if len(fetched_entity_urls) < total_urls:
-        if unfetched_urls and "web_fetch" in allowed:
-            next_url = unfetched_urls[0]
-            return {
-                "status": "partial",
-                "selected_tools": ["web_fetch"],
-                "strategy": f"Fetch source {len(fetched_entity_urls) + 1} of {total_urls}.",
-                "notes": "The user requested all entity-specific URLs to be fetched before the TLDR table.",
-                "missing_slots": [f"{total_urls - len(fetched_entity_urls)}_remaining_web_fetches"],
-                "argument_clues": {"web_fetch": next_url},
-                "tickers": tickers,
-                "fetched_url_count": len(fetched_entity_urls),
-                "source_contract": contract,
-            }
-        if "web_search" in allowed:
-            next_ticker = tickers[min(len(searched_tickers), len(tickers) - 1)]
-            return {
-                "status": "partial",
-                "selected_tools": ["web_search"],
-                "strategy": f"Collect more URLs for {next_ticker}.",
-                "notes": "Need more unique URLs before the 9 fetches can complete.",
-                "missing_slots": ["nine_unique_urls"],
-                "argument_clues": {
-                    "web_search": f"{next_ticker} stock news June 13 2026"
-                },
-                "tickers": tickers,
-                "source_contract": contract,
-            }
-
-    return {}
 
 
 def _should_finalize(
@@ -597,6 +376,7 @@ def _should_finalize(
     max_tool_calls: Optional[int],
     session_id: str,
     task_tracker=None,
+    contract_complete: Optional[bool] = None,
 ) -> tuple[bool, str]:
     """Decide whether the run should finalize this turn.
 
@@ -606,14 +386,23 @@ def _should_finalize(
     can route on ``startswith``:
 
     * ``no_plan_steps`` — backward compatible path; observation alone decides
+    * ``contract_complete`` — deterministic workflow contract says enough
+      evidence is gathered; finalize even if the observation wants more
     * ``clean_finalize`` — observation says finalize, no pending steps, no open todos
     * ``observation_driven`` — fallback when plan_steps complete but observation drove the call
     * ``pending_steps:[ids]`` — gate refuses finalize because steps remain
     * ``open_todos`` — gate refuses finalize because TaskTracker has active tasks
     * ``max_tool_calls_reached:N_steps_pending`` — hard cap forces finalize anyway
+
+    ``contract_complete`` is the source_collection over-collection cure: when the
+    deterministic completion gate (workflow_contracts) reports sufficient
+    evidence — or its own hard escape trips — the loop stops collecting even if
+    the observation model still says "continue".
     """
+    wants_finalize = observation_status == "finalize" or contract_complete is True
+
     if not plan_steps:
-        return observation_status == "finalize", "no_plan_steps"
+        return wants_finalize, "no_plan_steps"
 
     pending = [s for s in plan_steps if s.get("status") == "pending"]
 
@@ -630,6 +419,12 @@ def _should_finalize(
             open_todos = bool(task_tracker.has_active_tasks(session_id))
         except Exception:
             open_todos = False
+
+    # Deterministic contract authority: enough evidence exists, so finalize even
+    # if plan steps remain pending. The response phase stays honest via the gate
+    # reason and any open missing_slots.
+    if contract_complete is True and not open_todos:
+        return True, "contract_complete"
 
     if observation_status == "finalize" and not pending and not open_todos:
         return True, "clean_finalize"
@@ -922,6 +717,7 @@ class RunEngine:
         )
         self._last_model_swap: Optional[dict[str, Any]] = None
         self._active_ledgers: dict[str, RunLedger] = {}
+        self._background_memory_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _is_trivial_acknowledgement(message: str) -> bool:
@@ -1019,21 +815,49 @@ class RunEngine:
         )
         session_model = request.model or session.model or "llama3.2"
         session_system_prompt = request.system_prompt or session.system_prompt or ""
+        # V3 is the unified convergent engine and the declared profile default
+        # (agent_profiles.default_context_mode="v3", with active migration off
+        # v1/v2). Fall back to it here too so unconfigured sessions get the
+        # unified engine; v1/v2 remain selectable explicitly. V3 transparently
+        # migrates older v1/v2 session blobs on first compress.
         requested_context_mode = str(
-            request.context_mode or getattr(session, "context_mode", "v1") or "v1"
+            request.context_mode or getattr(session, "context_mode", "v3") or "v3"
         ).strip().lower()
         if requested_context_mode not in {"v1", "v2", "v3"}:
-            requested_context_mode = str(getattr(session, "context_mode", "v1") or "v1").strip().lower()
-        if getattr(session, "context_mode", "v1") != requested_context_mode:
+            requested_context_mode = str(getattr(session, "context_mode", "v3") or "v3").strip().lower()
+        if getattr(session, "context_mode", "v3") != requested_context_mode:
             self.sessions.set_context_mode(session.id, requested_context_mode)
             refreshed_session = self.sessions.get(session.id, owner_id=request.owner_id)
             if refreshed_session is not None:
                 session = refreshed_session
-        # Guard: refuse to run a chat session on an embed-only model.
-        from llm.model_capabilities import coerce_chat_model, is_chat_capable
+        # Guard: refuse to run a chat session on an embed-only model and make
+        # image handling explicit instead of silently dropping vision input.
+        from config.config import cfg
+        from llm.model_capabilities import coerce_chat_model, is_chat_capable, is_vision_capable
         if not is_chat_capable(session_model):
             safe_session_model, _ = coerce_chat_model(session_model, "llama3.2")
             session_model = safe_session_model
+        vision_model_swap: dict[str, Any] | None = None
+        if request.images and not is_vision_capable(session_model):
+            configured_vision_model = str(getattr(cfg, "VISION_MODEL", "") or "").strip()
+            if configured_vision_model and is_vision_capable(configured_vision_model):
+                vision_model_swap = {
+                    "slot": "model",
+                    "rejected": session_model,
+                    "fallback": configured_vision_model,
+                    "reason": "image input requires a vision-capable model",
+                }
+                session_model = configured_vision_model
+            else:
+                yield {
+                    "type": "error",
+                    "message": (
+                        "Image input requires a vision-capable model. Select a vision model "
+                        "or set VISION_MODEL to a provider-prefixed vision model such as "
+                        "gemini:gemini-1.5-flash, openai:gpt-4o-mini, or ollama:llava."
+                    ),
+                }
+                return
         active_context_engine = self._resolve_context_engine(
             requested_context_mode,
             compression_model=request.context_model or session_model,
@@ -1056,6 +880,13 @@ class RunEngine:
             event_type="run_engine_start",
             data={"model": session_model, "runtime": "run_engine"},
         )
+        if vision_model_swap:
+            self._trace(
+                request=request,
+                run_id=run.run_id,
+                event_type="model_capability_violation",
+                data=vision_model_swap,
+            )
 
         # Surface any model-capability swap that happened during context-engine resolution.
         if self._last_model_swap:
@@ -1139,6 +970,39 @@ class RunEngine:
                 ],
                 ledger_mode=ledger_mode,
             )
+            workflow_contract = infer_workflow_contract(
+                effective_objective,
+                allowed_tools=ledger.allowed_tools,
+            )
+            ledger.set_workflow_contract(workflow_contract)
+            ledger.set_pass_graph(
+                build_pass_graph(workflow_contract, workflow_template=request.workflow_template)
+            )
+            control_policy = resolve_control_policy(
+                effective_objective,
+                requested=request.control_policy,
+                workflow_contract=workflow_contract,
+                risk_policy=request.risk_policy,
+                allowed_tools=ledger.allowed_tools,
+            )
+            ledger.set_control_policy(control_policy)
+            plugin_contract = select_workflow_plugin_contract(effective_objective)
+            if plugin_contract:
+                ledger.set_source_contract(
+                    {
+                        "plugin_id": plugin_contract.get("plugin_id"),
+                        "plugin_contract": plugin_contract,
+                        "forbid_unlocked_entity_drift": bool(
+                            (plugin_contract.get("entity_lock_rules") or {}).get("forbid_unlocked_entity_drift", True)
+                        ),
+                    },
+                    source="workflow_plugin_contract",
+                )
+            if control_policy.id == "react" and str(request.control_policy or "auto").lower().replace("-", "_") == "react":
+                planner_enabled = False
+            if workflow_contract.workflow_shape == "simple_chat":
+                planner_enabled = False
+                selected_tools = []
             self._active_ledgers[run.run_id] = ledger
             ledger.append_event(
                 "intake",
@@ -1151,7 +1015,20 @@ class RunEngine:
                     "workflow_template": request.workflow_template,
                     "prompt_version": request.prompt_version,
                     "risk_policy": request.risk_policy,
+                    "control_policy": control_policy.to_dict(),
                 },
+            )
+            self._trace(
+                request=request,
+                run_id=run.run_id,
+                event_type="control_policy",
+                data=control_policy.to_dict(),
+            )
+            self._trace(
+                request=request,
+                run_id=run.run_id,
+                event_type="policy_selected",
+                data=control_policy.to_dict(),
             )
             if continuation_gate.get("action") != "none":
                 ledger.append_event(
@@ -1275,6 +1152,45 @@ class RunEngine:
                 request.user_message,
                 current_facts,
             )
+
+            # ── Converged turn router ───────────────────────────────────────
+            # One deterministic gate maps intent -> {tool palette, planner on/off,
+            # answer-from-memory}. This is the single place that fixes routing
+            # (memory/identity/meta never web-searched), context poisoning (no web
+            # junk enters a "remember my name" turn), and looping (direct-fact and
+            # chat take zero tools; disclosures store + acknowledge). Honoured only
+            # when the caller did not force a specific tool set.
+            if not request.forced_tools:
+                turn_policy = resolve_turn_policy(
+                    effective_objective,
+                    user_message=request.user_message,
+                    allowed_tools=[
+                        str(t.get("name") or "")
+                        for t in allowed_tools_list
+                        if isinstance(t, dict)
+                    ],
+                    direct_fact_answerable=direct_fact_memory_only,
+                    workflow_shape=workflow_contract.workflow_shape,
+                )
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="turn_policy",
+                    data=turn_policy.to_dict(),
+                )
+                if turn_policy.tool_whitelist is not None:
+                    _palette = set(turn_policy.tool_whitelist)
+                    allowed_tools_list = [
+                        t for t in allowed_tools_list
+                        if isinstance(t, dict) and str(t.get("name") or "") in _palette
+                    ]
+                if not turn_policy.use_planner:
+                    planner_enabled = False
+                if turn_policy.answer_from_memory:
+                    direct_fact_memory_only = True
+                if turn_policy.tool_whitelist is not None and not allowed_tools_list:
+                    selected_tools = []
+
             conversation_tension = analyze_conversation_tension(
                 user_message=request.user_message,
                 current_facts=current_facts,
@@ -1642,6 +1558,16 @@ class RunEngine:
                             ],
                         },
                     )
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="plan_committed",
+                        data={
+                            "step_count": len(plan_steps_state),
+                            "risk_tier": planned_risk_tier,
+                            "mutable_plan": bool(getattr(control_policy, "mutable_plan", True)),
+                        },
+                    )
 
                 # ── Load selected skill ──
                 # Planner is authoritative. If it picks no skill but the prior
@@ -1875,6 +1801,27 @@ class RunEngine:
                         ),
                     )
 
+            # Personal disclosures ("I am a photographer", "I like blue") are facts
+            # to remember, not research queries. The deterministic extractor already
+            # captures them; drop any spurious web tool the planner chose so the
+            # agent acknowledges + stores instead of web-searching the user.
+            if selected_tools and _is_personal_disclosure_only(request.user_message):
+                _filtered_tools = [
+                    t for t in selected_tools
+                    if t not in {"web_search", "web_fetch", "web_fetch_batch", "rag_search"}
+                ]
+                if _filtered_tools != selected_tools:
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="disclosure_route",
+                        data={
+                            "dropped": [t for t in selected_tools if t not in _filtered_tools],
+                            "message": str(request.user_message or "")[:80],
+                        },
+                    )
+                    selected_tools = _filtered_tools
+
             tool_turn = 0
             tool_call_count = 0
             repeated_tool_signatures: dict[str, int] = {}
@@ -1945,6 +1892,27 @@ class RunEngine:
 
                 if not isinstance(tool_call.arguments, dict):
                     tool_call.arguments = {}
+                original_tool_arguments = dict(tool_call.arguments or {})
+                tool_call.arguments = _canonical_tool_arguments_for_loop(
+                    tool_call.tool_name,
+                    tool_call.arguments,
+                )
+                if (
+                    tool_call.tool_name == "web_search"
+                    and str(original_tool_arguments.get("query") or "") != str(tool_call.arguments.get("query") or "")
+                ):
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="tool_argument_compiled",
+                        data={
+                            "tool_name": "web_search",
+                            "field": "query",
+                            "original": str(original_tool_arguments.get("query") or ""),
+                            "compiled": str(tool_call.arguments.get("query") or ""),
+                            "reason": "workflow text was reduced to a retrieval probe",
+                        },
+                    )
                 if tool_call.tool_name == "web_search":
                     if request.search_backend and request.search_backend != "auto":
                         tool_call.arguments["backend"] = request.search_backend
@@ -1956,9 +1924,31 @@ class RunEngine:
                         objective=effective_objective,
                     )
 
+                gated_tool_call, gate_event = self._gate_tool_call_with_ledger(
+                    request=request,
+                    run_id=run.run_id,
+                    ledger=ledger,
+                    tool_call=tool_call,
+                    tool_turn=tool_turn,
+                )
+                if gate_event:
+                    self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="policy_gate")
+                    if gate_event.get("type") == "recovery_started":
+                        yield gate_event
+                if gated_tool_call is None:
+                    yield gate_event or {
+                        "type": "policy_violation",
+                        "issue": "tool_call_blocked",
+                        "recovery_class": "missing_input",
+                        "turn": tool_turn,
+                    }
+                    selected_tools = []
+                    break
+                tool_call = gated_tool_call
+
                 pre_signature = tool_call_signature(tool_call.tool_name, tool_call.arguments or {})
                 if is_retry_sensitive_tool(tool_call.tool_name) and repeated_tool_signatures.get(pre_signature, 0) >= 1:
-                    workflow_override = _stock_source_workflow_override(
+                    workflow_override = select_workflow_override(
                         objective=effective_objective,
                         allowed_tools=allowed_tools_list,
                         tool_results=tool_results,
@@ -1981,13 +1971,15 @@ class RunEngine:
                     elif pivot_tool == "web_fetch" and pivot_clue:
                         url_match = _URL_RE.search(pivot_clue)
                         if url_match:
-                            pivot_args = {"url": url_match.group(0).rstrip(".,")}
-                            tool_call = ToolCall(
-                                tool_name="web_fetch",
-                                arguments=pivot_args,
-                                raw_json=json.dumps({"tool": "web_fetch", "arguments": pivot_args}),
-                            )
-                            planned_argument_clues.update(clue_map)
+                            url = _valid_fetch_url(url_match.group(0))
+                            if url:
+                                pivot_args = {"url": url}
+                                tool_call = ToolCall(
+                                    tool_name="web_fetch",
+                                    arguments=pivot_args,
+                                    raw_json=json.dumps({"tool": "web_fetch", "arguments": pivot_args}),
+                                )
+                                planned_argument_clues.update(clue_map)
 
                 tool_call_count += 1
 
@@ -2216,12 +2208,18 @@ class RunEngine:
                             compiled_context=observation_packet.content,
                         )
                         normalized_observation = self._normalize_observation_decision(observation)
-                        workflow_override = _stock_source_workflow_override(
+                        workflow_override = select_workflow_override(
                             objective=effective_objective,
                             allowed_tools=allowed_tools_list,
                             tool_results=tool_results,
                         )
+                        had_workflow_override = bool(workflow_override)
                         if workflow_override:
+                            self._sync_workflow_override_to_ledger(
+                                ledger=ledger,
+                                workflow_override=workflow_override,
+                                source="duplicate_recovery",
+                            )
                             self._trace_workflow_override(
                                 request=request,
                                 run_id=run.run_id,
@@ -2238,6 +2236,57 @@ class RunEngine:
                                 "should_continue": bool(workflow_override.get("selected_tools")),
                             })
                             planned_argument_clues.update(dict(workflow_override.get("argument_clues") or {}))
+                        if (
+                            normalized_observation["should_continue"]
+                            and repeat_count >= 1
+                            and not had_workflow_override
+                        ):
+                            stagnation_message = (
+                                "Loop_Stagnation: duplicate tool recovery did not produce a new deterministic next action. "
+                                "Stopping the tool loop and preserving continuation state instead of repeating the same call."
+                            )
+                            normalized_observation.update({
+                                "status": "blocked",
+                                "notes": stagnation_message,
+                                "selected_tools": [],
+                                "missing_slots": list(dict.fromkeys([
+                                    *(normalized_observation.get("missing_slots") or []),
+                                    "duplicate_loop",
+                                ])),
+                                "should_continue": False,
+                            })
+                            ledger.append_event(
+                                "loop_stagnation",
+                                source="duplicate_recovery",
+                                status="blocked",
+                                data={
+                                    "tool": tool_call.tool_name,
+                                    "signature": signature,
+                                    "repeat_count": repeat_count + 1,
+                                    "recovery_class": "duplicate_loop",
+                                    "message": stagnation_message,
+                                },
+                            )
+                            self._trace(
+                                request=request,
+                                run_id=run.run_id,
+                                event_type="loop_stagnation",
+                                data={
+                                    "tool": tool_call.tool_name,
+                                    "signature": signature,
+                                    "repeat_count": repeat_count + 1,
+                                    "recovery_class": "duplicate_loop",
+                                    "message": stagnation_message,
+                                },
+                            )
+                            yield {
+                                "type": "loop_stagnation",
+                                "tool": tool_call.tool_name,
+                                "signature": signature,
+                                "repeat_count": repeat_count + 1,
+                                "recovery_class": "duplicate_loop",
+                                "message": stagnation_message,
+                            }
                         selected_tools = list(normalized_observation["selected_tools"])
                         latest_strategy = str(normalized_observation["strategy"] or latest_strategy)
                         latest_notes = str(normalized_observation["notes"] or latest_notes)
@@ -2329,6 +2378,8 @@ class RunEngine:
                             else "nomic-embed-text"
                         ),
                         "_runtime_path": "run_engine",
+                        "_ledger_authority": True,
+                        "_ledger_tool_results": list(tool_results),
                     },
                 )
                 # Enrich content with AI-readable signals ([READ_MORE], [KEY_FACT], etc.)
@@ -2404,6 +2455,7 @@ class RunEngine:
                     status="ok" if tool_result.success else "failed",
                     summary=clip_text(_actor_summary or _shaped_content, 280),
                 )
+                result_payload["tool_result_id"] = result_record.id
                 if is_substantive_tool_result(result_payload):
                     ledger.add_evidence_from_result(result_record)
                 self._trace_ledger(request=request, run_id=run.run_id, ledger=ledger, reason="tool_result")
@@ -2583,20 +2635,24 @@ class RunEngine:
                     conversation_tension=conversation_tension,
                     trace_phase_label="observation",
                 )
-                observation = await self.orchestrator.observe_with_context(
-                    query=effective_objective,
-                    tools_list=allowed_tools_list,
-                    tool_results=tool_results,
-                    model=request.planner_model or session_model,
-                    compiled_context=observation_packet.content,
-                )
-                normalized_observation = self._normalize_observation_decision(observation)
-                workflow_override = _stock_source_workflow_override(
+                # ── Efficiency: skip the LLM observe call when a deterministic
+                # workflow override already decides the next step. For source/
+                # stock workflows the override replaced the observe result
+                # anyway, so that model request was pure waste — skipping it
+                # removes one LLM call per tool turn (a real free-tier quota
+                # saver) with identical routing behavior. Other turns still run
+                # the LLM observer.
+                workflow_override = select_workflow_override(
                     objective=effective_objective,
                     allowed_tools=allowed_tools_list,
                     tool_results=tool_results,
                 )
                 if workflow_override:
+                    self._sync_workflow_override_to_ledger(
+                        ledger=ledger,
+                        workflow_override=workflow_override,
+                        source="observation_override",
+                    )
                     self._trace_workflow_override(
                         request=request,
                         run_id=run.run_id,
@@ -2604,15 +2660,53 @@ class RunEngine:
                         workflow_override=workflow_override,
                         source="observation_override",
                     )
-                    normalized_observation.update({
-                        "status": workflow_override.get("status", normalized_observation["status"]),
-                        "strategy": workflow_override.get("strategy", normalized_observation["strategy"]),
-                        "notes": workflow_override.get("notes", normalized_observation["notes"]),
-                        "selected_tools": list(workflow_override.get("selected_tools") or []),
-                        "missing_slots": list(workflow_override.get("missing_slots") or []),
-                        "should_continue": bool(workflow_override.get("selected_tools")),
+                    normalized_observation = self._normalize_observation_decision({
+                        "status": workflow_override.get("status", "continue"),
+                        "strategy": workflow_override.get("strategy", latest_strategy),
+                        "notes": workflow_override.get("notes", latest_notes),
+                        "tools": [{"name": t} for t in (workflow_override.get("selected_tools") or [])],
+                        "missing": list(workflow_override.get("missing_slots") or []),
                     })
                     planned_argument_clues.update(dict(workflow_override.get("argument_clues") or {}))
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="observation_deterministic",
+                        data={
+                            "tool_turn": tool_turn,
+                            "source": "workflow_override",
+                            "status": normalized_observation["status"],
+                            "saved_llm_call": True,
+                        },
+                    )
+                else:
+                    try:
+                        observation = await self.orchestrator.observe_with_context(
+                            query=effective_objective,
+                            tools_list=allowed_tools_list,
+                            tool_results=tool_results,
+                            model=request.planner_model or session_model,
+                            compiled_context=observation_packet.content,
+                        )
+                        normalized_observation = self._normalize_observation_decision(observation)
+                    except (RateLimitError, ProviderError) as _obs_exc:
+                        # Resilience: a provider 429 / 5xx on the observer must not
+                        # kill the run (it's exactly what a real Gemini free-tier
+                        # run hit). Fall back to a deterministic observation:
+                        # finalize from the evidence we have, else keep going.
+                        self._trace(
+                            request=request,
+                            run_id=run.run_id,
+                            event_type="observation_fallback",
+                            data={"tool_turn": tool_turn, "error": type(_obs_exc).__name__},
+                        )
+                        normalized_observation = self._normalize_observation_decision({
+                            "status": "finalize" if tool_results else "continue",
+                            "strategy": latest_strategy,
+                            "notes": "deterministic observation (provider unavailable)",
+                            "tools": [],
+                            "missing": [],
+                        })
                 selected_tools = list(normalized_observation["selected_tools"])
                 latest_strategy = str(normalized_observation["strategy"] or latest_strategy)
                 latest_notes = str(normalized_observation["notes"] or latest_notes)
@@ -2683,6 +2777,24 @@ class RunEngine:
                     _tracker_for_gate = _get_tt()
                 except Exception:
                     _tracker_for_gate = None
+                # ── Move C: recompute the deterministic workflow contract from the
+                # accumulated tool results so its completion gate can finalize a
+                # source/web collection instead of over-collecting to the cap. The
+                # gate has its own hard escape (fetch target met OR turn budget),
+                # so it can never lock the loop forever.
+                _contract_complete = None
+                try:
+                    if workflow_contract is not None and workflow_contract.workflow_shape == "source_collection":
+                        workflow_contract = update_contract_from_tool_results(
+                            workflow_contract,
+                            tool_results,
+                            tool_turn=tool_turn,
+                            max_tool_turns=normalized_max_tool_calls or max_turns,
+                        )
+                        ledger.set_workflow_contract(workflow_contract)
+                        _contract_complete = workflow_contract.completion_gate.final_answer_allowed
+                except Exception:
+                    _contract_complete = None
                 _gate_finalize, _gate_reason = _should_finalize(
                     observation_status=normalized_observation["status"],
                     plan_steps=plan_steps_state,
@@ -2690,6 +2802,7 @@ class RunEngine:
                     max_tool_calls=normalized_max_tool_calls,
                     session_id=session.id,
                     task_tracker=_tracker_for_gate,
+                    contract_complete=_contract_complete,
                 )
                 self._trace(
                     request=request,
@@ -2896,6 +3009,25 @@ class RunEngine:
                 for token in buffered_tokens:
                     yield {"type": "token", "content": token}
 
+            ledger_response_check = ledger.response_support_check(final_response)
+            if not ledger_response_check.get("supported", True):
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="completion_gate",
+                    data={
+                        "final_answer_allowed": False,
+                        "issues": ledger_response_check.get("issues", []),
+                        "successful_tool_result_ids": ledger_response_check.get("successful_tool_result_ids", []),
+                        "ledger_mode": ledger.ledger_mode,
+                    },
+                )
+                if ledger.ledger_mode == "ledger_enforced":
+                    if not buffer_final_response:
+                        yield {"type": "retract_last_tokens"}
+                    final_response = self._ledger_incomplete_response(ledger)
+                    yield {"type": "token", "content": final_response}
+
             response_summary = self._build_controller_summary(
                 status=latest_observation_status,
                 strategy=latest_strategy,
@@ -2949,10 +3081,22 @@ class RunEngine:
                 )
 
             # Skip verification for runs that need no external grounding:
-            # direct-fact-memory-only answers come from deterministic facts,
-            # and no-tool runs have nothing to ground-check.
+            # direct-fact-memory-only answers come from deterministic facts, and
+            # no-tool runs have nothing to ground-check. When no tool ran AND the
+            # deterministic guards already passed (ledger response support +
+            # side-effect), the LLM verifier has nothing to add — skip it to save
+            # one model call per run (the deterministic floor still holds). Runs
+            # WITH tool results keep the LLM verifier so claims stay grounded.
             _plan_route = str(structured_plan.get("route_type", ""))
-            _skip_verify = direct_fact_memory_only or (not tool_results and _plan_route in {"trivial_chat", "memory_recall"})
+            _deterministic_response_clean = bool(
+                ledger_response_check.get("supported", True)
+                and side_effect_check.get("supported", True)
+            )
+            _skip_verify = (
+                direct_fact_memory_only
+                or (not tool_results and _plan_route in {"trivial_chat", "memory_recall"})
+                or (not tool_results and _deterministic_response_clean)
+            )
             if self.orchestrator is not None and not _skip_verify:
                 verification_packet = self._compile_phase_packet(
                     context_engine=active_context_engine,
@@ -3029,6 +3173,19 @@ class RunEngine:
                     "side_effect_guard": "tripped",
                 }
 
+            if not ledger_response_check.get("supported", True):
+                merged_issues = list(verification.get("issues") or [])
+                merged_issues.extend(ledger_response_check.get("issues", []))
+                verification = {
+                    **verification,
+                    "supported": False,
+                    "verdict": "needs_replan",
+                    "issues": list(dict.fromkeys(str(item) for item in merged_issues if str(item).strip())),
+                    "missing_evidence": list(ledger_response_check.get("issues") or []),
+                    "target_state": "gather",
+                    "ledger_completion_gate": "blocked",
+                }
+
             # Slice 4: 3-way verifier verdict routing.
             # The verifier now returns one of: supported | needs_redraft | needs_replan.
             # - supported   → COMMIT (handled by the post-redraft fall-through path)
@@ -3068,10 +3225,15 @@ class RunEngine:
             # Triggered by side-effect guard tripping OR multiple verification issues.
             # Bound to a single attempt — if the redraft also fails, we ship with a warning.
             # Only fires for verdict=needs_redraft (legacy unsupported case);
-            # needs_replan is handled above without redraft.
+            # needs_replan is handled above (cross-turn re-plan via continuation_state).
+            # The recovery budget comes from the active control policy
+            # (max_recovery_rounds): a policy can set it to 0 to forbid in-turn
+            # redraft and rely purely on the cross-turn re-plan path.
+            _recovery_budget = int(getattr(control_policy, "max_recovery_rounds", 1) or 0)
             _redraft_eligible = (
                 not bool(verification.get("supported", True))
                 and _verifier_verdict != "needs_replan"
+                and _recovery_budget >= 1
             )
             if _redraft_eligible:
                 _initial_issues = list(verification.get("issues") or [])
@@ -3347,24 +3509,63 @@ class RunEngine:
 
             self.sessions.append_message(session.id, "assistant", final_response)
             if verification_supported:
-                await self._commit_context(
-                    context_engine=active_context_engine,
-                    session_id=session.id,
-                    request=request,
-                    assistant_response=final_response,
-                    current_context=session.compressed_context,
-                    is_first_exchange=is_first_exchange,
-                    tool_results=tool_results,
-                    model=request.context_model or session_model,
-                    run_id=run.run_id,
-                    deterministic_keyed_facts=deterministic_keyed_facts,
-                    deterministic_voids=deterministic_voids,
-                    current_facts=current_facts,
-                    stance_signals=stance_signals,
-                    conversation_tension=conversation_tension,
-                    planned_locus_id=planned_locus_id,
-                    run_ledger=ledger,
-                )
+                memory_commit_mode = str(
+                    request.memory_commit_mode
+                    or os.getenv("SHOVSOS_MEMORY_COMMIT_MODE", "sync")
+                    or "sync"
+                ).strip().lower()
+                if memory_commit_mode not in {"sync", "async", "skip"}:
+                    memory_commit_mode = "sync"
+                commit_kwargs = {
+                    "context_engine": active_context_engine,
+                    "session_id": session.id,
+                    "request": request,
+                    "assistant_response": final_response,
+                    "current_context": session.compressed_context,
+                    "is_first_exchange": is_first_exchange,
+                    "tool_results": tool_results,
+                    "model": request.context_model or session_model,
+                    "run_id": run.run_id,
+                    "deterministic_keyed_facts": deterministic_keyed_facts,
+                    "deterministic_voids": deterministic_voids,
+                    "current_facts": current_facts,
+                    "stance_signals": stance_signals,
+                    "conversation_tension": conversation_tension,
+                    "planned_locus_id": planned_locus_id,
+                    "run_ledger": ledger,
+                }
+                if memory_commit_mode == "skip":
+                    self.run_store.save_checkpoint(
+                        run_id=run.run_id,
+                        phase="memory_commit",
+                        status="skipped",
+                        tool_turn=tool_turn,
+                        notes="Memory commit skipped by request.memory_commit_mode.",
+                    )
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="memory_commit_skipped",
+                        data={"reason": "request_memory_commit_mode_skip"},
+                    )
+                elif memory_commit_mode == "async":
+                    self.run_store.save_checkpoint(
+                        run_id=run.run_id,
+                        phase="memory_commit",
+                        status="deferred",
+                        tool_turn=tool_turn,
+                        notes="Memory commit deferred so response streaming can finish without waiting on compression or embeddings.",
+                    )
+                    self._trace(
+                        request=request,
+                        run_id=run.run_id,
+                        event_type="memory_commit_deferred",
+                        data={"reason": "async_memory_commit", "mode": memory_commit_mode},
+                    )
+                    yield {"type": "memory_commit_deferred", "run_id": run.run_id}
+                    self._schedule_deferred_memory_commit(**commit_kwargs)
+                else:
+                    await self._commit_context(**commit_kwargs)
             else:
                 self.run_store.save_checkpoint(
                     run_id=run.run_id,
@@ -3576,12 +3777,13 @@ class RunEngine:
                 if name == "web_fetch":
                     url_match = _URL_RE.search(clue)
                     if url_match:
-                        url = url_match.group(0).rstrip(".,")
-                        return ToolCall(
-                            tool_name=name,
-                            arguments={"url": url},
-                            raw_json=json.dumps({"tool": name, "arguments": {"url": url}}),
-                        )
+                        url = _canonical_fetch_url_for_loop(url_match.group(0))
+                        if url:
+                            return ToolCall(
+                                tool_name=name,
+                                arguments={"url": url},
+                                raw_json=json.dumps({"tool": name, "arguments": {"url": url}}),
+                            )
         fallback_ranked = self._rank_fallback_tool_candidates(effective_objective, available_names)
         if "web_fetch" in available_names and "web_fetch" not in fallback_ranked:
             if re.search(r"https?://[^\s\"'<>),]+", context_block or ""):
@@ -3593,7 +3795,7 @@ class RunEngine:
             if name == "web_fetch" and not re.search(r"https?://\S+", fallback_objective or ""):
                 context_url = re.search(r"https?://[^\s\"'<>),]+", context_block or "")
                 if context_url:
-                    fallback_objective = context_url.group(0)
+                    fallback_objective = _canonical_fetch_url_for_loop(context_url.group(0)) or fallback_objective
             fallback = fallback_tool_call(name, fallback_objective)
             if fallback is not None:
                 return fallback
@@ -3700,13 +3902,35 @@ class RunEngine:
             add("web_fetch")
         if re.search(r"\b(weather|temperature|forecast|rain|snow|wind)\b", lowered):
             add("weather_fetch")
+        if re.search(
+            r"\b(generate|create|make|design|render|draw|produce)\b.*\b(image|photo|picture|logo|mockup|illustration|asset)\b",
+            lowered,
+        ) or re.search(
+            r"\b(image|photo|picture|logo|mockup|illustration|asset)\b.*\b(generate|create|make|design|render|draw|produce)\b",
+            lowered,
+        ):
+            add("image_generate")
         if re.search(r"\b(image|photo|picture|screenshot|logo)\b", lowered):
             add("image_search")
         if re.search(r"\b(remember|memory|previously|earlier|recall)\b", lowered):
             add("query_memory")
             add("rag_search")
+        # Conversation-history / meta requests ("read recent chat", "what did we
+        # talk about", "summarize our conversation") must hit memory, never get
+        # web-searched literally. Rank query_memory before the web_search rule so
+        # it wins the single fallback slot.
+        if re.search(
+            r"\b(recent|previous|prior|last|earlier|past|our|the)\b[\w\s]{0,20}\b(chat|conversation|conversations|message|messages|discussion|thread|history)\b",
+            lowered,
+        ) or re.search(
+            r"\bwhat did (?:we|i|you)\b|\b(chat|conversation) history\b|\bread (?:the )?(?:recent |last )?(?:chat|conversation)\b",
+            lowered,
+        ):
+            add("query_memory")
         if re.search(r"\b(near me|nearby|place|restaurant|hotel|map|route|directions)\b", lowered):
             add("places_search")
+        if _source_collection_contract_from_objective(user_message):
+            add("source_collect")
         if re.search(
             r"\b(current|latest|today|news|price|prices|stock|stocks|market|search|find|lookup|look up|research|investigate|compare)\b",
             lowered,
@@ -3866,6 +4090,20 @@ class RunEngine:
         planned_locus_id: str = "",
         run_ledger: Optional[RunLedger] = None,
     ) -> None:
+        if should_skip_memory_compression(request.user_message, assistant_response):
+            self.run_store.save_checkpoint(
+                run_id=run_id,
+                phase="memory_commit",
+                status="skipped_low_value",
+                notes="Low-value social turn skipped before context packet compilation.",
+            )
+            self._trace(
+                request=request,
+                run_id=run_id,
+                event_type="memory_commit_skipped",
+                data={"reason": "low_value_social_turn"},
+            )
+            return
         session = self.sessions.get(session_id, owner_id=request.owner_id)
         existing_candidate_signals = list(getattr(session, "candidate_signals", []) or [])
         existing_candidate_context = getattr(session, "candidate_context", "") if session is not None else ""
@@ -4084,6 +4322,42 @@ class RunEngine:
             ],
         )
 
+    def _schedule_deferred_memory_commit(self, **kwargs) -> None:
+        async def _runner() -> None:
+            request = kwargs.get("request")
+            run_id = str(kwargs.get("run_id") or "")
+            try:
+                await self._commit_context(**kwargs)
+                if request is not None and run_id:
+                    self._trace(
+                        request=request,
+                        run_id=run_id,
+                        event_type="memory_commit_completed",
+                        data={"mode": "async"},
+                    )
+            except Exception as exc:
+                if run_id:
+                    try:
+                        self.run_store.save_checkpoint(
+                            run_id=run_id,
+                            phase="memory_commit",
+                            status="failed",
+                            notes=f"Deferred memory commit failed: {exc}",
+                        )
+                    except Exception:
+                        pass
+                if request is not None and run_id:
+                    self._trace(
+                        request=request,
+                        run_id=run_id,
+                        event_type="memory_commit_failed",
+                        data={"mode": "async", "message": str(exc)},
+                    )
+
+        task = asyncio.create_task(_runner())
+        self._background_memory_tasks.add(task)
+        task.add_done_callback(self._background_memory_tasks.discard)
+
     def _trace_memory_commit_plan(
         self,
         *,
@@ -4098,15 +4372,18 @@ class RunEngine:
         merged_voids = list(getattr(plan, "merged_voids", None) or [])
         blocked_keyed_facts = list(getattr(plan, "blocked_keyed_facts", None) or [])
         candidate_signals = list(getattr(plan, "candidate_signals", None) or [])
+        memory_decisions = list(getattr(plan, "memory_decisions", None) or [])
         data = {
             "path": path,
             "fact_count": len(merged_facts),
             "void_count": len(merged_voids),
             "blocked_count": len(blocked_keyed_facts),
             "candidate_signal_count": len(candidate_signals),
+            "memory_decision_count": len(memory_decisions),
             "candidate_context_lines": len(
                 [line for line in str(getattr(plan, "candidate_context", "") or "").splitlines() if line.strip()]
             ),
+            "memory_decisions": memory_decisions[:12],
             "facts": [
                 {
                     "subject": item.get("subject"),
@@ -4203,6 +4480,155 @@ class RunEngine:
             },
         )
 
+    def _sync_workflow_override_to_ledger(
+        self,
+        *,
+        ledger: RunLedger,
+        workflow_override: dict[str, Any],
+        source: str,
+    ) -> None:
+        if not workflow_override:
+            return
+        entities = [
+            str(item).strip()
+            for item in (workflow_override.get("tickers") or workflow_override.get("entities") or [])
+            if str(item).strip()
+        ]
+        if entities:
+            ledger.lock_entities(entities, source=source)
+        source_contract = dict(workflow_override.get("source_contract") or {})
+        selected_tools = list(workflow_override.get("selected_tools") or [])
+        argument_clues = dict(workflow_override.get("argument_clues") or {})
+        next_tool = str(selected_tools[0] if selected_tools else "").strip()
+        next_arguments: dict[str, Any] = {}
+        next_clue = str(argument_clues.get(next_tool) or "").strip() if next_tool else ""
+        if next_tool == "web_search" and next_clue:
+            next_arguments = {"query": next_clue}
+        elif next_tool == "web_fetch" and next_clue:
+            url_match = _URL_RE.search(next_clue)
+            if url_match:
+                url = _canonical_fetch_url_for_loop(url_match.group(0))
+                if url:
+                    next_arguments = {"url": url}
+        allowed_fetch_urls = []
+        if next_tool == "web_fetch" and next_arguments.get("url"):
+            allowed_fetch_urls.append(next_arguments["url"])
+        allowed_by_entity = workflow_override.get("allowed_fetch_urls_by_entity")
+        if isinstance(allowed_by_entity, dict):
+            source_contract["allowed_fetch_urls_by_entity"] = {
+                str(entity): [
+                    canonical
+                    for canonical in (
+                        _canonical_fetch_url_for_loop(str(url))
+                        for url in (urls if isinstance(urls, list) else [])
+                    )
+                    if canonical
+                ]
+                for entity, urls in allowed_by_entity.items()
+            }
+            for urls in allowed_by_entity.values():
+                if isinstance(urls, list):
+                    allowed_fetch_urls.extend(
+                        canonical
+                        for canonical in (_canonical_fetch_url_for_loop(str(url)) for url in urls)
+                        if canonical
+                    )
+        if source_contract or entities or next_tool:
+            ledger.set_source_contract(
+                {
+                    **source_contract,
+                    "plugin_id": workflow_override.get("plugin_id") or ledger.source_contract.get("plugin_id"),
+                    "missing_slots": list(workflow_override.get("missing_slots") or []),
+                    "next_tool": next_tool,
+                    "next_arguments": next_arguments,
+                    "next_reason": str(workflow_override.get("strategy") or ""),
+                    "allowed_fetch_urls": list(dict.fromkeys(url for url in allowed_fetch_urls if url)),
+                    "forbid_unlocked_entity_drift": True,
+                },
+                source=source,
+            )
+
+    def _gate_tool_call_with_ledger(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        ledger: RunLedger,
+        tool_call: ToolCall,
+        tool_turn: int,
+    ) -> tuple[Optional[ToolCall], Optional[dict[str, Any]]]:
+        validation = ledger.validate_tool_call_against_policy(
+            tool_call.tool_name,
+            tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
+        )
+        if validation.valid:
+            self._trace(
+                request=request,
+                run_id=run_id,
+                event_type="tool_call_validated",
+                data={
+                    "tool_name": tool_call.tool_name,
+                    "turn": tool_turn,
+                    "policy": str(getattr(ledger.control_policy, "id", "") or ""),
+                },
+            )
+            return tool_call, None
+
+        ledger.record_policy_violation(
+            issue=validation.issue,
+            recovery_class=validation.recovery_class,
+            tool_name=tool_call.tool_name,
+            arguments=tool_call.arguments if isinstance(tool_call.arguments, dict) else {},
+            expected_tool=validation.expected_tool,
+            expected_arguments=validation.expected_arguments,
+            message=validation.message,
+        )
+        violation_payload = {
+            "type": "policy_violation",
+            "issue": validation.issue,
+            "recovery_class": validation.recovery_class,
+            "recovery_policy": recovery_policy_for(validation.recovery_class).to_dict(),
+            "tool_name": tool_call.tool_name,
+            "arguments": dict(tool_call.arguments or {}),
+            "expected_tool": validation.expected_tool,
+            "expected_arguments": dict(validation.expected_arguments or {}),
+            "message": validation.message,
+            "turn": tool_turn,
+            "ledger_mode": ledger.ledger_mode,
+        }
+        self._trace(request=request, run_id=run_id, event_type="policy_violation", data=violation_payload)
+        if ledger.ledger_mode != "ledger_enforced":
+            return tool_call, violation_payload
+
+        if validation.expected_tool and validation.expected_arguments:
+            recovered = ToolCall(
+                tool_name=validation.expected_tool,
+                arguments=dict(validation.expected_arguments),
+                raw_json=json.dumps({"tool": validation.expected_tool, "arguments": validation.expected_arguments}),
+            )
+            recovery_payload = {
+                **violation_payload,
+                "type": "recovery_started",
+                "recovered_tool": recovered.tool_name,
+                "recovered_arguments": dict(recovered.arguments or {}),
+            }
+            ledger.append_event("recovery_started", source="policy_gate", status="active", data=recovery_payload)
+            self._trace(request=request, run_id=run_id, event_type="recovery_started", data=recovery_payload)
+            return recovered, recovery_payload
+
+        return None, violation_payload
+
+    def _ledger_incomplete_response(self, ledger: RunLedger) -> str:
+        gate = ledger.completion_gate()
+        next_action = ledger.next_required_action()
+        missing = ", ".join(str(item) for item in gate.get("missing_slots") or next_action.get("missing_slots") or [])
+        action = ""
+        if next_action.get("tool"):
+            action = f" Next required action: {next_action.get('tool')} {next_action.get('arguments') or {}}."
+        if not missing:
+            missing = "required evidence"
+        return f"I cannot finalize this as complete yet. Missing: {missing}.{action}"
+
     def _record_memory_outcome(
         self,
         *,
@@ -4283,6 +4709,20 @@ class RunEngine:
         active_ledger = run_ledger or self._active_ledgers.get(run_id)
         if active_ledger is not None:
             active_ledger.set_phase(phase, source="phase_packet")
+            control_policy_id = str(getattr(getattr(active_ledger, "control_policy", None), "id", "") or "")
+            if control_policy_id == "graph_harness":
+                graph_payload = active_ledger.record_graph_phase(
+                    phase,
+                    marker=f"{phase.value}:{tool_turn}",
+                    source="phase_packet",
+                )
+                if graph_payload:
+                    self._trace(
+                        request=request,
+                        run_id=run_id,
+                        event_type="pass_graph_execution",
+                        data=graph_payload,
+                    )
         capability_context = render_capability_cards(
             allowed_tools=[
                 str(tool.get("name") or "")

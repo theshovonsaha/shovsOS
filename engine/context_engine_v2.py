@@ -55,6 +55,7 @@ from llm.adapter_factory import create_adapter, strip_provider_prefix
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
+from engine.context_hygiene import should_skip_memory_compression
 
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
@@ -206,17 +207,12 @@ class ContextEngineV2:
         """
         self._turn += 1
 
-        # Never skip first exchange
-        is_trivial = (
-            bool(TRIVIAL_PATTERN.match(user_message.strip()))
-            and len(assistant_response.strip()) < 40
-        )
-        if is_trivial and not is_first_exchange:
-            return self._serialize_context(), [], []
-
         # Restore state from persisted context if this is a resumed session
         if current_context and not self._modules:
             self._deserialize_context(current_context)
+
+        if should_skip_memory_compression(user_message, assistant_response):
+            return current_context or self._serialize_context(), [], []
 
         use_model = model or self.compression_model
 

@@ -102,9 +102,12 @@ def _build_operator_story(
     usage: dict,
 ) -> dict:
     latest_plan = _latest_event(trace_events, {"plan", "plan_steps", "continuation_gate"})
+    latest_policy = _latest_event(trace_events, {"control_policy", "policy_selected", "policy_violation"})
+    latest_graph = _latest_event(trace_events, {"pass_graph_execution", "pass_node_started", "pass_node_completed", "pass_node_failed"})
     latest_context = _latest_event(trace_events, {"phase_packet", "phase_context", "compiled_context"})
     latest_tool_result = _latest_event(trace_events, {"tool_result"})
     latest_tool_call = _latest_event(trace_events, {"tool_call"})
+    latest_recovery = _latest_event(trace_events, {"recovery_started", "completion_gate"})
     latest_verification = _latest_event(trace_events, {"verification_warning", "verification_result"})
     latest_memory = _latest_event(trace_events, {"memory_commit_plan", "memory_write_policy", "memory_commit_skipped"})
     latest_response = _latest_event(trace_events, {"assistant_response"})
@@ -156,9 +159,12 @@ def _build_operator_story(
         },
         "lanes": [
             lane("plan", "Plan", latest_plan, count=len([p for p in passes if str(p.phase).lower() == "planning"])),
+            lane("policy", "Policy", latest_policy, count=len([e for e in trace_events if e.get("event_type") in {"control_policy", "policy_selected", "policy_violation"}])),
+            lane("graph", "Graph", latest_graph, count=len([e for e in trace_events if e.get("event_type") in {"pass_graph_execution", "pass_node_started", "pass_node_completed", "pass_node_failed"}])),
             lane("context", "Context", latest_context, count=len([e for e in trace_events if e.get("event_type") in {"phase_packet", "phase_context", "compiled_context"}])),
             lane("tool", "Tools", latest_tool_result or latest_tool_call, count=len([e for e in trace_events if e.get("event_type") in {"tool_call", "tool_result"}])),
             lane("evidence", "Evidence", None, summary=(evidence[0].get("summary") if evidence else "No evidence selected yet."), count=len(evidence), status="done" if evidence else "idle"),
+            lane("recovery", "Recovery", latest_recovery, count=len([e for e in trace_events if e.get("event_type") in {"recovery_started", "completion_gate"}])),
             lane("memory", "Memory", latest_memory, count=len([e for e in trace_events if "memory" in str(e.get("event_type") or "")])),
             lane("verify", "Verify", latest_verification, count=len(evals)),
             lane("response", "Response", latest_response, count=len([e for e in trace_events if e.get("event_type") == "assistant_response"])),

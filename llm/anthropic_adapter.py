@@ -20,6 +20,7 @@ import os
 from typing import AsyncIterator, Optional
 
 from llm.base_adapter import BaseLLMAdapter, LLMError, RateLimitError, ProviderError
+from llm.model_capabilities import rejects_sampling_params
 
 RETRY_DELAYS = [0.5, 1.5, 3.0]
 
@@ -69,24 +70,26 @@ class AnthropicAdapter(BaseLLMAdapter):
         reasoning_enabled: Optional[bool],
         max_tokens: int,
     ) -> None:
-        """Attach Anthropic extended-thinking config when applicable.
+        """Attach Anthropic thinking config when applicable.
 
-        Extended thinking is supported on Claude 3.7 and Claude 4 family
-        models. We require ``reasoning_enabled is True`` to enable, and
-        ``False`` is a no-op (Anthropic has no "force off" flag — extended
-        thinking is opt-in, off by default). Budget is bounded by the
-        request's ``max_tokens`` minus a 1024 floor for the visible reply.
+        Current models (Opus 4.6+, Sonnet 4.6+, Fable/Mythos 5) use ADAPTIVE
+        thinking — ``{type:"enabled", budget_tokens:N}`` and an explicit
+        ``temperature`` both return 400 there. Older Claude (3.7 / 4.0 / 4.5)
+        still take the explicit budget. ``reasoning_enabled is False`` is a
+        no-op (thinking is opt-in, off by default).
         """
         if reasoning_enabled is not True:
             return
-        from llm.model_capabilities import supports_reasoning
+        from llm.model_capabilities import supports_reasoning, uses_adaptive_thinking
         if not supports_reasoning(model):
             return
-        # Reserve at least 1024 tokens for the visible response, give the
-        # rest to the thinking budget. Anthropic requires budget < max_tokens.
+        if uses_adaptive_thinking(model):
+            kwargs["thinking"] = {"type": "adaptive"}
+            return
+        # Older models: explicit budget. Reserve ≥1024 tokens for the visible
+        # reply; Anthropic requires budget < max_tokens and temperature=1.
         budget = max(1024, int(max_tokens) - 1024)
         kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        # Extended thinking requires temperature=1 per Anthropic docs.
         kwargs["temperature"] = 1.0
 
     async def complete(
@@ -110,8 +113,9 @@ class AnthropicAdapter(BaseLLMAdapter):
                     "model": model,
                     "max_tokens": max_tokens or 4096,
                     "messages": msgs,
-                    "temperature": temperature,
                 }
+                if not rejects_sampling_params(model):
+                    kwargs["temperature"] = temperature
                 if system_prompt:
                     kwargs["system"] = system_prompt
                 anthropic_tools = self._convert_tools(tools)
@@ -167,8 +171,9 @@ class AnthropicAdapter(BaseLLMAdapter):
             "model": model,
             "max_tokens": max_tokens or 4096,
             "messages": msgs,
-            "temperature": temperature,
         }
+        if not rejects_sampling_params(model):
+            kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         anthropic_tools = self._convert_tools(tools)
@@ -239,12 +244,11 @@ class AnthropicAdapter(BaseLLMAdapter):
             return [m.id for m in getattr(page, "data", [])]
         except Exception:
             return [
-                "claude-sonnet-4-5",
-                "claude-opus-4-5",
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-opus-4-7",
                 "claude-haiku-4-5",
-                "claude-sonnet-4-0",
-                "claude-3-5-sonnet-latest",
-                "claude-3-5-haiku-latest",
+                "claude-fable-5",
             ]
 
     async def health(self) -> bool:

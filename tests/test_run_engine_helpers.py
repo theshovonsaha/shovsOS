@@ -8,6 +8,10 @@ from orchestration.session_manager import SessionManager
 from plugins.tool_registry import ToolCall, ToolRegistry
 
 from engine.conversation_tension import analyze_conversation_tension
+from orchestration.run_store import RunStore
+from run_engine.control_policies import resolve_control_policy
+from run_engine.engine import RunEngine
+from run_engine.ledger import RunLedger, recovery_policy_for
 from run_engine.memory_pipeline import (
     MemoryCommitPlan,
     apply_memory_commit,
@@ -17,6 +21,21 @@ from run_engine.memory_pipeline import (
     plan_memory_commit,
 )
 from run_engine.tool_selection import build_actor_request_content, extract_tool_call, fallback_tool_call, summarize_arguments
+from run_engine.search_query import compile_web_search_query
+
+
+class _TraceCapture:
+    def __init__(self):
+        self.events = []
+
+    def append_event(self, agent_id, session_id, event_type, data, **kwargs):
+        self.events.append({
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "event_type": event_type,
+            "data": data,
+            **kwargs,
+        })
 
 
 def test_continuation_gate_resumes_ambiguous_followup():
@@ -34,6 +53,104 @@ def test_continuation_gate_resumes_ambiguous_followup():
     assert decision["action"] == "resume"
     assert decision["effective_objective"] == "Find a storage bin under $20 near Toronto."
     assert decision["pending_step_count"] == 1
+
+
+def test_recovery_policy_classes_are_typed():
+    policy = recovery_policy_for("entity_drift")
+
+    assert policy.max_retries == 1
+    assert "web_search" in policy.allowed_recovery_tools
+    assert policy.persist_continuation is True
+
+
+def test_engine_policy_gate_recovers_bad_plan_execute_tool_call_in_enforced_mode(tmp_path):
+    traces = _TraceCapture()
+    engine = RunEngine(
+        adapter=MagicMock(),
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+    )
+    ledger = RunLedger(
+        run_id="run-policy-enforced",
+        session_id="session-policy-enforced",
+        turn_id="turn-1",
+        objective="Search ROKU, TBN, SENEA separately and fetch sources",
+        allowed_tools=["web_search", "web_fetch"],
+        ledger_mode="ledger_enforced",
+    )
+    ledger.set_control_policy(resolve_control_policy(ledger.objective, requested="plan_execute"))
+    ledger.lock_entities(["ROKU", "TBN", "SENEA"])
+    ledger.set_source_contract({
+        "next_tool": "web_search",
+        "next_arguments": {"query": "ROKU stock news June 13 2026"},
+        "forbid_unlocked_entity_drift": True,
+    })
+
+    recovered, event = engine._gate_tool_call_with_ledger(
+        request=MagicMock(session_id="session-policy-enforced", agent_id="agent", owner_id="owner"),
+        run_id="run-policy-enforced",
+        ledger=ledger,
+        tool_call=ToolCall(
+            "web_search",
+            {"query": "EPAM stock news June 13 2026"},
+            '{"tool":"web_search"}',
+        ),
+        tool_turn=1,
+    )
+
+    assert recovered is not None
+    assert recovered.tool_name == "web_search"
+    assert recovered.arguments == {"query": "ROKU stock news June 13 2026"}
+    assert event["type"] == "recovery_started"
+    assert event["recovery_policy"]["recovery_class"] == "entity_drift"
+    assert any(item["event_type"] == "policy_violation" for item in traces.events)
+    assert any(item["event_type"] == "recovery_started" for item in traces.events)
+
+
+def test_engine_policy_gate_records_but_allows_bad_call_in_shadow_mode(tmp_path):
+    traces = _TraceCapture()
+    engine = RunEngine(
+        adapter=MagicMock(),
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+    )
+    ledger = RunLedger(
+        run_id="run-policy-shadow",
+        session_id="session-policy-shadow",
+        turn_id="turn-1",
+        objective="Search ROKU separately and fetch sources",
+        allowed_tools=["web_search"],
+        ledger_mode="shadow",
+    )
+    ledger.set_control_policy(resolve_control_policy(ledger.objective, requested="plan_execute"))
+    ledger.lock_entities(["ROKU"])
+    ledger.set_source_contract({
+        "next_tool": "web_search",
+        "next_arguments": {"query": "ROKU stock news June 13 2026"},
+        "forbid_unlocked_entity_drift": True,
+    })
+    original = ToolCall(
+        "web_search",
+        {"query": "EPAM stock news June 13 2026"},
+        '{"tool":"web_search"}',
+    )
+
+    allowed, event = engine._gate_tool_call_with_ledger(
+        request=MagicMock(session_id="session-policy-shadow", agent_id="agent", owner_id="owner"),
+        run_id="run-policy-shadow",
+        ledger=ledger,
+        tool_call=original,
+        tool_turn=1,
+    )
+
+    assert allowed is original
+    assert event["type"] == "policy_violation"
+    assert event["ledger_mode"] == "shadow"
+    assert ledger.policy_violations[0]["recovery_policy"]["persist_continuation"] is True
 
 
 def test_continuation_gate_extends_related_additive_turn():
@@ -91,6 +208,26 @@ def test_fallback_tool_call_builds_url_and_search_arguments():
     assert fetch_call.arguments == {"url": "https://example.com/docs"}
     assert memory_call is not None
     assert memory_call.arguments == {"topic": "what did i say about my editor?"}
+
+
+def test_compile_web_search_query_removes_workflow_control_text():
+    query = compile_web_search_query(
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls that was found "
+        "one by one analyze report for each and write a tldr summary table."
+    )
+
+    assert query == "top 3 stocks today with major jumps"
+
+
+def test_fallback_web_search_does_not_fire_full_source_workflow_as_query():
+    call = fallback_tool_call(
+        "web_search",
+        "Search top 3 sushi places in Toronto, then search each, fetch 3 URLs each, and write a TLDR table.",
+    )
+
+    assert call is not None
+    assert call.arguments == {"query": "top 3 sushi places in Toronto"}
 
 
 def test_build_actor_request_content_includes_recent_result_previews():
@@ -1179,6 +1316,130 @@ def test_stock_source_workflow_locks_tickers_from_fetched_movers_table_not_noisy
     assert override["tickers"] == ["ROKU", "TBN", "SENEA"]
     assert override["argument_clues"]["web_search"] == "ROKU stock news June 13 2026"
     assert "EPAM" not in override["argument_clues"]["web_search"]
+
+
+def test_stock_source_workflow_locks_tickers_from_tradingview_compact_rows():
+    from run_engine.engine import _stock_source_workflow_override
+
+    objective = (
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls one by one."
+    )
+    tradingview_fetch = {
+        "tool_name": "web_fetch",
+        "success": True,
+        "arguments": {"url": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers/"},
+        "content": json.dumps({
+            "type": "web_fetch_result",
+            "url": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers",
+            "content": """
+US stocks that increased the most in price
+MEIMethode Electronics, Inc. D · +21.18%, 14.02 USD
+DOMODomo, Inc. D · +21.00%, 2.42 USD
+GEGGreat Elm Group, Inc. D · +19.43%, 2.09 USD
+""",
+        }),
+    }
+
+    override = _stock_source_workflow_override(
+        objective=objective,
+        allowed_tools=[{"name": "web_search"}, {"name": "web_fetch"}],
+        tool_results=[tradingview_fetch],
+    )
+
+    assert override["status"] == "partial"
+    assert override["selected_tools"] == ["web_search"]
+    assert override["tickers"] == ["MEI", "DOMO", "GEG"]
+    assert override["argument_clues"]["web_search"] == "MEI stock news June 13 2026"
+
+
+def test_stock_source_workflow_locks_tickers_from_real_tradingview_fetch_payload():
+    from run_engine.engine import _stock_source_workflow_override
+
+    objective = (
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls one by one."
+    )
+    tradingview_fetch = {
+        "tool_name": "web_fetch",
+        "success": True,
+        "arguments": {"url": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers"},
+        "content": json.dumps({
+            "type": "web_fetch_result",
+            "url": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers",
+            "final_url": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers/",
+            "host": "www.tradingview.com",
+            "backend": "httpx-html",
+            "content": """
+Top Gaining US Stocks — TradingView
+US stocks that increased the most in price
+Symbol Chg % Price Vol Rel vol Mkt cap P/E EPS dil TTM Sector Analyst rating
+LNKS Linkers Industries Limited
++67.50% 2.68 USD 69.88 M 51.24 4.75 M USD — −28.06 USD Electronic technology No rating
+CAST FreeCast, Inc.
++56.70% 8.07 USD 113.02 M 2.77 333.63 M USD Technology services Strong buy
+BFLY Butterfly Network, Inc.
++55.87% 8.90 USD 60.48 M 9.79 2.33 B USD Health technology Strong buy
+ATPC Agape ATP Corporation
++42.12% 3.88 USD 72.45 M
+""",
+            "truncated": True,
+            "total_length": 14899,
+            "title": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers",
+            "status_code": 200,
+        }),
+    }
+
+    override = _stock_source_workflow_override(
+        objective=objective,
+        allowed_tools=[{"name": "web_search"}, {"name": "web_fetch"}],
+        tool_results=[tradingview_fetch],
+    )
+
+    assert override["status"] == "partial"
+    assert override["selected_tools"] == ["web_search"]
+    assert override["tickers"] == ["LNKS", "CAST", "BFLY"]
+    assert override["argument_clues"]["web_search"] == "LNKS stock news June 13 2026"
+
+
+def test_stock_source_workflow_does_not_refetch_trailing_slash_movers_url():
+    from run_engine.engine import _stock_source_workflow_override
+
+    objective = (
+        "Search top 3 stocks today with major jumps web search those 3 stocks separately "
+        "and capture the 3 relevant for each results web fetch all 9 urls one by one."
+    )
+    search_result = {
+        "tool_name": "web_search",
+        "success": True,
+        "arguments": {"query": "top 3 stocks today with major jumps"},
+        "content": json.dumps({
+            "type": "web_search_results",
+            "results": [
+                {
+                    "title": "Top Gaining US Stocks - TradingView",
+                    "url": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers",
+                    "snippet": "MEIMethode Electronics, Inc. D · +21.18%",
+                }
+            ],
+        }),
+    }
+    fetched_result = {
+        "tool_name": "web_fetch",
+        "success": True,
+        "arguments": {"url": "https://www.tradingview.com/markets/stocks-usa/market-movers-gainers/"},
+        "content": "US stocks that increased the most in price\nMEIMethode Electronics, Inc. D · +21.18%\nDOMODomo, Inc. D · +21.00%\nGEGGreat Elm Group, Inc. D · +19.43%",
+    }
+
+    override = _stock_source_workflow_override(
+        objective=objective,
+        allowed_tools=[{"name": "web_search"}, {"name": "web_fetch"}],
+        tool_results=[search_result, fetched_result],
+    )
+
+    assert override["selected_tools"] == ["web_search"]
+    assert override["strategy"] == "Search MEI separately before fetching sources."
+    assert override["argument_clues"]["web_search"] == "MEI stock news June 13 2026"
 
 
 def test_stock_source_workflow_fetches_collected_urls_before_finalizing():

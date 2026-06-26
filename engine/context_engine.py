@@ -19,6 +19,7 @@ from llm.base_adapter import BaseLLMAdapter
 from llm.adapter_factory import create_adapter, strip_provider_prefix
 from engine.context_schema import ContextItem, ContextKind, ContextPhase
 from engine.fact_guard import is_grounded_fact_record
+from engine.context_hygiene import should_skip_memory_compression
 from config.config import cfg
 
 
@@ -100,10 +101,7 @@ class ContextEngine:
         self.adapter = adapter
 
     def is_trivial(self, user_message: str, assistant_response: str) -> bool:
-        return (
-            bool(TRIVIAL_PATTERN.match(user_message.strip()))
-            and len(assistant_response.strip()) < 40
-        )
+        return should_skip_memory_compression(user_message, assistant_response)
 
     def _clean_response(self, response: str) -> str:
         """Strip tool result blocks before compression — model needs prose only."""
@@ -127,8 +125,9 @@ class ContextEngine:
         Compress a new exchange into the existing context.
         Returns (updated_context_string, list_of_keyed_facts, list_of_voids).
         """
-        # Skip trivial exchanges — but never skip the first one
-        if not is_first_exchange and self.is_trivial(user_message, assistant_response):
+        # Skip low-value social turns even when the assistant was verbose. They
+        # do not carry durable user facts and should not poison context.
+        if self.is_trivial(user_message, assistant_response):
             return current_context, [], []
 
         use_model = model or self.compression_model
@@ -264,13 +263,35 @@ class ContextEngine:
             return current_context, [], []
 
         existing_lines = [l for l in current_context.split("\n") if l.strip()]
-        merged = existing_lines + new_lines
+        # Deterministic dedup BEFORE the line cap: each turn the compressor may
+        # re-extract an already-known fact (e.g. "User name is Vonny"). Appending
+        # blindly produced duplicate bullets that bloated context and forced an
+        # extra LLM recompression. Deduping here keeps the summary tight and cuts
+        # recompression frequency — no model call needed.
+        merged = self._dedupe_lines(existing_lines + new_lines)
 
         if len(merged) > MAX_CONTEXT_LINES:
             print(f"[ContextEngine] Context at {len(merged)} lines — recompressing...")
             merged = await self._recompress("\n".join(merged), use_model)
 
         return "\n".join(merged), keyed_facts, voids
+
+    @staticmethod
+    def _dedupe_lines(lines: list[str]) -> list[str]:
+        """Drop duplicate durable bullets, comparing on normalized content so
+        "- User name is Vonny" and "User name is Vonny." collapse to one. Keeps
+        the first occurrence to preserve the "First message" anchor's position."""
+        seen: set[str] = set()
+        out: list[str] = []
+        for line in lines:
+            if not str(line).strip():
+                continue
+            key = re.sub(r"[^a-z0-9]+", " ", str(line).lower()).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(line)
+        return out
 
     async def _recompress(self, context: str, model: str) -> list[str]:
         if ":" in model:

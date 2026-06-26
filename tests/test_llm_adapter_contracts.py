@@ -106,7 +106,11 @@ def test_api_provider_surfaces_include_nvidia(monkeypatch):
     assert health.json()["providers"]["nvidia"] is True
     assert models.status_code == 200
     assert models.json()["models"]["nvidia"] == ["nvidia-model"]
+    assert models.json()["capabilities"]["nvidia:nvidia-model"]["chat"] is True
+    assert "vision_model" in models.json()
     assert consumer_health.status_code == 200
     assert consumer_health.json()["providers"]["nvidia"] is True
     assert consumer_models.status_code == 200
     assert consumer_models.json()["models"]["nvidia"] == ["nvidia-model"]
+    assert consumer_models.json()["capabilities"]["nvidia:nvidia-model"]["chat"] is True
+    assert "vision_model" in consumer_models.json()

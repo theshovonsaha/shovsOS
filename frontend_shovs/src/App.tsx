@@ -14,10 +14,11 @@ import {
   MessageFileTile,
   PendingFileChip,
 } from './components/FilePreview';
-import type { Attachment } from './useAgent';
+import type { Attachment, MessageBlock } from './useAgent';
 import { ShovsView } from './components/ShovsView';
 import { TraceMonitor } from './components/TraceMonitor';
 import { VoiceControl } from './components/VoiceControl';
+import { WorkflowLabView } from './components/WorkflowLabView';
 
 const MAX_TOOL_SUMMARY_LENGTH = 84;
 const TRUNCATED_TOOL_SUMMARY_LENGTH = MAX_TOOL_SUMMARY_LENGTH - 3;
@@ -33,6 +34,7 @@ const TOOL_LABELS: Record<string, string> = {
   file_str_replace: 'Editing file',
   bash: 'Running command',
   generate_app: 'Building app',
+  image_generate: 'Generating image',
 };
 
 const truncateToolSummary = (content: string) => {
@@ -86,6 +88,14 @@ const summarizeToolContent = (
       payload.error ||
       payload.url ||
       `${payload.total_length || 0} chars loaded`;
+  } else if (payload?.type === 'image_generation_result') {
+    label = 'Image Ready';
+    summary = payload.url || payload.path || 'Generated image';
+    autoExpand = true;
+  } else if (payload?.type === 'image_generation_error') {
+    label = 'Image Failed';
+    summary = payload.error || 'Image generation failed';
+    autoExpand = true;
   } else if (payload && (payload.type === 'app_view' || payload.path)) {
     label = 'Preview Ready';
     summary = payload.title || payload.path || 'Interactive sandbox preview';
@@ -94,6 +104,140 @@ const summarizeToolContent = (
   }
 
   return { label, summary, autoExpand };
+};
+
+type ReceiptItem = {
+  id: string;
+  label: string;
+  detail: string;
+  status: 'done' | 'active' | 'warning';
+};
+
+const toolReceiptLabel = (tool?: string) =>
+  TOOL_LABELS[tool || ''] || (tool || 'tool').replace(/_/g, ' ');
+
+const buildRunReceipt = (blocks: MessageBlock[] = []): ReceiptItem[] => {
+  const items: ReceiptItem[] = [];
+  const completedTools = new Set(
+    blocks
+      .filter((block) => block.type === 'tool_result' || block.type === 'tool_error')
+      .map((block) => block.tool || 'unknown'),
+  );
+
+  const addOnce = (item: ReceiptItem) => {
+    if (!items.some((existing) => existing.label === item.label && existing.detail === item.detail)) {
+      items.push(item);
+    }
+  };
+
+  blocks.forEach((block) => {
+    if (block.type === 'tension_hint') {
+      addOnce({
+        id: `${block.id}-receipt`,
+        label: 'Checked the conversation state',
+        detail: 'Looked for changed assumptions before answering.',
+        status: 'done',
+      });
+      return;
+    }
+
+    if (block.type === 'plan') {
+      addOnce({
+        id: `${block.id}-receipt`,
+        label: 'Chose a working strategy',
+        detail: truncateToolSummary(block.content.replace(/\s+/g, ' ').trim()),
+        status: 'done',
+      });
+      return;
+    }
+
+    if (block.type === 'tool_call' && !completedTools.has(block.tool || 'unknown')) {
+      addOnce({
+        id: `${block.id}-receipt`,
+        label: `Started ${toolReceiptLabel(block.tool)}`,
+        detail: truncateToolSummary(block.content || 'Waiting for the tool result.'),
+        status: 'active',
+      });
+      return;
+    }
+
+    if (block.type === 'tool_result') {
+      const { summary } = summarizeToolContent('result', block.content);
+      addOnce({
+        id: `${block.id}-receipt`,
+        label: `Used ${toolReceiptLabel(block.tool)}`,
+        detail: summary || 'Result recorded.',
+        status: 'done',
+      });
+      return;
+    }
+
+    if (block.type === 'tool_error') {
+      const { summary } = summarizeToolContent('error', block.content);
+      addOnce({
+        id: `${block.id}-receipt`,
+        label: `${toolReceiptLabel(block.tool)} had a problem`,
+        detail: summary || 'Failure recorded for the trace.',
+        status: 'warning',
+      });
+      return;
+    }
+
+    if (block.type === 'compressing') {
+      addOnce({
+        id: `${block.id}-receipt`,
+        label: 'Compacted context',
+        detail: 'Reduced older context before continuing.',
+        status: 'done',
+      });
+    }
+  });
+
+  return items.slice(0, 7);
+};
+
+const RunReceipt = ({ blocks }: { blocks: MessageBlock[] }) => {
+  const items = useMemo(() => buildRunReceipt(blocks), [blocks]);
+  const [expanded, setExpanded] = useState(false);
+
+  if (!items.length) return null;
+
+  const warningCount = items.filter((item) => item.status === 'warning').length;
+  const activeCount = items.filter((item) => item.status === 'active').length;
+  const summary =
+    warningCount > 0
+      ? `${warningCount} issue${warningCount === 1 ? '' : 's'} recorded`
+      : activeCount > 0
+        ? `${activeCount} action${activeCount === 1 ? '' : 's'} still running`
+        : `${items.length} step${items.length === 1 ? '' : 's'} checked`;
+
+  return (
+    <section className={`shovs-run-receipt ${expanded ? 'expanded' : ''}`}>
+      <button
+        className='shovs-run-receipt-head'
+        onClick={() => setExpanded((prev) => !prev)}
+      >
+        <span>
+          <strong>How I got this answer</strong>
+          <small>{summary}</small>
+        </span>
+        <span>{expanded ? 'Hide' : 'Show'}</span>
+      </button>
+      {expanded ? (
+        <ol className='shovs-run-receipt-list'>
+          {items.map((item) => (
+            <li key={item.id} className={`shovs-run-receipt-item ${item.status}`}>
+              <span className='shovs-run-receipt-dot' />
+              <div>
+                <strong>{item.label}</strong>
+                <p>{item.detail || 'not recorded'}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </section>
+  );
 };
 
 const ToolEvent = ({
@@ -111,6 +255,11 @@ const ToolEvent = ({
   );
   const [expanded, setExpanded] = useState(autoExpand);
   const canExpand = Boolean(content);
+  const payload = useMemo(() => parseToolPayload(content), [content]);
+  const generatedImage =
+    payload?.type === 'image_generation_result' && typeof payload.url === 'string'
+      ? payload
+      : null;
 
   useEffect(() => {
     if (autoExpand) {
@@ -141,7 +290,23 @@ const ToolEvent = ({
       </div>
       {expanded && canExpand ? (
         <div className='shovs-tool-event-body'>
-          <RichContentViewer content={content || ''} />
+          {generatedImage ? (
+            <div className='shovs-generated-image-card'>
+              <img src={generatedImage.url} alt={generatedImage.prompt || 'Generated image'} />
+              <div>
+                <strong>{generatedImage.prompt || 'Generated image'}</strong>
+                <span>
+                  {generatedImage.model || 'image model'} · {generatedImage.size || 'size not recorded'} ·{' '}
+                  {generatedImage.bytes ? `${generatedImage.bytes} bytes` : 'bytes not recorded'}
+                </span>
+                <a href={generatedImage.url} target='_blank' rel='noreferrer'>
+                  Open image
+                </a>
+              </div>
+            </div>
+          ) : (
+            <RichContentViewer content={content || ''} />
+          )}
         </div>
       ) : null}
     </div>
@@ -220,13 +385,14 @@ function App() {
     'none' | 'sessions' | 'options'
   >('none');
   const [workspaceView, setWorkspaceView] = useState<
-    'chat' | 'capabilities' | 'monitor' | 'memory' | 'harness'
+    'chat' | 'capabilities' | 'monitor' | 'memory' | 'harness' | 'workflow'
   >(() => {
     const saved = localStorage.getItem('shovs_workspace_view');
     return saved === 'capabilities' ||
       saved === 'monitor' ||
       saved === 'memory' ||
-      saved === 'harness'
+      saved === 'harness' ||
+      saved === 'workflow'
       ? saved
       : 'chat';
   });
@@ -331,6 +497,19 @@ function App() {
   const globalOnlyTools = agent.tools.filter(
     (tool) => !allowedToolNames.has(tool.name),
   );
+  const hasAttachedImages = agent.pendingFiles.some((item) =>
+    item.file.type.startsWith('image/'),
+  );
+  const activeModelCapability = agent.modelCapabilities?.[agent.currentModel];
+  const selectedModelCanSeeImages = Boolean(activeModelCapability?.vision);
+  const visionHint =
+    hasAttachedImages && !selectedModelCanSeeImages
+      ? agent.visionModel
+        ? `Images will route to ${agent.visionModel}`
+        : 'Select a vision model for image input'
+      : hasAttachedImages
+        ? 'Vision input ready'
+        : '';
 
   if (!agent.activeAgentId) {
     return (
@@ -485,6 +664,12 @@ function App() {
             onClick={() => setWorkspaceView('harness')}
           >
             Harness
+          </button>
+          <button
+            className={workspaceView === 'workflow' ? 'active' : ''}
+            onClick={() => setWorkspaceView('workflow')}
+          >
+            Workflows
           </button>
           <button
             className={workspaceView === 'memory' ? 'active' : ''}
@@ -656,6 +841,8 @@ function App() {
             />
           ) : workspaceView === 'harness' ? (
             <HarnessLabView />
+          ) : workspaceView === 'workflow' ? (
+            <WorkflowLabView />
           ) : (
             <>
               <section
@@ -752,6 +939,10 @@ function App() {
                             {message.role === 'user' &&
                             !message.blocks?.length ? (
                               <RichContentViewer content={message.content} />
+                            ) : null}
+
+                            {message.role === 'assistant' ? (
+                              <RunReceipt blocks={message.blocks || []} />
                             ) : null}
 
                             {message.blocks?.map((block) => {
@@ -999,6 +1190,17 @@ function App() {
 
                 <div className='shovs-composer-foot'>
                   <span>Enter to send · Shift+Enter for new line</span>
+                  {visionHint ? (
+                    <span
+                      className={
+                        selectedModelCanSeeImages || agent.visionModel
+                          ? 'shovs-composer-signal'
+                          : 'shovs-composer-signal warning'
+                      }
+                    >
+                      {visionHint}
+                    </span>
+                  ) : null}
                   <span>
                     Context{' '}
                     {agent.contextLines > 0

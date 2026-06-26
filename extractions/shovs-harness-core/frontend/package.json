@@ -1,0 +1,13 @@
+{
+  "name": "shovs-harness-core-demo",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "../../../frontend_consumer/node_modules/.bin/vite --host 0.0.0.0",
+    "build": "../../../frontend_consumer/node_modules/.bin/tsc -b && ../../../frontend_consumer/node_modules/.bin/vite build",
+    "preview": "../../../frontend_consumer/node_modules/.bin/vite preview --host 0.0.0.0"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}

@@ -144,6 +144,26 @@ export interface Message {
     _pendingStructured?: string;
 }
 
+export interface ModelCapability {
+    model: string;
+    chat: boolean;
+    embed: boolean;
+    vision: boolean;
+    reasoning: boolean;
+    class: string;
+}
+
+interface RuntimeHealth {
+    status: string;
+    runtime?: string;
+    ollama?: boolean;
+    tool_count?: number;
+    tools?: Record<string, boolean>;
+    features?: Record<string, boolean>;
+    models?: Record<string, string>;
+    requirements?: Record<string, string>;
+}
+
 interface SessionTraceEvent {
     id: string;
     event_type: string;
@@ -316,9 +336,11 @@ const buildAssistantBlockGroupsFromTrace = (events: SessionTraceEvent[]): Messag
 };
 
 export function useAgent() {
-    const [health, setHealth] = useState<{ status: string; ollama: boolean }>({ status: 'connecting...', ollama: false });
+    const [health, setHealth] = useState<RuntimeHealth>({ status: 'connecting...', ollama: false });
     const [models, setModels] = useState<Record<string, string[]>>({ ollama: ['llama3.2'] });
     const [embedModels, setEmbedModels] = useState<Record<string, string[]>>({ 'ollama': ['nomic-embed-text'] });
+    const [modelCapabilities, setModelCapabilities] = useState<Record<string, ModelCapability>>({});
+    const [visionModel, setVisionModel] = useState<string>('');
     const [tools, setTools] = useState<any[]>([]);
     const [activeAgentProfile, setActiveAgentProfile] = useState<AgentSettingsProfile | null>(null);
     const [sessions, setSessions] = useState<Session[]>([]);
@@ -481,7 +503,7 @@ export function useAgent() {
 
     const fetchHealth = async () => {
         try {
-            const data = await fetch('/api/health').then(r => r.json());
+            const data = await fetch('/api/runtime/health').then(r => r.json());
             setHealth(data);
         } catch { setHealth({ status: 'error', ollama: false }); }
     };
@@ -491,6 +513,10 @@ export function useAgent() {
             const data = await fetch('/api/models').then(r => r.json());
             if (data.models) {
                 setModels(data.models);
+                if (data.capabilities && typeof data.capabilities === 'object') {
+                    setModelCapabilities(data.capabilities);
+                }
+                setVisionModel(typeof data.vision_model === 'string' ? data.vision_model : '');
                 const available = new Set<string>();
                 const providers = Object.keys(data.models);
                 for (const p of providers) {
@@ -1298,6 +1324,7 @@ export function useAgent() {
 
     return {
         health, models, tools, sessions, currentSessionId,
+        modelCapabilities, visionModel,
         activeAgentId, setActiveAgentId,
         activeAgentProfile,
         currentModel, setCurrentModel,

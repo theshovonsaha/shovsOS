@@ -37,7 +37,30 @@ This happens inside one run. It is not a default multi-agent swarm. The runtime 
 - run evals
 - trace events tied to runs
 
-### 4. Memory and State
+### 4. Workflow Contracts
+
+- deterministic task-shape classification for simple chat, source collection, coding, research, and memory-correction-style turns
+- source-collection contracts with entity quotas, per-entity source requirements, fetch requirements, tool policy, and completion gates
+- contract snapshots persisted through the run ledger
+- contract state visible in phase packets and runtime attention
+
+### 5. Agent Pass Framework
+
+- workflow contracts map to typed specialist passes rather than one large prompt
+- pass roles include retrieval, reasoning, summary, scoring, evaluation, and orchestration
+- context strategies distinguish direct response, local retrieval, chunk-wise analysis, global reasoning, deterministic ranking, scenario-state evals, and completion gates
+- pass graphs are stored in the run ledger so the UI and tests can inspect the intended workflow structure
+- pass graph execution state tracks node status, dependencies, attempts, outputs, and graph completion
+
+### 6. Runtime Attention
+
+- deterministic phase-weighted scoring over run ledger records
+- separate heads for objective, pending work, tool state, evidence, verification, memory, continuation, and risk
+- workflow contract and pass graph records included as high-signal state
+- attention snapshots included in phase packets and traces
+- designed to make context selection inspectable without modifying model internals
+
+### 7. Memory and State
 
 - deterministic facts
 - candidate signal lane
@@ -48,7 +71,7 @@ This happens inside one run. It is not a default multi-agent swarm. The runtime 
 - session RAG
 - task tracking
 
-### 5. State Integrity
+### 8. State Integrity
 
 - grounded fact filtering
 - failed-turn preservation
@@ -57,18 +80,22 @@ This happens inside one run. It is not a default multi-agent swarm. The runtime 
 - prompt overflow retry for local models
 - cumulative evidence retention across a run so verified exact-domain fetches survive later noisy searches
 - source-contract workflow guards for entity/source collection tasks
+- ledger-enforced source gates for opt-in runs: wrong next tools, unlocked-entity searches, and off-contract fetches are detected before execution
+- completion gates that mark source workflows incomplete until required evidence is present
 - scenario-state evals that catch wrong tool paths even when final text sounds plausible
 
-### 6. Tool and Evidence Discipline
+### 9. Tool and Evidence Discipline
 
 - hidden tool-call draft parsing before UI emission
 - unknown tool rejection before execution
 - duplicate tool-call suppression
+- ledger-authority source selection in managed runs, so deterministic source tools use successful prior tool results instead of model-supplied payloads
 - deterministic pivoting when a workflow contract knows the next required action
+- policy violation and recovery events for drift, duplicate loops, missing evidence, failed fetches, and unsupported response claims
 - side-effect guard for unsupported file/write claims
 - `HARD_FAILURE` status when write tools cannot verify expected outputs
 
-### 7. Provider Layer
+### 10. Provider Layer
 
 Supported providers:
 
@@ -82,20 +109,20 @@ Supported providers:
 - Gemini
 - Nvidia
 
-### 8. Model-Aware Runtime Shaping
+### 11. Model-Aware Runtime Shaping
 
 - execution profiles for small local, local standard, and frontier-class models
 - adaptive prompt budgets
 - adaptive evidence packet sizing
 - smaller acting surfaces for weaker local models
 
-### 9. Memory and Embedding Compatibility
+### 12. Memory and Embedding Compatibility
 
 - runtime embed-model propagation into memory tools
 - Ollama embedding compatibility across `/api/embed` and legacy `/api/embeddings`
 - OpenAI-compatible embedding transport for LM Studio, llama.cpp, and local OpenAI servers
 
-### 10. Frontend Planes
+### 13. Frontend Planes
 
 - Shovs Platform workspace
 - consumer frontend
@@ -107,6 +134,8 @@ Shovs Platform already includes:
 - planner toggle
 - reasoning visibility
 - Harness Lab for comparing plain model behavior against Shovs runtime wedges
+- Harness Lab policy comparison across plain model, model + tools, Shovs ReAct, Shovs Plan-Execute, and Shovs Graph Harness
+- Trace Monitor lanes for Policy, Graph, and Recovery events
 - readable monitor
 - trace replay
 - run eval display
@@ -162,7 +191,44 @@ This is much better than before, but still one of the main practical gaps for lo
 
 ### 6. Richer Monitor Lanes
 
-The monitor is much more readable now, but source contracts, missing slots, continuation state, and eval failures can still be surfaced more clearly.
+The monitor is much more readable now, but source contracts, missing slots, continuation state, workflow plugin decisions, and eval failures can still be surfaced more clearly.
+
+### Workflow Plugins
+
+ShovsOS now routes domain-specific source-collection behavior through workflow plugins instead of adding one-off branches directly inside the run loop.
+
+Current plugins:
+
+- `stock_movers_source_collection`: locks stock tickers from a mover source, then enforces separate searches and fetched-source quotas.
+- `local_place_source_collection`: locks places from search results, then enforces separate searches and fetched-source quotas.
+- `comparison_source_collection`: locks compared items/products/options, then enforces per-entity evidence collection.
+
+This is the pattern for future niches: shopping comparison, local-store checks, restaurant research, paper triage, or enterprise evidence collection can each become a plugin while the engine keeps the same contract, ledger, trace, and verification rules.
+
+### Control Policies
+
+The managed runtime now resolves an explicit control policy per run.
+
+- `react` for lightweight reason-act-observe tasks.
+- `plan_observe` for the existing planner/actor/observer compatibility loop.
+- `plan_execute` for web/source workflows where untrusted page content should not rewrite the task.
+- `graph_harness` for coding, higher-risk, or long-horizon workflows with typed pass graphs.
+
+This lets ShovsOS compare and compose agent architectures instead of betting the whole system on one loop style.
+
+Harness Lab now exposes those policy differences directly. It returns each mode's control policy, ledger mode, trace summary, state-eval score, policy-trace score, and issues, so the UI can show why one run drifted and another passed.
+
+### Context Ladder
+
+Phase packets now include a compact context ladder:
+
+- keyword hint
+- compact memory signal
+- relevant block
+- evidence reference
+- raw payload reference
+
+This keeps actor context smaller and more inspectable. Raw payloads stay available for verifier and UI inspection instead of being dumped into every model turn.
 
 ### 7. Active Workspace Builder Controls
 

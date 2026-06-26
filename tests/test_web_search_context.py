@@ -6,6 +6,7 @@ from plugins.tool_registry import ToolRegistry
 from plugins.tools import (
     _format_search_results,
     _normalize_search_results,
+    _source_collect,
     _source_contract,
     _source_coverage,
     _source_next_action,
@@ -61,6 +62,23 @@ async def test_source_contract_extracts_multi_entity_fetch_workflow():
 
 
 @pytest.mark.asyncio
+async def test_source_contract_treats_fetch_urls_each_as_per_entity_quota():
+    raw = await _source_contract(
+        "top 3 sushi places in toronto, then search each, fetch 3 URLs each to get intel",
+        entities=["The Best Sushi in Toronto: Top 17 Sushi Restaurants for 202..."],
+        topic="sushi restaurants in Toronto",
+    )
+    payload = json.loads(raw)
+
+    assert payload["contract"]["entity_count"] == 3
+    assert payload["contract"]["results_per_entity"] == 3
+    assert payload["contract"]["total_fetches"] == 9
+    assert payload["locked_entities"] == []
+    assert payload["missing_slots"] == ["locked_entities"]
+    assert payload["rejected_entities"] == ["The Best Sushi in Toronto: Top 17 Sushi Restaurants for 202..."]
+
+
+@pytest.mark.asyncio
 async def test_source_select_groups_urls_by_locked_entities_and_dedupes():
     search_payloads = [
         {
@@ -87,6 +105,71 @@ async def test_source_select_groups_urls_by_locked_entities_and_dedupes():
     assert len(payload["selected_by_entity"]["ROKU"]) == 2
     assert payload["coverage"]["missing_entities"] == ["TBN"]
     assert payload["selected_urls"].count("https://news.example/roku-1") == 1
+
+
+@pytest.mark.asyncio
+async def test_source_select_rejects_raw_payloads_in_ledger_authority_mode():
+    payload = json.loads(await _source_select(
+        search_payloads=[{
+            "query": "top sushi toronto",
+            "results": [{"title": "Fake", "url": "https://www.example.com/fake"}],
+        }],
+        per_entity=3,
+        _ledger_authority=True,
+        _ledger_tool_results=[],
+    ))
+
+    assert payload["success"] is False
+    assert payload["status"] == "rejected_untrusted_payload"
+    assert payload["selected_urls"] == []
+
+
+@pytest.mark.asyncio
+async def test_source_select_resolves_ledger_tool_result_ids():
+    payload = json.loads(await _source_select(
+        tool_result_ids=["result_search_1"],
+        entities=["Miku"],
+        per_entity=1,
+        _ledger_authority=True,
+        _ledger_tool_results=[
+            {
+                "tool_name": "web_search",
+                "success": True,
+                "tool_result_id": "result_search_1",
+                "arguments": {"query": "Miku sushi Toronto"},
+                "content": json.dumps({
+                    "type": "web_search_results",
+                    "query": "Miku sushi Toronto",
+                    "results": [
+                        {"title": "Miku review", "url": "https://reviews.example/miku", "host": "reviews.example"}
+                    ],
+                }),
+            }
+        ],
+    ))
+
+    assert payload["success"] is True
+    assert payload["selected_by_entity"]["Miku"][0]["url"] == "https://reviews.example/miku"
+
+
+@pytest.mark.asyncio
+async def test_source_select_rejects_truncated_display_urls():
+    payload = json.loads(await _source_select(
+        search_payloads=[
+            {
+                "query": "ROKU stock news June 13 2026",
+                "results": [
+                    {"title": "Broken", "url": "https://fi...", "host": "fi..."},
+                    {"title": "Good", "url": "https://news.example/roku", "host": "news.example"},
+                ],
+            }
+        ],
+        entities=["ROKU"],
+        per_entity=1,
+    ))
+
+    assert payload["success"] is True
+    assert payload["selected_urls"] == ["https://news.example/roku"]
 
 
 @pytest.mark.asyncio
@@ -128,10 +211,27 @@ async def test_source_next_action_moves_from_search_to_fetch_to_finalize():
     assert done["status"] == "finalize"
 
 
+@pytest.mark.asyncio
+async def test_source_next_action_does_not_fetch_invalid_selected_url():
+    payload = json.loads(await _source_next_action(
+        "Search top 3 stocks and fetch 3 URLs each.",
+        contract={"entity_count": 1, "results_per_entity": 1, "total_fetches": 1},
+        entities=["ROKU"],
+        searched_queries=["ROKU stock news"],
+        selected_urls=["https://fi..."],
+        fetched_urls=[],
+        topic="stock news",
+    ))
+
+    assert payload["status"] == "missing_input"
+    assert payload["next_tool"] == "source_select"
+
+
 def test_kernel_source_tools_register_by_name():
     registry = ToolRegistry()
-    register_tools(registry, "source_contract", "source_select", "source_next_action", "web_fetch_batch", "source_coverage")
+    register_tools(registry, "source_collect", "source_contract", "source_select", "source_next_action", "web_fetch_batch", "source_coverage")
 
+    assert registry.get("source_collect") is not None
     assert registry.get("source_contract") is not None
     assert registry.get("source_select") is not None
     assert registry.get("source_next_action") is not None
@@ -182,6 +282,114 @@ async def test_web_fetch_batch_compacts_multiple_urls(monkeypatch):
     assert payload["fetched_count"] == 2
     assert payload["failed_count"] == 0
     assert payload["fetched_sources"][0]["content_excerpt"].startswith("Full content")
+
+
+@pytest.mark.asyncio
+async def test_web_fetch_batch_skips_invalid_display_urls(monkeypatch):
+    calls = []
+
+    async def fake_fetch(url: str, max_chars: int = 8000, use_jina: bool = True):
+        calls.append(url)
+        return json.dumps({
+            "type": "web_fetch_result",
+            "url": url,
+            "final_url": url,
+            "host": url.split("/")[2],
+            "backend": "fake",
+            "content": "ok " * 100,
+            "truncated": False,
+            "total_length": 300,
+            "title": url,
+            "status_code": 200,
+        })
+
+    monkeypatch.setattr("plugins.tools._web_fetch", fake_fetch)
+
+    payload = json.loads(await _web_fetch_batch(["https://fi...", "https://news.example/roku"]))
+
+    assert calls == ["https://news.example/roku"]
+    assert payload["attempted_count"] == 1
+    assert payload["fetched_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_source_collect_compiles_fetch_queue_and_blocks_answer_until_complete():
+    search_payloads = [
+        {
+            "query": "ROKU stock news June 13 2026",
+            "results": [
+                {"title": "Roku 1", "url": "https://news.example/roku-1", "host": "news.example"},
+                {"title": "Roku 2", "url": "https://analysis.example/roku-2", "host": "analysis.example"},
+            ],
+        },
+        {
+            "query": "TBN stock news June 13 2026",
+            "results": [
+                {"title": "TBN 1", "url": "https://news.example/tbn-1", "host": "news.example"},
+                {"title": "TBN 2", "url": "https://analysis.example/tbn-2", "host": "analysis.example"},
+            ],
+        },
+    ]
+
+    payload = json.loads(await _source_collect(
+        "Search top 2 stocks separately, capture 2 relevant URLs for each, fetch all 4 URLs.",
+        entities=["ROKU", "TBN"],
+        topic="stock news June 13 2026",
+        search_payloads=search_payloads,
+        fetched_urls=["https://news.example/roku-1"],
+    ))
+
+    assert payload["type"] == "source_collect"
+    assert payload["answer_allowed"] is False
+    assert payload["coverage"]["observed"]["selected_urls"] == 4
+    assert payload["coverage"]["observed"]["fetched_urls"] == 1
+    assert payload["next_action"]["next_tool"] == "web_fetch_batch"
+    assert payload["next_action"]["arguments"]["urls"] == [
+        "https://analysis.example/roku-2",
+        "https://news.example/tbn-1",
+        "https://analysis.example/tbn-2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_source_collect_allows_answer_after_required_fetch_coverage():
+    selected_payload = {
+        "selected_by_entity": {
+            "ROKU": [{"url": "https://news.example/roku-1"}],
+            "TBN": [{"url": "https://news.example/tbn-1"}],
+        },
+        "selected_urls": ["https://news.example/roku-1", "https://news.example/tbn-1"],
+    }
+
+    payload = json.loads(await _source_collect(
+        "Search top 2 stocks separately, capture 1 URL for each, fetch all 2 URLs.",
+        entities=["ROKU", "TBN"],
+        selected_payload=selected_payload,
+        fetched_urls=["https://news.example/roku-1", "https://news.example/tbn-1"],
+    ))
+
+    assert payload["answer_allowed"] is True
+    assert payload["status"] == "complete"
+    assert payload["next_action"]["status"] == "finalize"
+    assert payload["missing_slots"] == []
+
+
+@pytest.mark.asyncio
+async def test_source_collect_rejects_raw_payloads_in_ledger_authority_mode():
+    payload = json.loads(await _source_collect(
+        "Search top 1 sushi place and fetch 1 URL.",
+        entities=["Miku"],
+        search_payloads=[{
+            "query": "Miku sushi Toronto",
+            "results": [{"title": "Fake", "url": "https://example.com/fake"}],
+        }],
+        _ledger_authority=True,
+        _ledger_tool_results=[],
+    ))
+
+    assert payload["success"] is False
+    assert payload["selected_payload"]["status"] == "rejected_untrusted_payload"
+    assert payload["answer_allowed"] is False
 
 
 @pytest.mark.asyncio

@@ -48,6 +48,17 @@ def is_small_or_local_model(model: str, profile: str = "") -> bool:
     return False
 
 
+_THINK_BLOCK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.IGNORECASE | re.DOTALL)
+# Tag-wrapped tool calls emitted as text by reasoning models that the runtime
+# never executed, e.g. gpt-oss `<tool_code>{...}</tool_code>` or
+# `<tool_call>{...}</tool_call>`. These must never be shown as the answer.
+_TOOL_TAG_BLOCK_RE = re.compile(
+    r"<(tool_code|tool_call|tool_use|function_call)>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_TOOL_JSON_KEYS = ("tool_use", "tool_calls", "tool_call", "tool_name", "function")
+
+
 def _loads_json_object(text: str) -> dict[str, Any]:
     raw = str(text or "").strip()
     if not raw.startswith("{") or not raw.endswith("}"):
@@ -57,6 +68,34 @@ def _loads_json_object(text: str) -> dict[str, Any]:
     except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _extract_embedded_json_object(text: str) -> tuple[str, dict[str, Any]]:
+    """Find a top-level JSON object embedded inside prose.
+
+    Reasoning models (e.g. qwen3 thinking mode) sometimes emit a final answer
+    that is prose/CoT followed by a literal tool-call blob like
+    ``{"thought": "...", "tool_use": {"function": "store_memory", ...}}``. The
+    whole text is not valid JSON, so ``_loads_json_object`` misses it. This
+    isolates the ``{...}`` span and parses it so the guard can strip it.
+    """
+    s = str(text or "")
+    start = s.find("{")
+    end = s.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return "", {}
+    candidate = s[start:end + 1]
+    try:
+        parsed = json.loads(candidate)
+    except Exception:
+        return "", {}
+    return candidate, (parsed if isinstance(parsed, dict) else {})
+
+
+def _looks_like_embedded_tool_json(parsed: dict[str, Any]) -> bool:
+    if not parsed:
+        return False
+    return any(key in parsed for key in _TOOL_JSON_KEYS)
 
 
 def looks_like_tool_json(text: str) -> bool:
@@ -145,12 +184,44 @@ def guard_final_response(
     replacement_used = False
     strict_mode = is_small_or_local_model(model, model_profile) if strict is None else bool(strict)
 
+    # 1) Strip leaked reasoning blocks (qwen/deepseek thinking mode etc.) and
+    #    tag-wrapped tool calls the runtime never executed (gpt-oss
+    #    <tool_code>...). These must never reach the user as the final answer.
+    lowered_clean = clean.lower()
+    if "<think" in lowered_clean:
+        stripped_think = _THINK_BLOCK_RE.sub("", clean).strip()
+        if stripped_think != clean:
+            issues.append("leaked_reasoning_block")
+            clean = stripped_think
+            changed = True
+    if any(tag in clean.lower() for tag in ("<tool_code", "<tool_call", "<tool_use", "<function_call")):
+        stripped_tool_tag = _TOOL_TAG_BLOCK_RE.sub("", clean).strip()
+        if stripped_tool_tag != clean:
+            issues.append("leaked_tool_call_tag")
+            clean = stripped_tool_tag
+            changed = True
+
     if looks_like_tool_json(clean):
         issues.append("tool_json_final_response")
         fallback = _fallback_from_tool_json(clean, user_message=user_message)
         clean = fallback or ""
         changed = True
         replacement_used = True
+    else:
+        # 2) A tool-call blob leaked at the end of an otherwise-prose answer
+        #    (e.g. reasoning followed by {"tool_use": {"function": ...}}). Remove
+        #    the blob from the visible text; if nothing meaningful remains, fall
+        #    back so the raw JSON is never shown.
+        embedded_json, embedded = _extract_embedded_json_object(clean)
+        if embedded_json and _looks_like_embedded_tool_json(embedded):
+            prose = clean.replace(embedded_json, "").strip()
+            issues.append("embedded_tool_json")
+            changed = True
+            if prose:
+                clean = prose
+            else:
+                clean = _fallback_from_tool_json(embedded_json, user_message=user_message) or ""
+                replacement_used = True
 
     query_allows_architecture = any(term in str(user_message or "").lower() for term in _ARCHITECTURE_QUERY_TERMS)
     if clean and (strict_mode or not query_allows_architecture) and not query_allows_architecture:
