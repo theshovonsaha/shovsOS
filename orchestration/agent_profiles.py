@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 from config.config import cfg
 from orchestration.workflow_templates import get_workflow_template
 
-DB_PATH = "agents.db"
+DB_PATH = cfg.AGENTS_DB
 DEFAULT_RUNTIME_KIND = "managed"
 RUNTIME_KIND_ALIASES = {
     "managed": "managed",
@@ -165,11 +165,12 @@ class AgentProfile(BaseModel):
 
 class ProfileManager:
     def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
+        self.db_path = str(Path(db_path).expanduser().resolve())
         self._init_db()
         self._ensure_default_agent()
 
     def _init_db(self):
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS agent_profiles (
@@ -456,7 +457,7 @@ class ProfileManager:
 
         bootstrap_max_chars = max(1000, min(20000, int(p.bootstrap_max_chars or 8000)))
         default_loop_mode = str(p.default_loop_mode or "auto").strip().lower()
-        if default_loop_mode not in {"auto", "single", "managed"}:
+        if default_loop_mode not in {"auto", "single", "managed", "kernel"}:
             default_loop_mode = "auto"
         default_context_mode = str(p.default_context_mode or "v2").strip().lower()
         if default_context_mode not in {"v1", "v2", "v3"}:

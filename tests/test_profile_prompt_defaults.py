@@ -124,3 +124,20 @@ def test_profile_runtime_defaults_and_bootstrap_are_sanitized(tmp_path):
     assert stored.default_loop_mode == "auto"
     assert stored.default_context_mode == "v2"
     assert stored.default_use_planner is False
+
+
+def test_profile_kernel_loop_mode_is_allowed(tmp_path):
+    db_path = tmp_path / "agents.db"
+    pm = ProfileManager(db_path=str(db_path))
+    profile = AgentProfile(
+        id="kernel_loop_test",
+        name="Kernel Loop Test",
+        tools=["web_search", "web_fetch"],
+        default_loop_mode="kernel",
+    )
+    pm.create(profile)
+
+    stored = pm.get("kernel_loop_test")
+
+    assert stored is not None
+    assert stored.default_loop_mode == "kernel"

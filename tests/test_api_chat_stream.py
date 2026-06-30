@@ -84,7 +84,32 @@ def test_api_prefixed_chat_stream_reaches_run_engine(monkeypatch):
     assert "api-prefixed" in response.text
 
 
-def test_runtime_health_reports_frontend_relevant_features():
+def test_runtime_health_reports_frontend_relevant_features(monkeypatch):
+    async def fake_docker_status():
+        return {"configured": False, "available": False, "message": "Docker disabled for test"}
+
+    async def fake_local_status(name, base_url, path="/"):
+        return {
+            "configured": bool(base_url),
+            "available": False,
+            "base_url": base_url,
+            "message": f"{name} not running for test",
+        }
+
+    monkeypatch.setattr("api.main._docker_runtime_status", fake_docker_status)
+    monkeypatch.setattr("api.main._local_service_status", fake_local_status)
+    monkeypatch.setattr(
+        "api.main._voice_runtime_status",
+        lambda: {
+            "websocket_paths": ["/ws/voice", "/api/ws/voice"],
+            "stt_available": False,
+            "tts_available": False,
+            "stt_backends": [],
+            "tts_backends": [],
+            "message": "voice unavailable for test",
+        },
+    )
+
     client = TestClient(app)
 
     response = client.get("/api/runtime/health")
@@ -96,6 +121,11 @@ def test_runtime_health_reports_frontend_relevant_features():
     assert payload["tools"]["image_generate"] is True
     assert payload["features"]["harness_lab"] is True
     assert payload["features"]["api_prefix_compatibility"] is True
+    assert payload["features"]["voice_io"] is True
+    assert payload["optional_services"]["docker_sandbox"]["available"] is False
+    assert "/api/ws/voice" in payload["optional_services"]["voice"]["websocket_paths"]
+    assert payload["requirements"]["bash_tool"] == "Docker disabled for test"
+    assert payload["requirements"]["voice"] == "voice unavailable for test"
 
 
 def test_chat_stream_ignores_unknown_runtime_path_field(monkeypatch):

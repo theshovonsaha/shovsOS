@@ -11,7 +11,8 @@ Checks:
   - Provider API keys (at least one provider available)
   - Ollama reachable (if OLLAMA_BASE_URL set)
   - Writable DB / chroma / logs paths
-  - All 5 LLM adapters import
+  - LLM adapters import
+  - Optional local services (Docker, SearXNG, llama.cpp)
   - Skill loader works and finds the platform skills
   - Context governor resolves to the unified V3 engine
 """
@@ -19,7 +20,10 @@ from __future__ import annotations
 
 import importlib
 import os
+import shutil
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,6 +87,56 @@ def check_ollama() -> None:
         report(WARN, "Ollama reachable", f"{url} returned {resp.status}")
     except Exception as e:
         report(WARN, "Ollama reachable", f"{url} unreachable ({type(e).__name__})")
+
+
+def _http_probe(url: str, timeout: float = 1.0) -> tuple[bool, str]:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "shovs-doctor/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= int(resp.status) < 500, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return int(exc.code) < 500, f"HTTP {exc.code}"
+    except Exception as exc:
+        return False, type(exc).__name__
+
+
+def check_docker() -> None:
+    if os.getenv("DOCKER_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        report(WARN, "Docker sandbox", "disabled by DOCKER_DISABLED=true; bash tool returns typed denial")
+        return
+    if not shutil.which("docker"):
+        report(WARN, "Docker sandbox", "docker CLI not found; app can still run with npm run dev:local")
+        return
+    try:
+        import docker
+
+        client = docker.from_env()
+        client.ping()
+        report(PASS, "Docker sandbox", "daemon reachable")
+    except Exception as exc:
+        report(WARN, "Docker sandbox", f"daemon not reachable ({type(exc).__name__}); use npm run dev:local")
+
+
+def check_searxng() -> None:
+    url = os.getenv("SEARXNG_URL", "").strip()
+    if not url:
+        report(WARN, "SearXNG local search", "SEARXNG_URL not set; web_search will use configured external fallbacks")
+        return
+    ok, detail = _http_probe(url.rstrip("/") + "/", timeout=1.0)
+    report(PASS if ok else WARN, "SearXNG local search", f"{url} ({detail})")
+
+
+def check_llamacpp() -> None:
+    binary = shutil.which("llama-server")
+    base_url = os.getenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8080/v1")
+    if not binary:
+        report(WARN, "llama.cpp server", "llama-server not found in PATH")
+        return
+    ok, detail = _http_probe(base_url.rstrip("/") + "/models", timeout=1.0)
+    if ok:
+        report(PASS, "llama.cpp server", f"{base_url} ({detail})")
+        return
+    report(WARN, "llama.cpp server", f"binary installed at {binary}, server not reachable at {base_url} ({detail})")
 
 
 def check_paths() -> None:
@@ -157,6 +211,9 @@ def main() -> int:
     check_python()
     check_provider_keys()
     check_ollama()
+    check_docker()
+    check_searxng()
+    check_llamacpp()
     check_paths()
     check_adapters()
     check_skills()

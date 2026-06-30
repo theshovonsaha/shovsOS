@@ -15,6 +15,7 @@ flowchart LR
     H --> CP["Control policy"]
     H --> G["Pass graph"]
     H --> A["Runtime attention"]
+    H --> K["Language kernel snapshot"]
     H --> T["Tool registry"]
     H --> E["Evidence lane"]
     H --> M["Memory"]
@@ -26,7 +27,8 @@ flowchart LR
     WP --> G
     CP --> G
     G --> A
-    A --> C
+    A --> K
+    K --> C
     C --> Model
     Model --> T
     T --> L
@@ -43,6 +45,7 @@ flowchart LR
 - Selects a control policy per run: ReAct, plan-act-observe, plan-then-execute, or structured graph harness.
 - Maps workflow contracts to specialist pass graphs with explicit roles and stop conditions.
 - Scores ledger records by phase so context is weighted before the model sees it.
+- Composes a language-kernel snapshot: prompt contract, context ladder, tool gate, memory immune report, experience graph, proxy-state eval, micro-agent jobs, and UI run map.
 - Builds phase packets from that ledger instead of passing loose prompt text around.
 - Validates plan-execute tool calls against locked entities, source contracts, and next required actions.
 - Blocks or replaces invalid calls in `ledger_enforced` mode while recording violations in `shadow` mode.
@@ -52,6 +55,26 @@ flowchart LR
 - Stops final answers from claiming tool work that is not in the ledger.
 - Stores memory with provenance and rollback behavior.
 - Produces traces that can be replayed by tests and inspected by the UI.
+
+## Smallest Live Harness
+
+The smallest standalone version lives in
+[`extractions/shovs-harness-core`](extractions/shovs-harness-core). Use it when
+you want to test the core idea without the full ShovsOS app:
+
+```bash
+venv/bin/python extractions/shovs-harness-core/scripts/check_setup.py
+extractions/shovs-harness-core/scripts/run_live_app.sh
+```
+
+It runs a local JSON backend on `127.0.0.1:8091` and a Vite frontend on
+`127.0.0.1:5177`. The backend exposes the extracted extension contract and can
+probe a local llama.cpp server when `LLAMACPP_BASE_URL` is set.
+
+For local llama.cpp tests, prefer `llama-server --host 127.0.0.1 --port 8081`.
+If `brew install llama.cpp` fails with `/opt/homebrew is not writable`, fix the
+Homebrew prefix ownership or build llama.cpp from source; do not run
+`sudo brew install`.
 
 ## What It Is Not
 
@@ -224,6 +247,124 @@ stream can finish before compression and vector indexing complete, while direct
 Set `SHOVSOS_MEMORY_COMMIT_MODE=sync` to force old blocking behavior, `async` to
 respond first and commit in the background, or `skip` for no memory maintenance
 on a run.
+
+LLM compression is also adaptive. Deterministic memory governance can run every
+turn, but the expensive `compress_exchange` model call now runs only when a turn
+has durable memory signals, corrections, deterministic fact updates, candidate
+stance signals, or a periodic maintenance interval. Configure this with
+`SHOVSOS_LLM_COMPRESSION_MODE=adaptive|always|off` and
+`SHOVSOS_LLM_COMPRESSION_INTERVAL` (default `6`). This keeps ordinary Q&A turns
+from paying an extra model call just to rewrite context.
+
+## Language Kernel Snapshot
+
+`run_engine/language_kernel.py` is the compact runtime object for the next
+ShovsOS direction. It does not call a model. It gathers the seven reliability
+lanes into one typed snapshot that prompts, tests, traces, and UI can consume.
+
+The snapshot contains:
+
+- `prompt_contract`: the current role, policy, locked entities, allowed next tool, missing slots, successful result IDs, and short runtime rules.
+- `context_ladder`: compact memory and evidence first, raw payloads by reference unless explicitly requested.
+- `attention`: phase-weighted ledger items from runtime attention.
+- `tool_gate`: next required action, source contract, completion gate, and policy violations.
+- `memory_immune_report`: memory writes, provenance status, disputed writes, and conflict traces.
+- `experience_graph`: objective, plan, tool calls, tool results, and evidence as reusable trajectory nodes.
+- `proxy_state_eval`: state-based checks for missing evidence, unsupported tool claims, drift, and completion.
+- `micro_agent_jobs`: small bounded jobs suitable for cheap verifier/classifier/compressor models.
+- `ui_run_map`: simple sections a frontend can render as Objective -> Plan -> Tools -> Evidence -> Memory -> Verification -> Response.
+
+The important design choice is that this layer is deterministic. Provider-native
+tool calling is treated as a transport detail; the language kernel decides what
+state the model is allowed to see and what the runtime must verify.
+
+Tool selection now uses this layer actively. If the ledger has an exact
+`next_required_action` with complete arguments, the runtime can select that tool
+without another actor-model call. If the next action is not deterministic, the
+actor prompt receives the language-kernel contract above the older context. That
+keeps provider-native tool calling useful while preventing it from becoming the
+source of truth.
+
+Example actor contract:
+
+```text
+Runtime Prompt Contract:
+- role: actor
+- phase: acting
+- objective: Search top 3 stocks, search each separately, fetch 3 URLs each
+- policy: plan_execute
+- final answer allowed: false
+- allowed next tool: web_search
+- allowed arguments: {'query': 'ROKU stock news June 13 2026'}
+- locked entities: ROKU, TBN, SENEA
+- missing slots: fetched_urls:0/9
+Rules:
+- Do not claim a tool ran unless its successful result id is listed.
+- Use the allowed next tool when one is provided.
+- Do not search or fetch outside locked entities/source contracts.
+- Do not write memory unless provenance or evidence is available.
+- Do not produce a final answer while missing slots remain.
+```
+
+This is the practical form of the research thesis: use language for intent and
+judgment, but let the harness own state, tools, memory, continuation, and proof.
+
+## Turn Relation Calculus
+
+Context is not retrieved by similarity alone. Each turn is first classified by
+its relationship to prior context:
+
+- `fresh_topic`: isolate from old plans and locked entities.
+- `direct_continuation`: load continuation state, pending steps, and next required action.
+- `distant_resumption`: retrieve compact memory signals and raw refs, not full history.
+- `correction`: latest explicit correction dominates older conflicting facts.
+- `refinement`: patch the current plan or constraint without restarting everything.
+- `deviation`: preserve stable preferences, but replan workflow state.
+- `meta_instruction`: apply as runtime/style policy, not domain factual content.
+
+The classifier emits a proof packet:
+
+```text
+relation
+confidence
+anchors
+required_context
+blocked_context
+memory_write_policy
+tool_policy
+proof_obligations
+```
+
+That packet is stored on the run ledger and rendered inside the language-kernel
+prompt contract. A real model sees a compact directive such as:
+
+```text
+- turn relation: direct_continuation
+- relation required context: continuation_state, locked_entities, next_required_action
+- relation blocked context: unrelated_memory, old_completed_plans
+```
+
+This gives the harness a logical reason for context inclusion. It can prove why
+old state was used, ignored, patched, or demoted.
+
+## Provider Capability Matrix
+
+`llm/provider_capabilities.py` describes provider/model features as runtime
+flags:
+
+- native tool transport
+- structured JSON support
+- vision input support
+- image generation support
+- reasoning-control support
+- parallel tool support
+- explicit tool-choice support
+- fallback protocol
+
+The engine should not assume every model behaves the same. Native tools are
+preferred when available, but unknown providers fall back to the same internal
+`ToolCallDraft`/JSON protocol. The business logic stays in the harness; provider
+features only choose the safest transport.
 
 ## Harness Lab
 

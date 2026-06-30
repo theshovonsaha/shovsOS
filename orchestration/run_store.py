@@ -7,9 +7,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from config.config import cfg
 
 
-DEFAULT_RUNS_DB = "runs.db"
+DEFAULT_RUNS_DB = cfg.RUNS_DB
 
 
 @dataclass
@@ -99,7 +100,7 @@ class RunPassRecord:
 
 class RunStore:
     def __init__(self, db_path: str = DEFAULT_RUNS_DB):
-        self.db_path = str(Path(db_path))
+        self.db_path = str(Path(db_path).expanduser().resolve())
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
@@ -108,6 +109,7 @@ class RunStore:
         return conn
 
     def _init_db(self) -> None:
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -310,6 +312,75 @@ class RunStore:
     def get(self, run_id: str) -> Optional[RunRecord]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+            if row is None:
+                return None
+            return RunRecord(**dict(row))
+
+    def count(self, *, owner_id: Optional[str] = None) -> int:
+        with self._connect() as conn:
+            if owner_id is None:
+                row = conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM runs WHERE COALESCE(owner_id, '') = COALESCE(?, '')",
+                    (owner_id,),
+                ).fetchone()
+            return int(row[0] or 0)
+
+    def reset_all(self, *, owner_id: Optional[str] = None) -> int:
+        with self._connect() as conn:
+            if owner_id is None:
+                before = int(conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] or 0)
+                run_ids = [row[0] for row in conn.execute("SELECT run_id FROM runs").fetchall()]
+                conn.execute("DELETE FROM runs")
+            else:
+                run_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT run_id FROM runs WHERE COALESCE(owner_id, '') = COALESCE(?, '')",
+                        (owner_id,),
+                    ).fetchall()
+                ]
+                before = len(run_ids)
+                conn.execute(
+                    "DELETE FROM runs WHERE COALESCE(owner_id, '') = COALESCE(?, '')",
+                    (owner_id,),
+                )
+            for run_id in run_ids:
+                conn.execute("DELETE FROM run_checkpoints WHERE run_id = ?", (run_id,))
+                conn.execute("DELETE FROM run_passes WHERE run_id = ?", (run_id,))
+                conn.execute("DELETE FROM run_artifacts WHERE run_id = ?", (run_id,))
+                conn.execute("DELETE FROM run_evals WHERE run_id = ?", (run_id,))
+            conn.commit()
+            return before
+
+    def latest_for_session(
+        self,
+        session_id: str,
+        *,
+        owner_id: Optional[str] = None,
+    ) -> Optional[RunRecord]:
+        with self._connect() as conn:
+            if owner_id is None:
+                row = conn.execute(
+                    """
+                    SELECT * FROM runs
+                    WHERE session_id = ?
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    """
+                    SELECT * FROM runs
+                    WHERE session_id = ? AND COALESCE(owner_id, '') = COALESCE(?, '')
+                    ORDER BY started_at DESC
+                    LIMIT 1
+                    """,
+                    (session_id, owner_id),
+                ).fetchone()
             if row is None:
                 return None
             return RunRecord(**dict(row))

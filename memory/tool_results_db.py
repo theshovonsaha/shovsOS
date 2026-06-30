@@ -12,19 +12,21 @@ import json
 import sqlite3
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, List, Dict
 from config.config import cfg
 
 
-DB_PATH = "tool_results.db"
+DB_PATH = cfg.TOOL_RESULTS_DB
 
 
 class ToolResultsDB:
     def __init__(self, db_path: str = DB_PATH):
-        self.db_path = db_path
+        self.db_path = str(Path(db_path).expanduser().resolve())
         self._init_db()
 
     def _init_db(self):
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS tool_results (

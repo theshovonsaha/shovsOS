@@ -13,6 +13,7 @@ from memory.tool_results_db import ToolResultsDB
 from memory.vector_engine import VectorEngine
 from memory.session_rag import CHROMA_DIR as SESSION_RAG_DIR, reset_session_rag_storage
 from orchestration.agent_profiles import ProfileManager
+from orchestration.run_store import RunStore
 from orchestration.session_manager import SessionManager
 
 
@@ -20,6 +21,7 @@ from orchestration.session_manager import SessionManager
 class StoreSelection:
     sessions: bool = True
     agents: bool = False
+    runs: bool = True
     semantic_memory: bool = True
     tool_results: bool = True
     vector_memory: bool = True
@@ -31,6 +33,7 @@ class StoreSelection:
         return cls(
             sessions=bool(payload.get("sessions", True)),
             agents=bool(payload.get("agents", False)),
+            runs=bool(payload.get("runs", True)),
             semantic_memory=bool(payload.get("semantic_memory", True)),
             tool_results=bool(payload.get("tool_results", True)),
             vector_memory=bool(payload.get("vector_memory", True)),
@@ -43,6 +46,8 @@ class StoreSelection:
             names.append("sessions")
         if self.agents:
             names.append("agents")
+        if self.runs:
+            names.append("runs")
         if self.semantic_memory:
             names.append("semantic_memory")
         if self.tool_results:
@@ -70,8 +75,9 @@ class StorageAdminService:
         self.paths = {
             "sessions": Path(overrides.get("sessions", sessions.db_path)).resolve(),
             "agents": Path(overrides.get("agents", profiles.db_path)).resolve(),
-            "semantic_memory": Path(overrides.get("semantic_memory", "memory_graph.db")).resolve(),
-            "tool_results": Path(overrides.get("tool_results", "tool_results.db")).resolve(),
+            "runs": Path(overrides.get("runs", cfg.RUNS_DB)).resolve(),
+            "semantic_memory": Path(overrides.get("semantic_memory", cfg.MEMORY_GRAPH_DB)).resolve(),
+            "tool_results": Path(overrides.get("tool_results", cfg.TOOL_RESULTS_DB)).resolve(),
             "vector_memory": Path(overrides.get("vector_memory", cfg.CHROMA_DB_PATH)).resolve(),
             "session_rag": Path(overrides.get("session_rag", SESSION_RAG_DIR)).resolve(),
         }
@@ -103,6 +109,7 @@ class StorageAdminService:
         stores = {name: self._store_info(name) for name in self.paths}
         stores["sessions"]["records"] = len(self.sessions.list_sessions())
         stores["agents"]["records"] = len(self.profiles.list_all())
+        stores["runs"]["records"] = RunStore(db_path=str(self.paths["runs"])).count()
         stores["semantic_memory"]["records"] = SemanticGraph(db_path=str(self.paths["semantic_memory"])).count()
         stores["tool_results"]["records"] = ToolResultsDB(db_path=str(self.paths["tool_results"])).count()
         stores["vector_memory"]["records"] = None
@@ -188,6 +195,10 @@ class StorageAdminService:
 
         if selection.agents:
             cleared["agents"] = {"deleted_rows": self.profiles.reset_all(preserve_default=preserve_default_agent)}
+
+        if selection.runs:
+            runs = RunStore(db_path=str(self.paths["runs"]))
+            cleared["runs"] = {"deleted_rows": runs.reset_all()}
 
         if selection.semantic_memory:
             graph = SemanticGraph(db_path=str(self.paths["semantic_memory"]))

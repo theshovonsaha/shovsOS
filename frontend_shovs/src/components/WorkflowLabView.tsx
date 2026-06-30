@@ -31,6 +31,7 @@ interface WorkflowDefinition {
   };
   steps: WorkflowStep[];
   tags: string[];
+  custom?: boolean;
 }
 
 interface WorkflowCatalog {
@@ -86,7 +87,7 @@ interface WorkflowRunResult {
   };
 }
 
-type WorkflowTab = 'build' | 'run' | 'events' | 'result' | 'api';
+type WorkflowTab = 'build' | 'run' | 'events' | 'result' | 'api' | 'create';
 
 interface WorkflowImageInput {
   id: string;
@@ -149,6 +150,22 @@ const parseJsonObject = (text: string): Record<string, unknown> => {
   return parsed as Record<string, unknown>;
 };
 
+const _exampleForWorkflow = (workflow: WorkflowDefinition): Record<string, unknown> => {
+  const example: Record<string, unknown> = {};
+  Object.keys(workflow.input_schema || {}).forEach((field) => {
+    if (field.toLowerCase().includes('location')) example[field] = 'Toronto';
+    else if (field.toLowerCase().includes('store')) example[field] = ['Costco', 'Walmart', 'Best Buy'];
+    else if (field.toLowerCase().includes('budget')) example[field] = 'under $300';
+    else if (field.toLowerCase().includes('product')) example[field] = 'ergonomic chair';
+    else if (field.toLowerCase().includes('query') || field.toLowerCase().includes('question')) {
+      example[field] = workflow.description || workflow.label;
+    } else {
+      example[field] = '';
+    }
+  });
+  return Object.keys(example).length ? example : { query: workflow.description || workflow.label };
+};
+
 export const WorkflowLabView: React.FC = () => {
   const [catalog, setCatalog] = useState<WorkflowCatalog | null>(null);
   const [selectedWorkflowId, setSelectedWorkflowId] = useState('shopping_comparison_v1');
@@ -160,10 +177,41 @@ export const WorkflowLabView: React.FC = () => {
   const [events, setEvents] = useState<WorkflowEvent[]>([]);
   const [result, setResult] = useState<WorkflowRunResult | null>(null);
   const [workflowImages, setWorkflowImages] = useState<WorkflowImageInput[]>([]);
+  const [draftWorkflow, setDraftWorkflow] = useState({
+    label: 'Store Price Watch',
+    description: 'Compare one product across selected stores and return the best practical option.',
+    policy: 'plan_execute',
+    tools: 'web_search, web_fetch, source_collect, source_contract, source_select, query_memory',
+    inputFields: 'product, location, stores, budget',
+    outputFields: 'best_option, price_notes, tradeoffs, source_urls, unresolved',
+  });
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
+  const [creatingWorkflow, setCreatingWorkflow] = useState(false);
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
+
+  const applyCatalog = (payload: WorkflowCatalog, preferredWorkflowId?: string) => {
+    setCatalog(payload);
+    const preferred = preferredWorkflowId
+      ? payload.workflows.find((item) => item.id === preferredWorkflowId)
+      : null;
+    const current = payload.workflows.find((item) => item.id === selectedWorkflowId);
+    const first = preferred || current || payload.workflows[0];
+    if (first) {
+      setSelectedWorkflowId(first.id);
+      setSelectedStepId(first.steps[0]?.id || '');
+      setInputText(formatJson(WORKFLOW_EXAMPLES[first.id] || _exampleForWorkflow(first)));
+    }
+  };
+
+  const loadCatalog = async (preferredWorkflowId?: string) => {
+    const response = await fetch('/api/workflow-lab/catalog');
+    if (!response.ok) throw new Error(`catalog failed: ${response.status}`);
+    const payload = (await response.json()) as WorkflowCatalog;
+    applyCatalog(payload, preferredWorkflowId);
+    return payload;
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -171,18 +219,7 @@ export const WorkflowLabView: React.FC = () => {
       setLoading(true);
       setError('');
       try {
-        const response = await fetch('/api/workflow-lab/catalog');
-        if (!response.ok) throw new Error(`catalog failed: ${response.status}`);
-        const payload = (await response.json()) as WorkflowCatalog;
-        if (!cancelled) {
-          setCatalog(payload);
-          const first = payload.workflows.find((item) => item.id === selectedWorkflowId) || payload.workflows[0];
-          if (first) {
-            setSelectedWorkflowId(first.id);
-            setSelectedStepId(first.steps[0]?.id || '');
-            setInputText(formatJson(WORKFLOW_EXAMPLES[first.id] || {}));
-          }
-        }
+        if (!cancelled) await loadCatalog();
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load workflows.');
       } finally {
@@ -206,7 +243,7 @@ export const WorkflowLabView: React.FC = () => {
   const selectWorkflow = (workflow: WorkflowDefinition) => {
     setSelectedWorkflowId(workflow.id);
     setSelectedStepId(workflow.steps[0]?.id || '');
-    setInputText(formatJson(WORKFLOW_EXAMPLES[workflow.id] || {}));
+    setInputText(formatJson(WORKFLOW_EXAMPLES[workflow.id] || _exampleForWorkflow(workflow)));
     setRunStatus(null);
     setEvents([]);
     setResult(null);
@@ -326,6 +363,38 @@ export const WorkflowLabView: React.FC = () => {
     }
   };
 
+  const createWorkflow = async () => {
+    setCreatingWorkflow(true);
+    setError('');
+    setCopied(false);
+    try {
+      const payload = {
+        label: draftWorkflow.label,
+        description: draftWorkflow.description,
+        policy: draftWorkflow.policy,
+        tools: draftWorkflow.tools.split(',').map((item) => item.trim()).filter(Boolean),
+        input_fields: draftWorkflow.inputFields.split(',').map((item) => item.trim()).filter(Boolean),
+        output_fields: draftWorkflow.outputFields.split(',').map((item) => item.trim()).filter(Boolean),
+      };
+      const response = await fetch('/api/workflow-lab/workflows', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) throw new Error(`create workflow failed: ${response.status}`);
+      const created = (await response.json()) as { workflow: WorkflowDefinition };
+      await loadCatalog(created.workflow.id);
+      setRunStatus(null);
+      setEvents([]);
+      setResult(null);
+      setActiveTab('build');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Workflow creation failed.');
+    } finally {
+      setCreatingWorkflow(false);
+    }
+  };
+
   const copyApiRequest = async () => {
     if (!apiRequest) return;
     const text = `fetch("${apiRequest.url}", {\n  method: "${apiRequest.method}",\n  headers: { "Content-Type": "application/json" },\n  body: JSON.stringify(${formatJson(apiRequest.body)})\n})`;
@@ -357,9 +426,14 @@ export const WorkflowLabView: React.FC = () => {
           <h2>{catalog.title}</h2>
           <p>{catalog.subtitle}</p>
         </div>
-        <button className='shovs-send-btn' onClick={runWorkflow} disabled={running}>
-          {running ? 'Running...' : 'Run Workflow'}
-        </button>
+        <div className='workflow-header-actions'>
+          <button className='shovs-ghost-btn' onClick={() => setActiveTab('create')} disabled={creatingWorkflow}>
+            New Workflow
+          </button>
+          <button className='shovs-send-btn' onClick={runWorkflow} disabled={running}>
+            {running ? 'Running...' : 'Run Workflow'}
+          </button>
+        </div>
       </div>
 
       {error ? <div className='workflow-error'>{error}</div> : null}
@@ -374,7 +448,7 @@ export const WorkflowLabView: React.FC = () => {
             >
               <strong>{workflow.label}</strong>
               <span>{workflow.runtime.policy} · {workflow.runtime.ledger_mode}</span>
-              <small>{workflow.tags.join(' · ')}</small>
+              <small>{workflow.custom && !workflow.tags.includes('custom') ? 'custom · ' : ''}{workflow.tags.join(' · ')}</small>
             </button>
           ))}
         </aside>
@@ -404,12 +478,76 @@ export const WorkflowLabView: React.FC = () => {
           </div>
 
           <div className='workflow-tabs' role='tablist' aria-label='Workflow Lab sections'>
-            {(['build', 'run', 'events', 'result', 'api'] as WorkflowTab[]).map((tab) => (
+            {(['build', 'run', 'events', 'result', 'api', 'create'] as WorkflowTab[]).map((tab) => (
               <button key={tab} className={activeTab === tab ? 'active' : ''} onClick={() => setActiveTab(tab)}>
                 {tab}
               </button>
             ))}
           </div>
+
+          {activeTab === 'create' ? (
+            <div className='workflow-create-panel'>
+              <div className='workflow-create-intro'>
+                <strong>Create a workflow contract</strong>
+                <p>
+                  Define the input fields, tools, policy, and output fields. The created workflow appears in this list and uses the same run/status/events/result API.
+                </p>
+              </div>
+              <div className='workflow-create-grid'>
+                <label>
+                  Name
+                  <input
+                    value={draftWorkflow.label}
+                    onChange={(event) => setDraftWorkflow((prev) => ({ ...prev, label: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  Policy
+                  <select
+                    value={draftWorkflow.policy}
+                    onChange={(event) => setDraftWorkflow((prev) => ({ ...prev, policy: event.target.value }))}
+                  >
+                    <option value='plan_execute'>plan_execute</option>
+                    <option value='react'>react</option>
+                    <option value='graph_harness'>graph_harness</option>
+                  </select>
+                </label>
+                <label className='span-2'>
+                  Description
+                  <textarea
+                    value={draftWorkflow.description}
+                    onChange={(event) => setDraftWorkflow((prev) => ({ ...prev, description: event.target.value }))}
+                  />
+                </label>
+                <label className='span-2'>
+                  Tools
+                  <input
+                    value={draftWorkflow.tools}
+                    onChange={(event) => setDraftWorkflow((prev) => ({ ...prev, tools: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  Input fields
+                  <input
+                    value={draftWorkflow.inputFields}
+                    onChange={(event) => setDraftWorkflow((prev) => ({ ...prev, inputFields: event.target.value }))}
+                  />
+                </label>
+                <label>
+                  Output fields
+                  <input
+                    value={draftWorkflow.outputFields}
+                    onChange={(event) => setDraftWorkflow((prev) => ({ ...prev, outputFields: event.target.value }))}
+                  />
+                </label>
+              </div>
+              <div className='workflow-create-actions'>
+                <button className='shovs-send-btn' onClick={createWorkflow} disabled={creatingWorkflow || !draftWorkflow.label.trim()}>
+                  {creatingWorkflow ? 'Creating...' : 'Create Workflow'}
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           {activeTab === 'build' ? (
             <div className='workflow-builder-grid'>

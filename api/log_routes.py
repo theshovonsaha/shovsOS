@@ -90,6 +90,65 @@ def _event_summary(event: Optional[dict], fallback: str = "not recorded") -> str
     return _clip_text(preview or event.get("event_type") or fallback, 180)
 
 
+def _extract_language_kernel_run_map(trace_events: list[dict]) -> Optional[dict]:
+    for event in trace_events:
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+        ledger = data.get("run_ledger") if isinstance(data.get("run_ledger"), dict) else data
+        kernel = ledger.get("language_kernel") if isinstance(ledger.get("language_kernel"), dict) else data.get("language_kernel")
+        if not isinstance(kernel, dict):
+            continue
+        run_map = kernel.get("ui_run_map")
+        if not isinstance(run_map, dict):
+            continue
+        sections = run_map.get("sections")
+        if not isinstance(sections, list):
+            continue
+        clean_sections = []
+        for section in sections:
+            if not isinstance(section, dict):
+                continue
+            section_id = str(section.get("id") or section.get("label") or "").strip()
+            label = str(section.get("label") or section.get("id") or "").strip()
+            if not section_id or not label:
+                continue
+            clean_sections.append({
+                "id": section_id,
+                "label": label,
+                "status": str(section.get("status") or "not_recorded"),
+                "count": int(section.get("count") or 0),
+                "event_id": event.get("id"),
+                "event_type": event.get("event_type"),
+            })
+        if clean_sections:
+            return {
+                "version": str(run_map.get("version") or kernel.get("version") or ""),
+                "next_focus": str(run_map.get("next_focus") or ""),
+                "sections": clean_sections,
+            }
+    return None
+
+
+def _kernel_section_summary(section: dict) -> str:
+    section_id = str(section.get("id") or "")
+    status = str(section.get("status") or "not_recorded").replace("_", " ")
+    count = int(section.get("count") or 0)
+    if section_id == "objective":
+        return "Current run goal is captured." if count else "No objective recorded yet."
+    if section_id == "plan":
+        return f"{count} plan step(s) recorded." if count else "Plan not recorded yet."
+    if section_id == "tools":
+        return f"{count} tool call(s) linked." if count else "No tool calls yet."
+    if section_id == "evidence":
+        return f"{count} evidence item(s) selected." if count else "Evidence not selected yet."
+    if section_id == "memory":
+        return f"{count} memory write(s) recorded." if count else "No memory write recorded."
+    if section_id == "verification":
+        return f"{count or 1} issue(s) need attention." if status == "blocked" else f"Verification is {status}."
+    if section_id == "response":
+        return "Final response is blocked." if status == "blocked" else "Final response is allowed."
+    return f"{section.get('label') or section_id} is {status}."
+
+
 def _build_operator_story(
     *,
     run,
@@ -111,6 +170,7 @@ def _build_operator_story(
     latest_verification = _latest_event(trace_events, {"verification_warning", "verification_result"})
     latest_memory = _latest_event(trace_events, {"memory_commit_plan", "memory_write_policy", "memory_commit_skipped"})
     latest_response = _latest_event(trace_events, {"assistant_response"})
+    kernel_run_map = _extract_language_kernel_run_map(trace_events)
 
     def lane(
         lane_id: str,
@@ -141,7 +201,7 @@ def _build_operator_story(
             "summary": summary or _event_summary(event),
         }
 
-    return {
+    base_story = {
         "status": run.status,
         "objective": _clip_text(
             getattr(passes[-1], "objective", "")
@@ -157,24 +217,47 @@ def _build_operator_story(
             "total_tokens": usage["total_tokens"],
             "estimated_cost_usd": usage["estimated_cost_usd"],
         },
-        "lanes": [
-            lane("plan", "Plan", latest_plan, count=len([p for p in passes if str(p.phase).lower() == "planning"])),
-            lane("policy", "Policy", latest_policy, count=len([e for e in trace_events if e.get("event_type") in {"control_policy", "policy_selected", "policy_violation"}])),
-            lane("graph", "Graph", latest_graph, count=len([e for e in trace_events if e.get("event_type") in {"pass_graph_execution", "pass_node_started", "pass_node_completed", "pass_node_failed"}])),
-            lane("context", "Context", latest_context, count=len([e for e in trace_events if e.get("event_type") in {"phase_packet", "phase_context", "compiled_context"}])),
-            lane("tool", "Tools", latest_tool_result or latest_tool_call, count=len([e for e in trace_events if e.get("event_type") in {"tool_call", "tool_result"}])),
-            lane("evidence", "Evidence", None, summary=(evidence[0].get("summary") if evidence else "No evidence selected yet."), count=len(evidence), status="done" if evidence else "idle"),
-            lane("recovery", "Recovery", latest_recovery, count=len([e for e in trace_events if e.get("event_type") in {"recovery_started", "completion_gate"}])),
-            lane("memory", "Memory", latest_memory, count=len([e for e in trace_events if "memory" in str(e.get("event_type") or "")])),
-            lane("verify", "Verify", latest_verification, count=len(evals)),
-            lane("response", "Response", latest_response, count=len([e for e in trace_events if e.get("event_type") == "assistant_response"])),
-        ],
         "next_best_action": _event_summary(
             _latest_event(trace_events, {"continuation_state_updated", "replan_recommended", "verification_warning"}),
             "No follow-up action recorded.",
         ),
         "artifact_count": len(artifacts),
     }
+    if kernel_run_map:
+        base_story["source"] = "language_kernel"
+        base_story["next_best_action"] = (
+            f"Next focus: {kernel_run_map['next_focus']}"
+            if kernel_run_map.get("next_focus")
+            else base_story["next_best_action"]
+        )
+        base_story["lanes"] = [
+            {
+                "id": section["id"],
+                "label": section["label"],
+                "status": section["status"],
+                "count": section["count"],
+                "event_id": section.get("event_id"),
+                "event_type": section.get("event_type"),
+                "phase": section["id"],
+                "summary": _kernel_section_summary(section),
+            }
+            for section in kernel_run_map["sections"]
+        ]
+        return base_story
+    base_story["source"] = "trace_timeline"
+    base_story["lanes"] = [
+        lane("plan", "Plan", latest_plan, count=len([p for p in passes if str(p.phase).lower() == "planning"])),
+        lane("policy", "Policy", latest_policy, count=len([e for e in trace_events if e.get("event_type") in {"control_policy", "policy_selected", "policy_violation"}])),
+        lane("graph", "Graph", latest_graph, count=len([e for e in trace_events if e.get("event_type") in {"pass_graph_execution", "pass_node_started", "pass_node_completed", "pass_node_failed"}])),
+        lane("context", "Context", latest_context, count=len([e for e in trace_events if e.get("event_type") in {"phase_packet", "phase_context", "compiled_context"}])),
+        lane("tool", "Tools", latest_tool_result or latest_tool_call, count=len([e for e in trace_events if e.get("event_type") in {"tool_call", "tool_result"}])),
+        lane("evidence", "Evidence", None, summary=(evidence[0].get("summary") if evidence else "No evidence selected yet."), count=len(evidence), status="done" if evidence else "idle"),
+        lane("recovery", "Recovery", latest_recovery, count=len([e for e in trace_events if e.get("event_type") in {"recovery_started", "completion_gate"}])),
+        lane("memory", "Memory", latest_memory, count=len([e for e in trace_events if "memory" in str(e.get("event_type") or "")])),
+        lane("verify", "Verify", latest_verification, count=len(evals)),
+        lane("response", "Response", latest_response, count=len([e for e in trace_events if e.get("event_type") == "assistant_response"])),
+    ]
+    return base_story
 
 
 def _build_run_replay_payload(*, run_id: str, owner_id: str, trace_limit: int = 160) -> dict:

@@ -22,6 +22,7 @@ If you are evaluating Shovs quickly, read these in order:
 
 | File | Purpose |
 | --- | --- |
+| [extractions/shovs-harness-core](extractions/shovs-harness-core) | Small standalone harness extension with setup checks, a live demo app, and llama.cpp probe support. |
 | [HARNESS.md](HARNESS.md) | Defines the agent harness in simple terms, with runtime diagrams. |
 | [BENCHMARKS.md](BENCHMARKS.md) | Shows the deterministic benchmark suite and what each scenario checks. |
 | [EVALS.md](EVALS.md) | Explains scenario-state evaluation and why final-answer-only judging is not enough. |
@@ -53,6 +54,18 @@ The UI now also includes a **Workflows** workspace tab. This is the beginning of
 - copy the API request shape that another frontend app could use
 
 The workflow layer is intentionally contract-first. It is not a free-form node canvas yet. Its current purpose is to make ShovsOS features composable and inspectable through stable workflow definitions, durable run records, status polling, event history, and result contracts.
+
+## Current UI Test Run
+
+These screenshots were captured from the local React frontend running against the local FastAPI backend. They are not benchmark claims; they show the operator surfaces used to inspect whether a run preserved entities, followed tool policy, gathered evidence, and completed the expected workflow.
+
+![Harness Lab policy comparison test run](images/harness_lab_test_run.png)
+
+The Harness Lab view compares a plain model path, a model-with-tools path, and Shovs runtime modes on the same source-collection task. The useful signal is not prettier prose. The useful signal is whether the run can prove its locked entities, search/fetch counts, policy gate, ledger mode, trace events, and unresolved issues.
+
+![Workflow Lab deterministic contract run](images/workflow_lab_test_run.png)
+
+The Workflow Lab view exposes ShovsOS features as typed workflows. In this run, the Shopping Comparison workflow shows the selected policy, context mode, completion status, and ordered events from intake through response.
 
 ---
 
@@ -294,9 +307,13 @@ Handlers run concurrently via `asyncio.gather`; exceptions are logged, never rai
 # Verify the install
 python3 scripts/doctor.py
 
-# Run Shovs Platform (operator workspace)
-npm run dev:shovs
-# → http://localhost:5174
+# Run Shovs Platform (operator workspace, no Docker required)
+npm run dev
+# → backend + frontend_shovs; Docker-backed bash returns a typed denial
+
+# Run with Docker services enabled
+npm run dev:shovs:docker
+# → starts SearXNG + agent-sandbox, then backend + frontend_shovs
 
 # Run Consumer plane
 npm run dev:consumer
@@ -306,9 +323,27 @@ npm run dev:backend
 # → http://localhost:8000  ·  /docs for OpenAPI
 ```
 
-`scripts/doctor.py` checks: Python ≥3.10, provider API keys, Ollama reachability, writable DB/chroma/logs paths, all 5 LLM adapters import, skill loader works (≥1 skill), unified context engine has its budget knobs.
+`scripts/doctor.py` checks: Python ≥3.10, provider API keys, Ollama reachability, optional Docker/SearXNG/llama.cpp services, writable DB/chroma/logs paths, LLM adapters import, skill loader works (≥1 skill), unified context engine has its budget knobs.
 
 The full interactive setup (Docker services, embed model selection) is in [setup-linux-mac.sh](setup-linux-mac.sh) and [setup-windows.ps1](setup-windows.ps1).
+
+### Running without Docker
+
+Docker is useful for the sandboxed `bash` tool and local SearXNG search, but the main app should not require Docker just to open and test agents.
+
+Use:
+
+```bash
+npm run dev
+```
+
+This starts the backend from `./venv/bin/python` when the project venv exists, disables MCP for the lightweight local run, and sets `DOCKER_DISABLED=true`. The app still boots; Docker-only execution returns a clear denial instead of crashing. `/runtime/health` reports Docker, SearXNG, and llama.cpp as optional service statuses so the frontend can show what is missing.
+
+If port `8000` is already occupied, run the backend on another port:
+
+```bash
+BACKEND_PORT=8010 npm run dev:backend:local
+```
 
 ---
 
@@ -329,6 +364,7 @@ DEFAULT_MODEL=qwen2.5-coder-3b-instruct-mlx
 
 LLM_PROVIDER=llamacpp
 LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
+LLAMACPP_DEFAULT_MODEL=local-model
 
 # Cloud
 OPENAI_API_KEY=sk-...
@@ -337,6 +373,9 @@ GROQ_API_KEY=gsk_...
 GEMINI_API_KEY=AIza...
 NVIDIA_API_KEY=nvapi-...
 
+# Optional market data
+ALPHA_VANTAGE_API_KEY=...
+
 # Optional image generation
 IMAGE_GENERATION_MODEL=gpt-image-1
 ```
@@ -344,6 +383,20 @@ IMAGE_GENERATION_MODEL=gpt-image-1
 Embedding transport auto-detects `/api/embed` (current Ollama) and `/api/embeddings` (legacy); LM Studio / llama.cpp / OpenAI-compatible servers use `/v1/embeddings`.
 
 Image generation is exposed both as an agent tool (`image_generate`) and as `POST /images/generate`. Generated files are saved under the sandbox and served from `/sandbox/generated/images/...`. If `OPENAI_API_KEY` is missing, the tool returns a typed failure instead of pretending an image was created.
+
+For llama.cpp on Apple Silicon:
+
+```bash
+# install via Homebrew, then start a local OpenAI-compatible server
+llama-server -m /absolute/path/to/model.gguf --host 127.0.0.1 --port 8080
+
+export LLM_PROVIDER=llamacpp
+export LLAMACPP_BASE_URL=http://127.0.0.1:8080/v1
+export LLAMACPP_DEFAULT_MODEL=local-model
+npm run dev:local
+```
+
+If port `8080` is already used, start `llama-server` on another port and set `LLAMACPP_BASE_URL` to match.
 
 ---
 

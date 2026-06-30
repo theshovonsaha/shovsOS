@@ -47,6 +47,7 @@ const WORDS: Record<string, number> = {
   nine: 9,
   ten: 10,
 };
+const NUMBER_PATTERN = "\\d+|one|two|three|four|five|six|seven|eight|nine|ten";
 
 function numberValue(raw: string | undefined): number {
   if (!raw) return 0;
@@ -55,12 +56,11 @@ function numberValue(raw: string | undefined): number {
 
 export function inferSourceContract(objective: string): SourceContract {
   const text = objective.toLowerCase().replace(/\s+/g, " ").trim();
-  const number = "\\d+|one|two|three|four|five|six|seven|eight|nine|ten";
-  const entityCount = numberValue(text.match(new RegExp(`\\btop\\s+(${number})\\b`))?.[1]);
+  const entityCount = numberValue(text.match(new RegExp(`\\btop\\s+(${NUMBER_PATTERN})\\b`))?.[1]);
   const urlsPerEntity = numberValue(
     text.match(
       new RegExp(
-        `\\b(${number})\\s+(?:relevant\\s+)?(?:urls?|links?|results?|sources?|articles?)\\s+(?:for\\s+)?(?:each|per)\\b`,
+        `\\b(${NUMBER_PATTERN})\\s+(?:relevant\\s+)?(?:urls?|links?|results?|sources?|articles?)\\s+(?:for\\s+)?(?:each|per)\\b`,
       ),
     )?.[1],
   );
@@ -81,6 +81,20 @@ export function inferSourceContract(objective: string): SourceContract {
     requiredTools,
     missing,
   };
+}
+
+export function discoveryQuery(objective: string): string {
+  const stripped = objective
+    .replace(
+      /\b(?:then|and then|after that|web\s*search|search\s+each|search\s+those|search\s+these|web\s*fetch|fetch|capture|analy[sz]e|write|produce|report|tldr|tl;dr|summary table|one by one|separately|each)\b.*$/i,
+      "",
+    )
+    .replace(/^\s*(?:please\s+)?(?:web\s*search|search\s+for|search|find|look\s*up)\s+/i, "")
+    .replace(new RegExp(`\\b(top\\s+(?:${NUMBER_PATTERN})|those|these|(?:${NUMBER_PATTERN})\\s+relevant|all\\s+(?:${NUMBER_PATTERN})\\s+urls?)\\b`, "gi"), "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.,:;]+$/g, "");
+  return stripped || objective.slice(0, 80).trim();
 }
 
 export function evaluateTrace(contract: SourceContract, events: TraceEvent[]): TraceEval {
@@ -154,7 +168,7 @@ export function decide(contract: SourceContract, evalReport: TraceEval): KernelD
     return { state: "respond", reason: "source quota met" };
   }
   if (evalReport.metrics.searchCount === 0) {
-    return { state: "act", reason: "need entity discovery/search", nextTool: "web_search", nextArgs: { query: contract.objective } };
+    return { state: "act", reason: "need entity discovery/search", nextTool: "web_search", nextArgs: { query: discoveryQuery(contract.objective) } };
   }
   return { state: "act", reason: "need selected URL fetches", nextTool: "web_fetch", nextArgs: { url: "<selected_url>" } };
 }

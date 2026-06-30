@@ -15,6 +15,7 @@ interface AgentProfile {
     bootstrap_files?: string[];
     bootstrap_max_chars?: number;
     default_use_planner?: boolean;
+    default_loop_mode?: 'auto' | 'single' | 'managed' | 'kernel';
     default_context_mode?: 'v1' | 'v2' | 'v3';
     unified_model_mode?: boolean;
     workflow_template?: string;
@@ -34,7 +35,7 @@ interface WorkflowTemplate {
     description: string;
     system_prompt: string;
     tools: string[];
-    default_loop_mode?: 'auto' | 'single' | 'managed';
+    default_loop_mode?: 'auto' | 'single' | 'managed' | 'kernel';
     default_context_mode?: 'v1' | 'v2' | 'v3';
     default_use_planner?: boolean;
     bootstrap_files?: string[];
@@ -62,7 +63,7 @@ const AGENT_PRESETS: Record<AgentPresetId, {
     description: string;
     systemPrompt: string;
     tools: string[];
-    defaultLoopMode: 'auto' | 'single' | 'managed';
+    defaultLoopMode: 'auto' | 'single' | 'managed' | 'kernel';
     defaultContextMode: 'v1' | 'v2' | 'v3';
     defaultUsePlanner: boolean;
     bootstrapFiles: string[];
@@ -72,6 +73,16 @@ const AGENT_PRESETS: Record<AgentPresetId, {
         description: 'Evidence-first research agent for web investigation, comparison, and concise reports.',
         systemPrompt: 'Act as a rigorous researcher. Preserve exact domains and names, gather evidence before conclusions, prefer first-party sources when evaluating a product, and surface what remains unverified clearly.',
         tools: ['web_search', 'web_fetch', 'query_memory', 'store_memory'],
+        defaultLoopMode: 'managed',
+        defaultContextMode: 'v3',
+        defaultUsePlanner: true,
+        bootstrapFiles: ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md'],
+    },
+    finance: {
+        label: 'Finance',
+        description: 'Ticker and market-mover analyst using Alpha Vantage before web expansion.',
+        systemPrompt: 'Act as a finance research analyst. Use Alpha Vantage tools first for quotes, movers, fundamentals, and news sentiment. Lock ticker symbols from deterministic data before web expansion, cite only URLs present in tool results, and avoid buy/sell advice unless explicitly requested.',
+        tools: ['finance_snapshot', 'alpha_vantage_movers', 'alpha_vantage_quote', 'alpha_vantage_overview', 'alpha_vantage_news', 'source_collect', 'web_search', 'web_fetch', 'query_memory'],
         defaultLoopMode: 'managed',
         defaultContextMode: 'v3',
         defaultUsePlanner: true,
@@ -106,6 +117,16 @@ const AGENT_PRESETS: Record<AgentPresetId, {
         defaultContextMode: 'v3',
         defaultUsePlanner: false,
         bootstrapFiles: ['IDENTITY.md', 'SOUL.md'],
+    },
+    harness: {
+        label: 'Kernel Harness',
+        description: 'Deterministic source workflow agent for source collection, comparisons, and citation-grounded answers.',
+        systemPrompt: 'Act as a source-grounded harness agent. Let the deterministic runtime control search/fetch loops, preserve locked entities, cite only fetched sources, and surface unsupported claims instead of guessing.',
+        tools: ['web_search', 'web_fetch'],
+        defaultLoopMode: 'kernel',
+        defaultContextMode: 'v3',
+        defaultUsePlanner: false,
+        bootstrapFiles: ['AGENTS.md', 'TOOLS.md'],
     },
 };
 
@@ -349,6 +370,7 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
     const [bootstrapFilesText, setBootstrapFilesText] = useState((initialAgent?.bootstrap_files || ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md']).join(', '));
     const [bootstrapMaxChars, setBootstrapMaxChars] = useState(String(initialAgent?.bootstrap_max_chars || 8000));
     const [defaultUsePlanner, setDefaultUsePlanner] = useState(initialAgent?.default_use_planner ?? true);
+    const [defaultLoopMode, setDefaultLoopMode] = useState<'auto' | 'single' | 'managed' | 'kernel'>(initialAgent?.default_loop_mode || 'auto');
     const [defaultContextMode, setDefaultContextMode] = useState<'v1' | 'v2' | 'v3'>(initialAgent?.default_context_mode || 'v3');
     const [unifiedModelMode, setUnifiedModelMode] = useState<boolean>(initialAgent?.unified_model_mode ?? true);
     const [promptVersion, setPromptVersion] = useState(initialAgent?.prompt_version || 'role_contracts_v1');
@@ -384,6 +406,7 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
         if (!description.trim() || !isEdit) setDescription(preset.description);
         if (!systemPrompt.trim() || !isEdit) setSystemPrompt(preset.system_prompt);
         setSelectedTools(preset.tools);
+        setDefaultLoopMode(preset.default_loop_mode || 'auto');
         setDefaultContextMode(preset.default_context_mode || 'v3');
         setDefaultUsePlanner(preset.default_use_planner ?? true);
         setBootstrapFilesText((preset.bootstrap_files || ['AGENTS.md', 'IDENTITY.md', 'SOUL.md', 'TOOLS.md']).join(', '));
@@ -421,6 +444,7 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                     .filter(Boolean),
                 bootstrap_max_chars: Number(bootstrapMaxChars) || 8000,
                 default_use_planner: defaultUsePlanner,
+                default_loop_mode: defaultLoopMode,
                 default_context_mode: defaultContextMode,
                 unified_model_mode: unifiedModelMode,
                 workflow_template: selectedPreset || initialAgent?.workflow_template || 'general_operator_v1',
@@ -598,6 +622,15 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                                 <strong>{riskPolicy || 'standard'}</strong>
                             </div>
                             <div>
+                                <span>Loop Mode</span>
+                                <select value={defaultLoopMode} onChange={e => setDefaultLoopMode(e.target.value as 'auto' | 'single' | 'managed' | 'kernel')}>
+                                    <option value="auto">auto</option>
+                                    <option value="managed">managed</option>
+                                    <option value="single">single</option>
+                                    <option value="kernel">kernel</option>
+                                </select>
+                            </div>
+                            <div>
                                 <span>Ledger Mode</span>
                                 <select value={ledgerMode} onChange={e => setLedgerMode(e.target.value as 'shadow' | 'ledger_enforced')}>
                                     <option value="shadow">shadow</option>
@@ -734,13 +767,13 @@ const CreateAgentModal: React.FC<{ onClose: () => void; onCreated: () => void; e
                                 <div><span>Bootstrap Docs</span><strong>{parsedBootstrapFiles.length}</strong></div>
                                 <div><span>Bootstrap Budget</span><strong>{effectiveBootstrapBudget} chars</strong></div>
                                 <div><span>Per Doc Budget</span><strong>{estimatedPerDocBudget} chars</strong></div>
-                                <div><span>Runtime</span><strong>managed</strong></div>
+                                <div><span>Runtime</span><strong>{defaultLoopMode}</strong></div>
                                 <div><span>Context Mode</span><strong>{defaultContextMode}</strong></div>
                                 <div><span>Planner</span><strong>{defaultUsePlanner ? 'on' : 'off'}</strong></div>
                                 <div><span>Selected Tools</span><strong>{selectedTools.length}</strong></div>
                             </div>
                             <div className="agent-builder-note">
-                                Runtime shape: platform core prompt + agent prompt + selected bootstrap docs + tool registry + managed runtime context defaults.
+                                Runtime shape: platform core prompt + agent prompt + selected bootstrap docs + tool registry + {defaultLoopMode} runtime context defaults.
                             </div>
                         </div>
                     </div>

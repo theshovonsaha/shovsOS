@@ -570,6 +570,53 @@ async def test_run_engine_async_memory_commit_does_not_block_done_event(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_run_engine_adaptive_memory_skips_llm_compression_for_ordinary_turn(tmp_path):
+    adapter = MagicMock()
+    adapter.stream = MagicMock(return_value=AsyncIter(["Tokyo."]))
+
+    context_engine = MagicMock()
+    context_engine.build_context_block.return_value = ""
+    context_engine.compress_exchange = AsyncMock(return_value=("ctx", [], []))
+
+    traces = FakeTraceStore()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=ToolRegistry(),
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=traces,
+        orchestrator=None,
+        context_engine=context_engine,
+        graph=SemanticGraph(db_path=str(tmp_path / "memory.db")),
+    )
+
+    events = [
+        event
+        async for event in engine.stream(
+            RunEngineRequest(
+                session_id="adaptive-no-compress",
+                owner_id="owner-adaptive-no-compress",
+                agent_id="default",
+                user_message="What is the capital of Japan?",
+                model="llama3.2",
+                system_prompt="You are Shovs.",
+                allowed_tools=(),
+                use_planner=False,
+                memory_commit_mode="sync",
+            )
+        )
+    ]
+
+    assert any(event["type"] == "done" for event in events)
+    context_engine.compress_exchange.assert_not_awaited()
+    assert any(
+        event["event_type"] == "llm_compression_skipped"
+        and event["data"].get("reason") == "adaptive_gate"
+        for event in traces.events
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_engine_blocks_memory_commit_on_unsupported_verification(tmp_path):
     adapter = MagicMock()
     adapter.complete = AsyncMock(

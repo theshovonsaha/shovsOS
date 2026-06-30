@@ -21,6 +21,7 @@ import asyncio
 from datetime import datetime, timezone
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 
@@ -62,13 +63,14 @@ class SessionManager:
     def __init__(self, max_sessions: int = MAX_SESSIONS, db_path: str = DB_PATH):
         self._sessions: OrderedDict[str, Session] = OrderedDict()
         self._max       = max_sessions
-        self.db_path    = db_path
+        self.db_path    = str(Path(db_path).expanduser().resolve())
         self._init_db()
         self._load_from_db()
 
     # ── DB ────────────────────────────────────────────────────────────────────
 
     def _init_db(self):
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (

@@ -18,6 +18,10 @@ const examples = [
 
 let objective = examples[0];
 let selectedRun: "plain" | "harness" = "harness";
+let backendState: { status: "idle" | "loading" | "ready" | "error"; summary: string; raw?: unknown } = {
+  status: "idle",
+  summary: "Backend not checked",
+};
 
 function render() {
   const contract = inferSourceContract(objective);
@@ -77,6 +81,7 @@ function render() {
         </section>
 
         <aside class="detailPanel">
+          ${backendCard()}
           ${card(
             "Why This Matters",
             `<p>The model can suggest work. The ledger decides what happened.
@@ -106,6 +111,10 @@ function bindEvents() {
       selectedRun = button.dataset.run === "plain" ? "plain" : "harness";
       render();
     });
+  });
+  const backendButton = document.querySelector<HTMLButtonElement>("[data-backend-run]");
+  backendButton?.addEventListener("click", () => {
+    void runBackend();
   });
 }
 
@@ -164,6 +173,42 @@ function timeline(events: TraceEvent[]) {
         .join("")}
     </section>
   `;
+}
+
+function backendCard() {
+  const status = backendState.status;
+  const raw = backendState.raw ? `<pre>${escapeHtml(JSON.stringify(backendState.raw, null, 2))}</pre>` : "";
+  return card(
+    "Live Extension Backend",
+    `<div class="backendStatus ${status}">
+      <strong>${escapeHtml(status)}</strong>
+      <span>${escapeHtml(backendState.summary)}</span>
+    </div>
+    <button type="button" data-backend-run>Run Python extension</button>
+    ${raw}`,
+  );
+}
+
+async function runBackend() {
+  backendState = { status: "loading", summary: "Calling http://127.0.0.1:8091/api/run" };
+  render();
+  try {
+    const response = await fetch("http://127.0.0.1:8091/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ objective, include_traces: false }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const payload = await response.json();
+    const verdict = payload?.verdict?.summary || "extension returned JSON";
+    backendState = { status: "ready", summary: verdict, raw: payload };
+  } catch (error) {
+    backendState = {
+      status: "error",
+      summary: error instanceof Error ? error.message : "Backend unavailable. Start scripts/run_backend.sh.",
+    };
+  }
+  render();
 }
 
 function escapeHtml(value: string) {

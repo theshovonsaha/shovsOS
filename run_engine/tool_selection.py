@@ -9,6 +9,22 @@ from plugins.tool_registry import ToolCall, ToolRegistry
 from run_engine.search_query import compile_web_search_query
 
 
+def _extract_stock_symbol(text: str) -> str:
+    raw = str(text or "")
+    tickers = re.findall(r"\b[A-Z]{1,5}(?:[._-][A-Z]{1,3})?\b", raw)
+    blocked = {
+        "API", "URL", "URLs", "LLM", "AI", "US", "USA", "USD", "CAD", "CEO", "CFO",
+        "ETF", "NYSE", "NASDAQ", "SEC", "EPS", "PE", "TTM",
+    }
+    for ticker in tickers:
+        if ticker not in blocked:
+            return ticker
+    match = re.search(r"\b(?:ticker|symbol|stock)\s+([A-Za-z]{1,5}(?:[._-][A-Za-z]{1,3})?)\b", raw, flags=re.IGNORECASE)
+    if match:
+        return match.group(1).upper()
+    return ""
+
+
 def build_actor_request_content(
     *,
     user_message: str,
@@ -20,6 +36,7 @@ def build_actor_request_content(
     clip_text,
     argument_clues: Optional[dict[str, str]] = None,
     capability_context: str = "",
+    language_kernel_context: str = "",
 ) -> str:
     recent_results = "\n".join(
         format_tool_result_line(item, preview_chars=200)
@@ -44,9 +61,17 @@ def build_actor_request_content(
     capability_block = ""
     if capability_context.strip():
         capability_block = f"Capability cards for available workflows:\n{capability_context.strip()}\n\n"
+    kernel_block = ""
+    if language_kernel_context.strip():
+        kernel_block = (
+            "Canonical runtime contract for this step:\n"
+            f"{language_kernel_context.strip()}\n\n"
+            "Follow this runtime contract over older context if they conflict.\n\n"
+        )
 
     return (
         f"{objective_block}"
+        f"{kernel_block}"
         "Decision policy:\n"
         "- Use the smallest sufficient next step.\n"
         "- If deterministic facts in context already answer the user, answer directly and do not call tools.\n"
@@ -118,6 +143,13 @@ def fallback_tool_call(tool_name: str, user_message: str) -> Optional[ToolCall]:
         arguments = {"location": lowered}
     elif tool_name == "image_generate":
         arguments = {"prompt": lowered}
+    elif tool_name == "alpha_vantage_movers":
+        arguments = {"limit": 10}
+    elif tool_name in {"alpha_vantage_quote", "alpha_vantage_overview", "alpha_vantage_news", "finance_snapshot"}:
+        symbol = _extract_stock_symbol(user_message)
+        if not symbol:
+            return None
+        arguments = {"symbol": symbol}
     elif tool_name == "delegate_to_agent":
         arguments = {"task": lowered}
     else:

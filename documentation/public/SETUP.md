@@ -152,6 +152,19 @@ BRAVE_SEARCH_KEY=
 EXA_API_KEY=
 ```
 
+## Market Data
+
+Alpha Vantage is optional. It enables deterministic finance tools for ticker
+quotes, top movers, company overview, news sentiment, and compact finance
+snapshots:
+
+```env
+ALPHA_VANTAGE_API_KEY=
+```
+
+If the key is missing or rate-limited, finance tools return a typed failure
+instead of pretending market data was retrieved.
+
 ## Optional Services
 
 ### SearXNG and Sandbox

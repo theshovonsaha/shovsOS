@@ -195,10 +195,16 @@ def update_contract_from_tool_results(
                     for url in _extract_urls_from_result(result):
                         selected_urls_by_entity.setdefault(entity, set()).add(url)
         elif tool_name in {"web_fetch", "web_fetch_batch"}:
-            result_urls = set(_extract_urls_from_result(result))
-            url = str(args.get("url") or "").strip()
-            if url:
-                result_urls.add(url)
+            if tool_name == "web_fetch":
+                # Count only the URL that was actually fetched. Page bodies can
+                # contain many links; those are candidate evidence, not proof
+                # that the runtime fetched those URLs.
+                result_urls = set()
+                url = str(args.get("url") or "").strip()
+                if url:
+                    result_urls.add(url)
+            else:
+                result_urls = set(_extract_urls_from_result(result))
             fetched_urls.update(result_urls)
             # Broadened attribution: a fetched URL counts for an entity if the
             # entity name appears in the URL, else for the most recently searched
@@ -238,21 +244,31 @@ def update_contract_from_tool_results(
                 observed_count=entity_coverage,
             )
         )
-    if total_fetches and len(fetched_urls) < total_fetches:
+    fetched_entity_urls = {
+        url
+        for urls in fetched_urls_by_entity.values()
+        for url in urls
+        if url
+    }
+    if entity_count:
+        fetched_count_for_quota = len(fetched_entity_urls)
+    else:
+        fetched_count_for_quota = len(fetched_urls)
+    if total_fetches and fetched_count_for_quota < total_fetches:
         missing_slots.append("total_fetched_urls")
     requirements.append(
         EvidenceRequirement(
             id="fetched_sources",
             description=f"Fetch {total_fetches} selected source URL(s)",
-            status="complete" if not total_fetches or len(fetched_urls) >= total_fetches else "pending",
+            status="complete" if not total_fetches or fetched_count_for_quota >= total_fetches else "pending",
             required_count=total_fetches,
-            observed_count=len(fetched_urls),
+            observed_count=fetched_count_for_quota,
         )
     )
     # Hard escape: the gate must never lock forever. Once the overall fetch
     # target is met, or the loop has spent its turn budget, allow the answer and
     # let the response phase be honest about any slot that stayed open.
-    min_fetches_met = bool(total_fetches) and len(fetched_urls) >= total_fetches
+    min_fetches_met = bool(total_fetches) and fetched_count_for_quota >= total_fetches
     hard_escape = bool(max_tool_turns) and tool_turn >= max_tool_turns
     complete = (not missing_slots) or min_fetches_met or hard_escape
     if complete and missing_slots:
@@ -281,7 +297,7 @@ def update_contract_from_tool_results(
         metadata={
             **metadata,
             "searched_entities": sorted(searched_entities),
-            "fetched_url_count": len(fetched_urls),
+            "fetched_url_count": fetched_count_for_quota,
             "gate_hard_escape": bool(hard_escape),
         },
     )

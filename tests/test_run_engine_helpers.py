@@ -1,11 +1,12 @@
 import json
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from memory.semantic_graph import SemanticGraph
 from orchestration.session_manager import SessionManager
-from plugins.tool_registry import ToolCall, ToolRegistry
+from plugins.tool_registry import Tool, ToolCall, ToolRegistry
 
 from engine.conversation_tension import analyze_conversation_tension
 from orchestration.run_store import RunStore
@@ -153,6 +154,32 @@ def test_engine_policy_gate_records_but_allows_bad_call_in_shadow_mode(tmp_path)
     assert ledger.policy_violations[0]["recovery_policy"]["persist_continuation"] is True
 
 
+def test_lean_response_context_only_for_low_risk_no_tool_turns():
+    assert RunEngine._should_use_lean_response_context(
+        user_message="Hi. Reply in one sentence.",
+        effective_objective="Hi. Reply in one sentence.",
+        workflow_shape="open_ended_chat",
+        tool_results=[],
+        selected_tools=[],
+        current_facts=[],
+        continuation_state={},
+        plan_steps=[],
+        session_history=[],
+    ) is True
+
+    assert RunEngine._should_use_lean_response_context(
+        user_message="Create an ABNB finance snapshot",
+        effective_objective="Create an ABNB finance snapshot",
+        workflow_shape="research_report",
+        tool_results=[],
+        selected_tools=[],
+        current_facts=[],
+        continuation_state={},
+        plan_steps=[],
+        session_history=[],
+    ) is False
+
+
 def test_continuation_gate_extends_related_additive_turn():
     from run_engine.engine import _assess_continuation_state
 
@@ -230,6 +257,81 @@ def test_fallback_web_search_does_not_fire_full_source_workflow_as_query():
     assert call.arguments == {"query": "top 3 sushi places in Toronto"}
 
 
+def test_contextual_followup_search_query_preserves_active_frame():
+    query = compile_web_search_query(
+        "i want to buy an ergonomic gaming race chair under 500 cad\n"
+        "Current turn update: what about razr"
+    )
+
+    assert query == "razr ergonomic gaming race chair under 500 cad"
+
+
+def test_fallback_web_search_uses_compiled_contextual_followup_query():
+    call = fallback_tool_call(
+        "web_search",
+        "i want to buy an ergonomic gaming race chair under 500 cad\n"
+        "Current turn update: what about razr",
+    )
+
+    assert call is not None
+    assert call.arguments == {"query": "razr ergonomic gaming race chair under 500 cad"}
+
+
+@pytest.mark.asyncio
+async def test_select_tool_call_prefers_ledger_resolved_objective_for_short_followup(tmp_path):
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="web_search",
+            description="Search the web",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            handler=AsyncMock(),
+        )
+    )
+    engine = RunEngine(
+        adapter=MagicMock(),
+        sessions=SessionManager(db_path=str(tmp_path / "sessions.db")),
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=_TraceCapture(),
+    )
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value="")
+    ledger = RunLedger(
+        run_id="run-followup",
+        session_id="session-followup",
+        turn_id="turn-1",
+        objective=(
+            "i want to buy an ergonomic gaming race chair under 500 cad\n"
+            "Current turn update: what about razr"
+        ),
+        allowed_tools=["web_search"],
+    )
+
+    call = await engine._select_tool_call(
+        adapter=adapter,
+        model="test-model",
+        request=SimpleNamespace(
+            user_message="what about razr",
+            session_id="session-followup",
+            owner_id="owner",
+            agent_id="agent",
+            images=[],
+            workflow_template="",
+        ),
+        session=SimpleNamespace(sliding_window=[], first_message=""),
+        allowed_tools=["web_search"],
+        tool_results=[],
+        context_block="",
+        run_id="run-followup",
+        run_ledger=ledger,
+    )
+
+    assert call is not None
+    assert call.tool_name == "web_search"
+    assert call.arguments == {"query": "razr ergonomic gaming race chair under 500 cad"}
+
+
 def test_build_actor_request_content_includes_recent_result_previews():
     content = build_actor_request_content(
         user_message="Research the run engine.",
@@ -261,6 +363,27 @@ def test_build_actor_request_content_includes_capability_cards():
     assert "Capability cards for available workflows:" in content
     assert "Local Store Shopping Advisor" in content
     assert "answer_patch.comparison_table" in content
+
+
+def test_build_actor_request_content_puts_language_kernel_contract_first():
+    content = build_actor_request_content(
+        user_message="continue",
+        effective_objective="Fetch exact ROKU source",
+        session_first_message="",
+        allowed_tools=["web_fetch"],
+        tool_results=[],
+        context_block="older context says search broadly",
+        clip_text=lambda text, _: text,
+        language_kernel_context=(
+            "Runtime Prompt Contract:\n"
+            "- allowed next tool: web_fetch\n"
+            "- allowed arguments: {'url': 'https://news.example/roku-1'}"
+        ),
+    )
+
+    assert "Canonical runtime contract for this step:" in content
+    assert content.index("Canonical runtime contract for this step:") < content.index("Decision policy:")
+    assert "Follow this runtime contract over older context if they conflict." in content
 
 
 def test_summarize_arguments_clips_long_values():
@@ -892,6 +1015,201 @@ async def test_tool_actor_fallback_can_fetch_url_from_context_block(tmp_path):
     assert call is not None
     assert call.tool_name == "web_fetch"
     assert call.arguments == {"url": "https://example.com/pricing"}
+
+
+@pytest.mark.asyncio
+async def test_single_web_search_uses_compiled_query_without_actor_llm(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestration.run_store import RunStore
+    from orchestration.session_manager import SessionManager
+    from plugins.tool_registry import Tool, ToolRegistry
+    from run_engine.engine import RunEngine
+    from run_engine.types import RunEngineRequest
+
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value='{"tool_calls": []}')
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    session = sessions.create(
+        model="llama3.2",
+        system_prompt="",
+        agent_id="default",
+        session_id="deterministic-single-search",
+        owner_id="owner-1",
+    )
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="web_search",
+            description="Search",
+            parameters={"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+            handler=AsyncMock(return_value="{}"),
+        )
+    )
+    trace = _TraceCapture()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=trace,
+    )
+
+    call = await engine._select_tool_call(
+        adapter=adapter,
+        model="llama3.2",
+        request=RunEngineRequest(
+            session_id=session.id,
+            owner_id="owner-1",
+            agent_id="default",
+            user_message="Search top 3 stocks today with major jumps web search those 3 stocks separately and fetch 9 URLs.",
+            model="llama3.2",
+        ),
+        session=session,
+        allowed_tools=["web_search"],
+        tool_results=[],
+        context_block="",
+    )
+
+    assert call is not None
+    assert call.tool_name == "web_search"
+    assert call.arguments == {"query": "top 3 stocks today with major jumps"}
+    adapter.complete.assert_not_awaited()
+    assert any(event["event_type"] == "tool_call_deterministic" for event in trace.events)
+
+
+@pytest.mark.asyncio
+async def test_single_finance_snapshot_uses_deterministic_symbol_without_actor_llm(tmp_path):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from orchestration.run_store import RunStore
+    from orchestration.session_manager import SessionManager
+    from plugins.tool_registry import Tool, ToolRegistry
+    from run_engine.engine import RunEngine
+    from run_engine.types import RunEngineRequest
+
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value='{"tool_calls": []}')
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    session = sessions.create(
+        model="llama3.2",
+        system_prompt="",
+        agent_id="default",
+        session_id="deterministic-finance",
+        owner_id="owner-1",
+    )
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="finance_snapshot",
+            description="Finance snapshot",
+            parameters={"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]},
+            handler=AsyncMock(return_value="{}"),
+        )
+    )
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=_TraceCapture(),
+    )
+
+    call = await engine._select_tool_call(
+        adapter=adapter,
+        model="llama3.2",
+        request=RunEngineRequest(
+            session_id=session.id,
+            owner_id="owner-1",
+            agent_id="default",
+            user_message="Create a compact ABNB finance snapshot",
+            model="llama3.2",
+        ),
+        session=session,
+        allowed_tools=["finance_snapshot"],
+        tool_results=[],
+        context_block="",
+    )
+
+    assert call is not None
+    assert call.tool_name == "finance_snapshot"
+    assert call.arguments == {"symbol": "ABNB"}
+    adapter.complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_actor_uses_language_kernel_next_action_without_model_call(tmp_path):
+    from run_engine.types import RunEngineRequest
+
+    adapter = MagicMock()
+    adapter.complete = AsyncMock(return_value='{"tool_calls": []}')
+
+    sessions = SessionManager(db_path=str(tmp_path / "sessions.db"))
+    session = sessions.create(
+        model="llama3.2",
+        system_prompt="",
+        agent_id="default",
+        session_id="kernel-next-action",
+        owner_id="owner-1",
+    )
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="web_fetch",
+            description="Fetch URL",
+            parameters={"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            handler=AsyncMock(return_value="{}"),
+        )
+    )
+    trace = _TraceCapture()
+    engine = RunEngine(
+        adapter=adapter,
+        sessions=sessions,
+        tool_registry=registry,
+        run_store=RunStore(db_path=str(tmp_path / "runs.db")),
+        trace_store=trace,
+    )
+    ledger = RunLedger(
+        run_id="run-kernel-next-action",
+        session_id=session.id,
+        turn_id="turn-1",
+        objective="Fetch the locked ROKU URL",
+        allowed_tools=["web_fetch"],
+        ledger_mode="ledger_enforced",
+    )
+    ledger.set_control_policy(resolve_control_policy(ledger.objective, requested="plan_execute"))
+    ledger.lock_entities(["ROKU"])
+    ledger.set_source_contract({
+        "next_tool": "web_fetch",
+        "next_arguments": {"url": "https://news.example/roku-1"},
+        "allowed_fetch_urls": ["https://news.example/roku-1"],
+        "total_urls": 1,
+    })
+
+    call = await engine._select_tool_call(
+        adapter=adapter,
+        model="llama3.2",
+        request=RunEngineRequest(
+            session_id=session.id,
+            owner_id="owner-1",
+            agent_id="default",
+            user_message="continue",
+            model="llama3.2",
+            system_prompt="",
+        ),
+        session=session,
+        allowed_tools=["web_fetch"],
+        tool_results=[],
+        context_block="",
+        run_id=ledger.run_id,
+        run_ledger=ledger,
+    )
+
+    assert call is not None
+    assert call.tool_name == "web_fetch"
+    assert call.arguments == {"url": "https://news.example/roku-1"}
+    adapter.complete.assert_not_awaited()
+    assert any(event["event_type"] == "language_kernel_next_action" for event in trace.events)
 
 
 def test_build_phase_packet_direct_fact_turn_prefers_deterministic_only_mode():

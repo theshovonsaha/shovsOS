@@ -36,6 +36,19 @@ def test_read_recent_chat_is_conversation_recall_not_web():
     assert "web_search" not in p.constrain(ALL)
 
 
+@pytest.mark.parametrize("msg", [
+    "but you forgot what we were chating about",
+    "you forgot what we were talking about",
+    "what were we chatting about",
+    "you lost the conversation context",
+])
+def test_context_loss_complaints_are_conversation_recall_not_web(msg):
+    p = _p(msg)
+    assert p.intent == "conversation_recall"
+    assert p.forbid_web and not p.use_planner
+    assert "web_search" not in p.constrain(ALL)
+
+
 @pytest.mark.parametrize("msg", ["I am a photographer", "I like blue color", "my favorite color is blue", "I'm a designer"])
 def test_personal_disclosure_stores_not_searches(msg):
     p = _p(msg)

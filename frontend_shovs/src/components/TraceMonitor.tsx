@@ -133,9 +133,25 @@ interface OperatorStoryLane {
   summary: string;
 }
 
+interface KernelRunMapSection {
+  id: string;
+  label: string;
+  status: string;
+  count: number;
+}
+
+interface KernelRunMap {
+  version?: string;
+  sections: KernelRunMapSection[];
+  next_focus?: string;
+  event_id?: string;
+  event_type?: string;
+}
+
 interface OperatorStory {
   status: string;
   objective: string;
+  source?: string;
   next_best_action?: string;
   artifact_count?: number;
   cost?: {
@@ -387,9 +403,95 @@ function ledgerList(value: unknown): Array<Record<string, unknown>> {
 
 function eventStatusClass(status?: string): string {
   const normalized = String(status || 'idle').toLowerCase();
-  if (normalized.includes('attention') || normalized.includes('warn')) return 'attention';
-  if (normalized.includes('done') || normalized.includes('success') || normalized.includes('complete')) return 'done';
+  if (
+    normalized.includes('attention') ||
+    normalized.includes('warn') ||
+    normalized.includes('blocked') ||
+    normalized.includes('fail')
+  )
+    return 'attention';
+  if (
+    normalized.includes('done') ||
+    normalized.includes('success') ||
+    normalized.includes('complete') ||
+    normalized.includes('allowed') ||
+    normalized.includes('passed') ||
+    normalized.includes('active')
+  )
+    return 'done';
   return 'idle';
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object'
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function extractKernelRunMapFromEvent(event: TraceEventSummary): KernelRunMap | null {
+  const data = asRecord(event.data);
+  if (!data) return null;
+  const ledger = extractRunLedger(data);
+  const kernel = asRecord(ledger?.language_kernel) || asRecord(data.language_kernel);
+  const runMap = asRecord(kernel?.ui_run_map) || asRecord(data.ui_run_map);
+  if (!runMap) return null;
+  const sectionsRaw = runMap?.sections;
+  if (!Array.isArray(sectionsRaw)) return null;
+  const sections = sectionsRaw
+    .map((item): KernelRunMapSection | null => {
+      const section = asRecord(item);
+      if (!section) return null;
+      const id = String(section.id || section.label || '').trim();
+      const label = String(section.label || section.id || '').trim();
+      if (!id || !label) return null;
+      return {
+        id,
+        label,
+        status: String(section.status || 'not_recorded'),
+        count: Number(section.count || 0),
+      };
+    })
+    .filter((item): item is KernelRunMapSection => item !== null);
+  if (!sections.length) return null;
+  return {
+    version: String(runMap.version || kernel?.version || ''),
+    sections,
+    next_focus: String(runMap.next_focus || ''),
+    event_id: event.id,
+    event_type: event.event_type,
+  };
+}
+
+function latestKernelRunMap(events: TraceEventSummary[]): KernelRunMap | null {
+  for (const event of events) {
+    const runMap = extractKernelRunMapFromEvent(event);
+    if (runMap) return runMap;
+  }
+  return null;
+}
+
+function kernelSectionSummary(section: KernelRunMapSection): string {
+  const status = section.status.replace(/_/g, ' ');
+  switch (section.id) {
+    case 'objective':
+      return section.count ? 'Current run goal is captured.' : 'No objective recorded yet.';
+    case 'plan':
+      return section.count ? `${section.count} plan step(s) recorded.` : 'Plan not recorded yet.';
+    case 'tools':
+      return section.count ? `${section.count} tool call(s) linked.` : 'No tool calls yet.';
+    case 'evidence':
+      return section.count ? `${section.count} evidence item(s) selected.` : 'Evidence not selected yet.';
+    case 'memory':
+      return section.count ? `${section.count} memory write(s) recorded.` : 'No memory write recorded.';
+    case 'verification':
+      return section.status === 'blocked'
+        ? `${section.count || 1} issue(s) need attention.`
+        : `Verification is ${status}.`;
+    case 'response':
+      return section.status === 'blocked' ? 'Final response is blocked.' : 'Final response is allowed.';
+    default:
+      return `${section.label} is ${status || 'not recorded'}.`;
+  }
 }
 
 async function copyText(value: string): Promise<void> {
@@ -606,7 +708,33 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
       };
     });
   }, [events]);
-  const storyLanes = operatorStory?.lanes?.length ? operatorStory.lanes : fallbackLanes;
+  const kernelRunMap = useMemo(() => latestKernelRunMap(events), [events]);
+  const kernelRunMapLanes = useMemo<OperatorStoryLane[]>(() => {
+    if (!kernelRunMap) return [];
+    return kernelRunMap.sections.map((section) => ({
+      id: section.id,
+      label: section.label,
+      status: section.status,
+      count: section.count,
+      event_id: kernelRunMap.event_id,
+      event_type: kernelRunMap.event_type,
+      phase: section.id,
+      summary: kernelSectionSummary(section),
+    }));
+  }, [kernelRunMap]);
+  const storyLanes = kernelRunMapLanes.length
+    ? kernelRunMapLanes
+    : operatorStory?.lanes?.length
+      ? operatorStory.lanes
+      : fallbackLanes;
+  const storySourceLabel = kernelRunMapLanes.length
+    ? 'Language Kernel Run Map'
+    : operatorStory?.source === 'language_kernel'
+      ? 'Language Kernel Run Map'
+    : operatorStory?.lanes?.length
+      ? 'Operator Story'
+      : 'Trace Timeline';
+  const storyUsesKernel = kernelRunMapLanes.length > 0 || operatorStory?.source === 'language_kernel';
 
   const fetchRecent = useCallback(
     async (opts?: { append?: boolean; beforeTs?: number }) => {
@@ -1084,10 +1212,12 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
         <div className='trace-operator-view'>
           <section className='trace-operator-hero'>
             <div className='trace-operator-main'>
-              <div className='trace-operator-kicker'>Operator View</div>
+              <div className='trace-operator-kicker'>{storySourceLabel}</div>
               <h2>{operatorStory?.objective || overview.primary[0]?.summary || 'Waiting for run objective.'}</h2>
               <p>
-                {operatorStory?.next_best_action ||
+                {kernelRunMap?.next_focus
+                  ? `Next focus: ${kernelRunMap.next_focus.replace(/_/g, ' ')}`
+                  : operatorStory?.next_best_action ||
                   overview.primary[1]?.summary ||
                   'No next action has been recorded yet.'}
               </p>
@@ -1112,7 +1242,7 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
             {storyLanes.map((lane, index) => (
               <button
                 key={lane.id}
-                className={`trace-lane-card state-${eventStatusClass(lane.status)}`}
+                className={`trace-lane-card state-${eventStatusClass(lane.status)} ${storyUsesKernel ? 'kernel-map-card' : ''}`}
                 onClick={() => {
                   if (lane.event_id) {
                     setSelectedId(lane.event_id);
@@ -1130,7 +1260,8 @@ export const TraceMonitor: React.FC<TraceMonitorProps> = ({
                   <div className='trace-lane-summary'>{lane.summary || 'Not recorded yet.'}</div>
                   <div className='trace-lane-meta'>
                     <span>{lane.status || 'idle'}</span>
-                    {lane.event_type ? <span>{humanizeShovsTraceEvent(lane.event_type)}</span> : null}
+                    {storyUsesKernel ? <span>kernel</span> : null}
+                    {!storyUsesKernel && lane.event_type ? <span>{humanizeShovsTraceEvent(lane.event_type)}</span> : null}
                   </div>
                 </div>
               </button>

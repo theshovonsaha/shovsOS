@@ -14,6 +14,9 @@ Changes from v0.5.0:
 import asyncio
 import json
 import os
+import shutil
+import socket
+from dataclasses import asdict
 from pathlib import Path
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -65,6 +68,7 @@ from guardrails.api_routes import make_guardrail_router
 from orchestration.run_store import get_run_store
 from config.trace_store import get_trace_store
 from run_engine import RunEngine, RunEngineRequest
+from run_engine.kernel_engine import KernelRunEngine
 
 from config.config import cfg
 from engine.fact_guard import is_grounded_fact_record
@@ -131,6 +135,214 @@ def _coerce_agent_patch_value(key: str, value: Any) -> Any:
             return 8000
     return value
 
+
+def _python_module_available(module_name: str) -> bool:
+    try:
+        __import__(module_name)
+        return True
+    except Exception:
+        return False
+
+
+def _port_open(host: str, port: int, timeout: float = 0.35) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+async def _docker_runtime_status() -> dict[str, Any]:
+    if os.getenv("DOCKER_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        return {
+            "configured": False,
+            "available": False,
+            "message": "Docker sandbox disabled by DOCKER_DISABLED=true",
+        }
+    if not shutil.which("docker"):
+        return {
+            "configured": False,
+            "available": False,
+            "message": "Docker CLI not found; Docker-backed tools are unavailable",
+        }
+
+    def _ping() -> tuple[bool, str]:
+        try:
+            import docker
+
+            client = docker.from_env()
+            client.ping()
+            return True, "Docker daemon reachable"
+        except Exception as exc:
+            return False, f"Docker daemon not reachable ({type(exc).__name__})"
+
+    available, message = await asyncio.to_thread(_ping)
+    return {
+        "configured": True,
+        "available": available,
+        "message": message,
+    }
+
+
+async def _local_service_status(name: str, base_url: str, path: str = "/") -> dict[str, Any]:
+    raw_url = (base_url or "").strip()
+    if not raw_url:
+        return {
+            "configured": False,
+            "available": False,
+            "base_url": "",
+            "message": f"{name} URL is not configured",
+        }
+
+    def _probe() -> dict[str, Any]:
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        parsed = urllib.parse.urlparse(raw_url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        is_port_open = _port_open(host, port)
+        probe_url = raw_url.rstrip("/") + (path if path.startswith("/") else f"/{path}")
+        try:
+            request = urllib.request.Request(probe_url, headers={"User-Agent": "shovs-runtime-health/1.0"})
+            with urllib.request.urlopen(request, timeout=0.75) as response:
+                return {
+                    "configured": True,
+                    "available": 200 <= int(response.status) < 500,
+                    "base_url": raw_url,
+                    "port_open": is_port_open,
+                    "message": f"{name} returned HTTP {response.status}",
+                }
+        except urllib.error.HTTPError as exc:
+            return {
+                "configured": True,
+                "available": int(exc.code) < 500,
+                "base_url": raw_url,
+                "port_open": is_port_open,
+                "message": f"{name} returned HTTP {exc.code}",
+            }
+        except Exception as exc:
+            return {
+                "configured": True,
+                "available": False,
+                "base_url": raw_url,
+                "port_open": is_port_open,
+                "message": f"{name} not reachable ({type(exc).__name__})",
+            }
+
+    return await asyncio.to_thread(_probe)
+
+
+def _voice_runtime_status() -> dict[str, Any]:
+    stt_backends: list[str] = []
+    tts_backends: list[str] = []
+    if os.getenv("DEEPGRAM_API_KEY"):
+        stt_backends.append("deepgram")
+        tts_backends.append("deepgram-aura")
+    if os.getenv("GROQ_API_KEY"):
+        stt_backends.append("groq-whisper")
+    if _python_module_available("faster_whisper"):
+        stt_backends.append("faster-whisper")
+    if _python_module_available("edge_tts"):
+        tts_backends.append("edge-tts")
+    if _python_module_available("kokoro"):
+        tts_backends.append("kokoro")
+    return {
+        "websocket_paths": ["/ws/voice", "/api/ws/voice"],
+        "stt_available": bool(stt_backends),
+        "tts_available": bool(tts_backends),
+        "stt_backends": stt_backends,
+        "tts_backends": tts_backends,
+        "message": "configured" if stt_backends and tts_backends else "voice requires at least one STT backend and one TTS backend",
+    }
+
+
+def _session_runtime_state(session, *, owner_id: str) -> dict[str, Any]:
+    store = get_run_store()
+    latest_run = store.latest_for_session(session.id, owner_id=owner_id)
+    latest_run_payload: dict[str, Any] | None = None
+    latest_pass_payload: dict[str, Any] | None = None
+    latest_checkpoint_payload: dict[str, Any] | None = None
+    if latest_run:
+        latest_run_payload = asdict(latest_run)
+        passes = store.list_passes(latest_run.run_id)
+        checkpoints = store.list_checkpoints(latest_run.run_id)
+        if passes:
+            latest_pass_payload = asdict(passes[-1])
+        if checkpoints:
+            latest_checkpoint_payload = asdict(checkpoints[-1])
+
+    trace_store = get_trace_store()
+    latest_ledger: dict[str, Any] | None = None
+    for event in trace_store.list_events(
+        limit=30,
+        session_id=session.id,
+        owner_id=owner_id,
+        event_type="run_ledger",
+    ):
+        hydrated = trace_store.get_event(str(event.get("id") or "")) or event
+        data = hydrated.get("data") if isinstance(hydrated.get("data"), dict) else {}
+        if data:
+            latest_ledger = {
+                "event_id": hydrated.get("id"),
+                "run_id": hydrated.get("run_id") or data.get("run_id"),
+                "created_at": hydrated.get("iso_ts"),
+                "reason": data.get("reason"),
+                "ledger_mode": data.get("ledger_mode"),
+                "phase": data.get("phase") or data.get("current_phase"),
+                "objective": data.get("objective"),
+                "summary": data.get("summary") or {},
+                "next_required_action": data.get("next_required_action") or {},
+                "completion_gate": data.get("completion_gate") or {},
+                "missing_requirements": data.get("missing_requirements") or [],
+                "locked_entities": data.get("locked_entities") or [],
+                "policy_violations": data.get("policy_violations") or [],
+            }
+            break
+
+    compressed_context = str(getattr(session, "compressed_context", "") or "")
+    continuation_state = dict(getattr(session, "continuation_state", {}) or {})
+    full_history = list(getattr(session, "full_history", []) or [])
+    candidate_signals = list(getattr(session, "candidate_signals", []) or [])
+    context_status = "ready"
+    stale_reasons: list[str] = []
+    if not compressed_context and len(full_history) >= 4:
+        context_status = "needs_compression"
+        stale_reasons.append("session has history but no compressed context")
+    if continuation_state:
+        context_status = "continuation_pending"
+        stale_reasons.append("session has pending continuation state")
+    if latest_ledger and latest_ledger.get("missing_requirements"):
+        context_status = "evidence_or_state_missing"
+        stale_reasons.append("latest ledger reports missing requirements")
+
+    return {
+        "context_status": context_status,
+        "stale_reasons": stale_reasons,
+        "db_paths": {
+            "sessions": session_manager.db_path,
+            "agents": profile_manager.db_path,
+            "runs": store.db_path,
+            "semantic_memory": semantic_graph.db_path,
+        },
+        "session": {
+            "id": session.id,
+            "agent_id": getattr(session, "agent_id", "default"),
+            "message_count": int(getattr(session, "message_count", 0) or 0),
+            "history_count": len(full_history),
+            "sliding_window_count": len(getattr(session, "sliding_window", []) or []),
+            "compressed_context_chars": len(compressed_context),
+            "candidate_signal_count": len(candidate_signals),
+            "continuation_pending": bool(continuation_state),
+            "continuation_state": continuation_state,
+        },
+        "latest_run": latest_run_payload,
+        "latest_pass": latest_pass_payload,
+        "latest_checkpoint": latest_checkpoint_payload,
+        "latest_ledger": latest_ledger,
+    }
+
 # ── Singletons ────────────────────────────────────────────────────────────────
 adapter         = OllamaAdapter()
 tool_registry   = ToolRegistry()
@@ -158,6 +370,20 @@ agent_manager = AgentManager(
     guardrail_middleware = guardrail_middleware,
 )
 run_engine = RunEngine(
+    adapter=adapter,
+    sessions=session_manager,
+    tool_registry=tool_registry,
+    run_store=get_run_store(),
+    trace_store=get_trace_store(),
+    orchestrator=orchestrator,
+    context_engine=context_engine,
+    graph=semantic_graph,
+)
+# Kernel-driven runtime (the deterministic control plane). Same construction
+# surface and the same `.stream(request)` signature as RunEngine, so it is a
+# drop-in A/B path: selected when control_policy == "kernel". The model is a
+# slot-filler (lock entities + synthesize = 2 LLM calls), not the orchestrator.
+kernel_run_engine = KernelRunEngine(
     adapter=adapter,
     sessions=session_manager,
     tool_registry=tool_registry,
@@ -230,6 +456,7 @@ def _seed_standard_profiles():
                 "source_collect",
                 "source_contract", "source_select", "source_next_action",
                 "web_fetch_batch", "source_coverage",
+                "finance_snapshot", "alpha_vantage_movers", "alpha_vantage_quote", "alpha_vantage_overview", "alpha_vantage_news",
                 "web_search", "web_fetch", "image_search", "image_generate", "rag_search", "query_memory", "store_memory",
             ],
             system_prompt=(
@@ -237,6 +464,36 @@ def _seed_standard_profiles():
                 "CRITICAL: Only call web_fetch with URLs returned by a prior web_search result. "
                 "Never invent or guess URLs. Cite sources. Never fabricate data."
             ),
+        ),
+        AgentProfile(
+            id="finance-analyst",
+            name="Finance Analyst",
+            description="Ticker and market-mover analyst using deterministic Alpha Vantage data before web expansion.",
+            model=cfg.DEFAULT_MODEL,
+            tools=[
+                "finance_snapshot",
+                "alpha_vantage_movers",
+                "alpha_vantage_quote",
+                "alpha_vantage_overview",
+                "alpha_vantage_news",
+                "source_collect",
+                "source_contract", "source_select", "source_next_action",
+                "web_fetch_batch", "source_coverage",
+                "web_search", "web_fetch", "query_memory",
+            ],
+            system_prompt=(
+                "You are a finance research analyst. Use Alpha Vantage tools first for quotes, movers, fundamentals, "
+                "and news sentiment when a ticker or stock-mover task is present. Lock ticker symbols from deterministic "
+                "data before web expansion. Keep reports structured, cite only URLs present in tool results, and avoid "
+                "buy/sell advice unless the user explicitly asks for a risk-framed opinion."
+            ),
+            default_use_planner=True,
+            default_loop_mode="managed",
+            default_context_mode="v3",
+            workflow_template="finance_analyst_v1",
+            prompt_version="finance_snapshot_v1",
+            risk_policy="finance_read_only",
+            ledger_mode="shadow",
         ),
         AgentProfile(
             id="analyst",
@@ -517,29 +774,69 @@ async def list_tools():
 async def runtime_health():
     tools = tool_registry.list_tools()
     tool_names = [str(tool.get("name") or "") for tool in tools]
+    docker_status, searxng_status, llamacpp_status = await asyncio.gather(
+        _docker_runtime_status(),
+        _local_service_status("SearXNG", os.getenv("SEARXNG_URL", ""), "/"),
+        _local_service_status(
+            "llama.cpp",
+            os.getenv("LLAMACPP_BASE_URL", "http://127.0.0.1:8080/v1"),
+            "/models",
+        ),
+    )
+    voice_status = _voice_runtime_status()
     return {
         "status": "ok",
         "runtime": "run_engine",
+        "local_mode": os.getenv("DOCKER_DISABLED", "").strip().lower() in {"1", "true", "yes", "on"},
         "tool_count": len(tools),
         "tools": {
             "web_search": "web_search" in tool_names,
             "web_fetch": "web_fetch" in tool_names,
             "image_generate": "image_generate" in tool_names,
             "image_search": "image_search" in tool_names,
+            "finance_snapshot": "finance_snapshot" in tool_names,
+            "alpha_vantage_movers": "alpha_vantage_movers" in tool_names,
         },
         "models": {
             "default_model": cfg.DEFAULT_MODEL,
             "vision_model": cfg.VISION_MODEL,
             "image_generation_model": cfg.IMAGE_GENERATION_MODEL,
         },
+        "persistence": {
+            "project_root": cfg.PROJECT_ROOT,
+            "sessions_db": session_manager.db_path,
+            "agents_db": profile_manager.db_path,
+            "runs_db": get_run_store().db_path,
+            "semantic_memory_db": semantic_graph.db_path,
+            "chroma_db_path": cfg.CHROMA_DB_PATH,
+        },
         "features": {
             "harness_lab": True,
             "workflow_lab": True,
             "api_prefix_compatibility": True,
             "sandbox_static": True,
+            "voice_io": True,
+            "finance_data": "finance_snapshot" in tool_names,
+        },
+        "optional_services": {
+            "docker_sandbox": docker_status,
+            "searxng": searxng_status,
+            "llamacpp": llamacpp_status,
+            "voice": voice_status,
+            "alpha_vantage": {
+                "available": bool(os.getenv("ALPHA_VANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY")),
+                "configured": bool(os.getenv("ALPHA_VANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY")),
+                "message": "configured" if (os.getenv("ALPHA_VANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY")) else "ALPHA_VANTAGE_API_KEY not set",
+            },
         },
         "requirements": {
             "image_generation": "OPENAI_API_KEY" if not cfg.OPENAI_API_KEY else "configured",
+            "vision": "VISION_MODEL" if not cfg.VISION_MODEL else "configured",
+            "voice": "configured" if voice_status.get("stt_available") and voice_status.get("tts_available") else voice_status.get("message"),
+            "bash_tool": "configured" if docker_status.get("available") else docker_status.get("message"),
+            "local_search": "configured" if searxng_status.get("available") else searxng_status.get("message"),
+            "llamacpp": "configured" if llamacpp_status.get("available") else llamacpp_status.get("message"),
+            "alpha_vantage": "configured" if (os.getenv("ALPHA_VANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY")) else "ALPHA_VANTAGE_API_KEY not set",
         },
     }
 
@@ -701,7 +998,8 @@ async def chat_stream(
                 reasoning_enabled=reasoning_enabled,
                 memory_commit_mode=os.getenv("SHOVSOS_MEMORY_COMMIT_MODE", "async"),
             )
-            async for event in run_engine.stream(run_request):
+            _engine = kernel_run_engine if run_request.control_policy == "kernel" else run_engine
+            async for event in _engine.stream(run_request):
                 yield f"data: {json.dumps(event)}\n\n"
             return
 
@@ -935,12 +1233,14 @@ async def get_session_memory_state(session_id: str, owner_id: str):
     s = session_manager.get(session_id, owner_id=owner_id)
     if not s:
         raise HTTPException(404, "Session not found")
-    return build_session_memory_payload(
+    payload = build_session_memory_payload(
         session=s,
         owner_id=owner_id,
         context_preview=_context_preview,
         graph=semantic_graph,
     )
+    payload["runtime_state"] = _session_runtime_state(s, owner_id=owner_id)
+    return payload
 
 @app.get("/memory")
 async def list_memories(limit: int = 100, owner_id: Optional[str] = None):

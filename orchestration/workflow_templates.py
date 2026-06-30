@@ -93,6 +93,53 @@ WORKFLOW_TEMPLATES: dict[str, WorkflowTemplate] = {
         workflow_pattern="diverge_converge_patch_v1",
         test_scenarios=("shopping_price_patch", "unverified_store_page", "failed_fetch_disclosed"),
     ),
+    "finance_analyst_v1": WorkflowTemplate(
+        id="finance_analyst_v1",
+        label="Finance Analyst",
+        description="Ticker research workflow with deterministic Alpha Vantage data before web/news expansion.",
+        tools=(
+            "finance_snapshot",
+            "alpha_vantage_movers",
+            "alpha_vantage_quote",
+            "alpha_vantage_overview",
+            "alpha_vantage_news",
+            "source_collect",
+            "source_contract",
+            "source_select",
+            "source_next_action",
+            "web_fetch_batch",
+            "source_coverage",
+            "web_search",
+            "web_fetch",
+            "query_memory",
+        ),
+        system_prompt=(
+            "Act as a finance research analyst. Use Alpha Vantage tools first for quotes, movers, fundamentals, "
+            "and news sentiment when a ticker or stock-mover task is present. Lock ticker symbols from deterministic "
+            "data before web expansion. Keep reports structured, cite only fetched/news URLs that exist in tool results, "
+            "and avoid buy/sell advice unless the user explicitly asks for a risk-framed opinion."
+        ),
+        risk_policy="finance_read_only",
+        prompt_version="finance_snapshot_v1",
+        test_scenarios=("top_movers_lock_entities", "fundamentals_snapshot", "unsupported_finance_claim"),
+    ),
+    "kernel_harness_v1": WorkflowTemplate(
+        id="kernel_harness_v1",
+        label="Kernel Harness",
+        description="Deterministic source workflow agent for source collection, comparisons, and citation-grounded answers.",
+        tools=("web_search", "web_fetch"),
+        system_prompt=(
+            "Act as a source-grounded harness agent. Let the deterministic runtime control "
+            "source loops, preserve locked entities, cite only fetched sources, and surface "
+            "unsupported claims instead of guessing."
+        ),
+        default_use_planner=False,
+        default_loop_mode="kernel",
+        risk_policy="evidence_first",
+        prompt_version="kernel_contract_v1",
+        ledger_mode="ledger_enforced",
+        test_scenarios=("source_collection_9_urls", "comparison_citation_grounding", "fabricated_source_blocked"),
+    ),
     "coding_agent_v1": WorkflowTemplate(
         id="coding_agent_v1",
         label="Coding Agent",

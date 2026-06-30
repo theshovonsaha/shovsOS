@@ -125,6 +125,9 @@ def test_session_memory_state_exposes_current_superseded_and_candidate_memory():
         assert payload["summary"]["preference_memory_count"] == 0
         assert payload["exact_policy_memory"] == []
         assert payload["exact_preference_memory"] == []
+        assert payload["runtime_state"]["session"]["history_count"] == 0
+        assert payload["runtime_state"]["db_paths"]["agents"].endswith("agents.db")
+        assert "runs" in payload["runtime_state"]["db_paths"]
         assert any(item["object"] == "Berlin" and item["status"] == "current" for item in payload["deterministic_facts"])
         assert all(item.get("content_hash") for item in payload["deterministic_facts"])
         assert any(item["object"] == "Toronto" and item["status"] == "superseded" for item in payload["superseded_facts"])

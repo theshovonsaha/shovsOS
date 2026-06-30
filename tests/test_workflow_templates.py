@@ -6,8 +6,10 @@ def test_workflow_templates_are_listable_and_defaultable():
     templates = list_workflow_templates()
 
     assert any(item["id"] == "general_operator_v1" for item in templates)
+    assert any(item["id"] == "kernel_harness_v1" and item["default_loop_mode"] == "kernel" for item in templates)
     assert get_workflow_template("missing").id == "general_operator_v1"
     assert get_workflow_template("research_agent_v1").risk_policy == "evidence_first"
+    assert get_workflow_template("kernel_harness_v1").ledger_mode == "ledger_enforced"
 
 
 def test_agent_profile_persists_workflow_coherence_fields(tmp_path):

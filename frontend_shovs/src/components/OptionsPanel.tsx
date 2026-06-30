@@ -60,6 +60,56 @@ interface SessionMemoryState {
   candidate_context_preview?: string;
   context_preview: string[];
   recent_memory_signals: MemorySignal[];
+  runtime_state?: {
+    context_status: string;
+    stale_reasons: string[];
+    db_paths: Record<string, string>;
+    session: {
+      message_count: number;
+      history_count: number;
+      sliding_window_count: number;
+      compressed_context_chars: number;
+      candidate_signal_count: number;
+      continuation_pending: boolean;
+      continuation_state?: Record<string, unknown>;
+    };
+    latest_run?: {
+      run_id: string;
+      status: string;
+      model: string;
+      started_at: string;
+      ended_at?: string | null;
+      error?: string | null;
+    } | null;
+    latest_pass?: {
+      phase: string;
+      status: string;
+      tool_turn?: number;
+      selected_tools?: string[];
+      response_preview?: string;
+    } | null;
+    latest_checkpoint?: {
+      phase: string;
+      status: string;
+      tool_turn?: number;
+      strategy?: string;
+      notes?: string;
+    } | null;
+    latest_ledger?: {
+      run_id?: string;
+      created_at?: string;
+      reason?: string;
+      ledger_mode?: string;
+      phase?: string;
+      objective?: string;
+      summary?: Record<string, number>;
+      next_required_action?: Record<string, unknown>;
+      completion_gate?: Record<string, unknown>;
+      missing_requirements?: string[];
+      locked_entities?: Array<Record<string, unknown>>;
+      policy_violations?: Array<Record<string, unknown>>;
+    } | null;
+  };
   explanation: string[];
 }
 
@@ -199,6 +249,7 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
   const [storageSelection, setStorageSelection] = useState({
     sessions: true,
     agents: false,
+    runs: true,
     semantic_memory: true,
     tool_results: true,
     vector_memory: true,
@@ -1407,6 +1458,115 @@ export const OptionsPanel: React.FC<OptionsPanelProps> = ({
                 <div
                   style={{ marginBottom: '14px', display: 'grid', gap: '10px' }}
                 >
+                  {sessionMemoryState.runtime_state && (
+                    <div className='memory-card'>
+                      <div
+                        className='memory-footer'
+                        style={{ marginBottom: '8px' }}
+                      >
+                        <span className='memory-date'>Runtime state</span>
+                        <span className='memory-date'>
+                          {sessionMemoryState.runtime_state.context_status}
+                        </span>
+                      </div>
+                      <div
+                        className='memory-footer'
+                        style={{ marginBottom: '8px', flexWrap: 'wrap' }}
+                      >
+                        <span className='memory-date'>
+                          History:{' '}
+                          {sessionMemoryState.runtime_state.session.history_count}
+                        </span>
+                        <span className='memory-date'>
+                          Window:{' '}
+                          {
+                            sessionMemoryState.runtime_state.session
+                              .sliding_window_count
+                          }
+                        </span>
+                        <span className='memory-date'>
+                          Context chars:{' '}
+                          {
+                            sessionMemoryState.runtime_state.session
+                              .compressed_context_chars
+                          }
+                        </span>
+                      </div>
+                      {sessionMemoryState.runtime_state.latest_ledger ? (
+                        <div className='context-line' style={{ marginBottom: '8px' }}>
+                          <strong style={{ color: 'var(--text)' }}>
+                            Ledger:
+                          </strong>{' '}
+                          {sessionMemoryState.runtime_state.latest_ledger
+                            .ledger_mode || 'shadow'}{' '}
+                          · phase{' '}
+                          {sessionMemoryState.runtime_state.latest_ledger
+                            .phase || 'not recorded'}
+                          {sessionMemoryState.runtime_state.latest_ledger
+                            .missing_requirements?.length ? (
+                            <span style={{ opacity: 0.62 }}>
+                              {' '}
+                              · missing{' '}
+                              {sessionMemoryState.runtime_state.latest_ledger.missing_requirements.join(
+                                ', ',
+                              )}
+                            </span>
+                          ) : null}
+                        </div>
+                      ) : (
+                        <div className='context-line' style={{ marginBottom: '8px' }}>
+                          Ledger not recorded for this session yet.
+                        </div>
+                      )}
+                      {sessionMemoryState.runtime_state.latest_run && (
+                        <div className='context-line' style={{ marginBottom: '8px' }}>
+                          <strong style={{ color: 'var(--text)' }}>
+                            Latest run:
+                          </strong>{' '}
+                          {sessionMemoryState.runtime_state.latest_run.status} ·{' '}
+                          {sessionMemoryState.runtime_state.latest_run.model}
+                        </div>
+                      )}
+                      {sessionMemoryState.runtime_state.session
+                        .continuation_pending && (
+                        <div className='context-line' style={{ marginBottom: '8px' }}>
+                          <strong style={{ color: 'var(--text)' }}>
+                            Continuation:
+                          </strong>{' '}
+                          pending next action from the previous run.
+                        </div>
+                      )}
+                      {sessionMemoryState.runtime_state.stale_reasons.length >
+                        0 && (
+                        <div className='context-line' style={{ marginBottom: '8px' }}>
+                          <strong style={{ color: 'var(--text)' }}>
+                            Attention:
+                          </strong>{' '}
+                          {sessionMemoryState.runtime_state.stale_reasons.join(
+                            '; ',
+                          )}
+                        </div>
+                      )}
+                      <details>
+                        <summary className='memory-date'>
+                          DB paths and raw runtime details
+                        </summary>
+                        <div style={{ marginTop: '8px', display: 'grid', gap: '6px' }}>
+                          {Object.entries(
+                            sessionMemoryState.runtime_state.db_paths,
+                          ).map(([key, value]) => (
+                            <div key={key} className='context-line'>
+                              <strong style={{ color: 'var(--text)' }}>
+                                {key}
+                              </strong>
+                              : <code>{value}</code>
+                            </div>
+                          ))}
+                        </div>
+                      </details>
+                    </div>
+                  )}
+
                   <div className='memory-card'>
                     <div
                       className='memory-footer'

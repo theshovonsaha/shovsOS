@@ -11,9 +11,21 @@ Usage:
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _project_path_env(name: str, default: str) -> str:
+    raw = os.getenv(name, default)
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return str(path)
+    return str((PROJECT_ROOT / path).resolve())
 
 
 @dataclass
@@ -50,9 +62,14 @@ class Config:
     MAX_SESSIONS: int = int(os.getenv("MAX_SESSIONS", "200"))
 
     # ── Database ──────────────────────────────────────────────────────────
-    SESSIONS_DB: str = os.getenv("SESSIONS_DB", "sessions.db")
-    AGENTS_DB: str = os.getenv("AGENTS_DB", "agents.db")
-    CHROMA_DB_PATH: str = os.getenv("CHROMA_DB_PATH", "./chroma_db")
+    PROJECT_ROOT: str = str(PROJECT_ROOT)
+    SESSIONS_DB: str = _project_path_env("SESSIONS_DB", "sessions.db")
+    AGENTS_DB: str = _project_path_env("AGENTS_DB", "agents.db")
+    RUNS_DB: str = _project_path_env("RUNS_DB", "runs.db")
+    MEMORY_GRAPH_DB: str = _project_path_env("MEMORY_GRAPH_DB", "memory_graph.db")
+    TOOL_RESULTS_DB: str = _project_path_env("TOOL_RESULTS_DB", "tool_results.db")
+    SESSION_TASKS_DB: str = _project_path_env("SESSION_TASKS_DB", "session_tasks.db")
+    CHROMA_DB_PATH: str = _project_path_env("CHROMA_DB_PATH", "./chroma_db")
     EMBED_MODEL: str = os.getenv("EMBED_MODEL", "qwen3-embedding:latest")
     EMBEDDING_HTTP_TIMEOUT: float = float(os.getenv("EMBEDDING_HTTP_TIMEOUT", "20"))
     EMBEDDING_HTTP_RETRIES: int = int(os.getenv("EMBEDDING_HTTP_RETRIES", "2"))
@@ -68,7 +85,7 @@ class Config:
     RETRIEVAL_TOP_K_FACT: int = int(os.getenv("RETRIEVAL_TOP_K_FACT", "4"))
 
     # ── Tools ─────────────────────────────────────────────────────────────
-    SANDBOX_DIR: str = os.getenv("SANDBOX_DIR", "./agent_sandbox")
+    SANDBOX_DIR: str = _project_path_env("SANDBOX_DIR", "./agent_sandbox")
     BASH_TIMEOUT: int = int(os.getenv("BASH_TIMEOUT", "30"))
     GOOGLE_PLACES_API_KEY: str = os.getenv("GOOGLE_PLACES_API_KEY", "")
 

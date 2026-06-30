@@ -14,7 +14,7 @@ from engine.conversation_tension import analyze_conversation_tension, conversati
 from engine.tokenization import get_token_encoding as _get_token_encoding
 from engine.context_schema import ContextPhase
 from engine.context_governor import ContextGovernor
-from engine.context_hygiene import should_skip_memory_compression
+from engine.context_hygiene import should_run_llm_memory_compression, should_skip_memory_compression
 from engine.deterministic_facts import extract_user_stated_fact_updates
 from engine.direct_fact_policy import should_answer_direct_fact_from_memory
 from engine.side_effect_guard import check_plan_for_side_effects, check_side_effect_claims
@@ -68,6 +68,7 @@ from run_engine.types import CompiledPassPacket, RunEngineRequest
 from run_engine.ledger import RunLedger, ToolCallDraft, recovery_policy_for
 from run_engine.workflow_contracts import infer_workflow_contract, update_contract_from_tool_results
 from run_engine.control_policies import resolve_control_policy
+from run_engine.turn_relation import classify_turn_relation
 from run_engine.turn_policy import resolve_turn_policy
 from run_engine.workflow_plugins import (
     default_tool_turn_budget as _plugin_default_tool_turn_budget,
@@ -941,11 +942,24 @@ class RunEngine:
             continuation_state=continuation_state if isinstance(continuation_state, dict) else {},
             ambiguous_followup=self._is_ambiguous_followup(request.user_message),
         )
+        turn_relation = classify_turn_relation(
+            user_message=request.user_message,
+            continuation_state=continuation_state if isinstance(continuation_state, dict) else {},
+            recent_turns=list(getattr(session, "sliding_window", []) or getattr(session, "full_history", []) or []),
+            distant_memory_signals=[
+                str(getattr(session, "compressed_context", "") or ""),
+                str(getattr(session, "candidate_context", "") or ""),
+            ],
+            ambiguous_followup=self._is_ambiguous_followup(request.user_message),
+        )
         if continuation_gate.get("action") in {"resume", "resume_with_update"}:
             effective_objective = str(continuation_gate.get("effective_objective") or "").strip() or effective_objective
         elif continuation_gate.get("action") == "supersede" and hasattr(self.sessions, "clear_continuation_state"):
             self.sessions.clear_continuation_state(session.id, owner_id=request.owner_id)
             session.continuation_state = {}
+            effective_objective = str(getattr(turn_relation, "resolved_objective", "") or "").strip() or effective_objective
+        elif str(getattr(turn_relation, "resolved_objective", "") or "").strip():
+            effective_objective = str(turn_relation.resolved_objective).strip()
 
         try:
             tool_results: list[dict[str, Any]] = []
@@ -986,6 +1000,7 @@ class RunEngine:
                 allowed_tools=ledger.allowed_tools,
             )
             ledger.set_control_policy(control_policy)
+            ledger.set_turn_relation(turn_relation.to_dict())
             plugin_contract = select_workflow_plugin_contract(effective_objective)
             if plugin_contract:
                 ledger.set_source_contract(
@@ -1017,6 +1032,12 @@ class RunEngine:
                     "risk_policy": request.risk_policy,
                     "control_policy": control_policy.to_dict(),
                 },
+            )
+            self._trace(
+                request=request,
+                run_id=run.run_id,
+                event_type="turn_relation",
+                data=turn_relation.to_dict(),
             )
             self._trace(
                 request=request,
@@ -1152,6 +1173,7 @@ class RunEngine:
                 request.user_message,
                 current_facts,
             )
+            turn_policy_intent = ""
 
             # ── Converged turn router ───────────────────────────────────────
             # One deterministic gate maps intent -> {tool palette, planner on/off,
@@ -1178,6 +1200,7 @@ class RunEngine:
                     event_type="turn_policy",
                     data=turn_policy.to_dict(),
                 )
+                turn_policy_intent = str(turn_policy.intent or "")
                 if turn_policy.tool_whitelist is not None:
                     _palette = set(turn_policy.tool_whitelist)
                     allowed_tools_list = [
@@ -1738,7 +1761,7 @@ class RunEngine:
                     packet=planning_packet,
                 )
 
-            if not selected_tools and not direct_fact_memory_only:
+            if not selected_tools and not direct_fact_memory_only and turn_policy_intent != "conversation_recall":
                 selected_tools = self._bootstrap_tools_for_turn(
                     user_message=request.user_message,
                     allowed_tools=allowed_tools_list,
@@ -1886,6 +1909,7 @@ class RunEngine:
                     context_block=acting_packet.content,
                     argument_clues=planned_argument_clues if planned_argument_clues else None,
                     run_id=run.run_id,
+                    run_ledger=ledger,
                 )
                 if tool_call is None:
                     break
@@ -2922,13 +2946,49 @@ class RunEngine:
                 conversation_tension=conversation_tension,
                 plan_steps=plan_steps_state,
             )
+            response_context_block = response_packet.content
+            answer_patch_for_response = self._extract_answer_patch(tool_results)
+            if answer_patch_for_response:
+                response_context_block = ""
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="response_context_elided",
+                    data={
+                        "reason": "deterministic_answer_patch",
+                        "patch_format": answer_patch_for_response.get("format"),
+                        "original_chars": len(response_packet.content or ""),
+                    },
+                )
+            elif self._should_use_lean_response_context(
+                user_message=request.user_message,
+                effective_objective=effective_objective,
+                workflow_shape=workflow_contract.workflow_shape,
+                tool_results=tool_results,
+                selected_tools=selected_tools,
+                current_facts=current_facts,
+                continuation_state=continuation_state if isinstance(continuation_state, dict) else {},
+                plan_steps=plan_steps_state,
+                session_history=list(getattr(session, "sliding_window", []) or []),
+            ):
+                response_context_block = ""
+                self._trace(
+                    request=request,
+                    run_id=run.run_id,
+                    event_type="response_context_elided",
+                    data={
+                        "reason": "lean_no_tool_turn",
+                        "workflow_shape": workflow_contract.workflow_shape,
+                        "original_chars": len(response_packet.content or ""),
+                    },
+                )
             final_messages = self._build_final_messages(
                 session=session,
                 system_prompt=session_system_prompt,
                 user_message=request.user_message,
                 effective_objective=effective_objective,
                 tool_results=tool_results,
-                context_block=response_packet.content,
+                context_block=response_context_block,
                 allowed_tools=[tool.get("name") for tool in allowed_tools_list if isinstance(tool, dict) and isinstance(tool.get("name"), str)],
                 controller_summary=self._build_controller_summary(
                     status=latest_observation_status,
@@ -3668,14 +3728,47 @@ class RunEngine:
         context_block: str,
         argument_clues: Optional[dict[str, str]] = None,
         run_id: str = "",
+        run_ledger: Optional[RunLedger] = None,
     ) -> Optional[ToolCall]:
         available_names = [name for name in allowed_tools if self.tool_registry.get(name) is not None]
         if not available_names:
             return None
-        effective_objective = self._resolve_effective_objective(
-            request.user_message,
-            list(getattr(session, "sliding_window", []) or []),
+        effective_objective = ""
+        if run_ledger is not None:
+            effective_objective = str(getattr(run_ledger, "objective", "") or "").strip()
+        if not effective_objective:
+            effective_objective = self._resolve_effective_objective(
+                request.user_message,
+                list(getattr(session, "sliding_window", []) or []),
+            )
+        if run_ledger is not None:
+            kernel_call = self._tool_call_from_language_kernel(
+                request=request,
+                run_id=run_id,
+                ledger=run_ledger,
+                available_names=available_names,
+            )
+            if kernel_call is not None:
+                return kernel_call
+        deterministic_call = self._deterministic_single_tool_call(
+            request=request,
+            run_id=run_id,
+            available_names=available_names,
+            effective_objective=effective_objective,
+            context_block=context_block,
+            argument_clues=argument_clues,
         )
+        if deterministic_call is not None:
+            return deterministic_call
+        language_kernel_context = ""
+        if run_ledger is not None:
+            from run_engine.language_kernel import build_kernel_snapshot
+
+            language_kernel_context = build_kernel_snapshot(
+                run_ledger,
+                ContextPhase.ACTING,
+                query=effective_objective,
+            ).render_for_actor()
 
         messages = [
             {
@@ -3692,6 +3785,7 @@ class RunEngine:
                     tool_results=tool_results,
                     context_block=context_block,
                     argument_clues=argument_clues,
+                    language_kernel_context=language_kernel_context,
                 ),
             },
         ]
@@ -3801,6 +3895,114 @@ class RunEngine:
                 return fallback
         return None
 
+    def _deterministic_single_tool_call(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        available_names: list[str],
+        effective_objective: str,
+        context_block: str,
+        argument_clues: Optional[dict[str, str]] = None,
+    ) -> Optional[ToolCall]:
+        """Skip the actor LLM when a single allowed tool has deterministic args."""
+        if len(available_names) != 1:
+            return None
+        name = available_names[0]
+        call: Optional[ToolCall] = None
+        clue = str((argument_clues or {}).get(name) or "").strip()
+        if clue and name in {"web_search", "rag_search"}:
+            call = fallback_tool_call(name, clue)
+        elif clue and name == "web_fetch":
+            url_match = _URL_RE.search(clue)
+            if url_match:
+                url = _canonical_fetch_url_for_loop(url_match.group(0))
+                if url:
+                    call = ToolCall(
+                        tool_name=name,
+                        arguments={"url": url},
+                        raw_json=json.dumps({"tool": name, "arguments": {"url": url}, "source": "deterministic_single_tool"}),
+                    )
+        if call is None and name == "web_fetch" and not re.search(r"https?://\S+", effective_objective or ""):
+            context_url = re.search(r"https?://[^\s\"'<>),]+", context_block or "")
+            if context_url:
+                url = _canonical_fetch_url_for_loop(context_url.group(0))
+                if url:
+                    call = ToolCall(
+                        tool_name=name,
+                        arguments={"url": url},
+                        raw_json=json.dumps({"tool": name, "arguments": {"url": url}, "source": "deterministic_single_tool"}),
+                    )
+        if call is None:
+            call = fallback_tool_call(name, effective_objective)
+        if call is None:
+            return None
+        validation_error = self.tool_registry.validate_tool_call(call)
+        if validation_error:
+            self._trace(
+                request=request,
+                run_id=run_id,
+                event_type="tool_call_deterministic_rejected",
+                data={
+                    "tool_name": name,
+                    "validation_error": validation_error,
+                    "arguments": dict(call.arguments or {}),
+                },
+            )
+            return None
+        self._trace(
+            request=request,
+            run_id=run_id,
+            event_type="tool_call_deterministic",
+            data={
+                "tool_name": call.tool_name,
+                "arguments": dict(call.arguments or {}),
+                "source": "single_allowed_tool",
+            },
+        )
+        return call
+
+    def _tool_call_from_language_kernel(
+        self,
+        *,
+        request: RunEngineRequest,
+        run_id: str,
+        ledger: RunLedger,
+        available_names: list[str],
+    ) -> Optional[ToolCall]:
+        next_action = ledger.next_required_action()
+        tool_name = str(next_action.get("tool") or "").strip()
+        arguments = next_action.get("arguments") if isinstance(next_action.get("arguments"), dict) else {}
+        if not tool_name or tool_name not in available_names or not arguments:
+            return None
+        validation = ledger.validate_tool_call_against_policy(tool_name, dict(arguments))
+        if not validation.valid:
+            return None
+        payload = {
+            "tool_name": tool_name,
+            "arguments": dict(arguments),
+            "reason": str(next_action.get("reason") or "language_kernel_next_action"),
+            "missing_slots": list(next_action.get("missing_slots") or []),
+            "policy": str(getattr(ledger.control_policy, "id", "") or ""),
+        }
+        self._trace(
+            request=request,
+            run_id=run_id,
+            event_type="language_kernel_next_action",
+            data=payload,
+        )
+        ledger.append_event(
+            "language_kernel_next_action",
+            source="language_kernel",
+            status="selected",
+            data=payload,
+        )
+        return ToolCall(
+            tool_name=tool_name,
+            arguments=dict(arguments),
+            raw_json=json.dumps({"tool": tool_name, "arguments": dict(arguments), "source": "language_kernel"}),
+        )
+
     def _build_actor_request_content(
         self,
         *,
@@ -3811,6 +4013,7 @@ class RunEngine:
         tool_results: list[dict[str, Any]],
         context_block: str,
         argument_clues: Optional[dict[str, str]] = None,
+        language_kernel_context: str = "",
     ) -> str:
         capability_context = render_capability_cards(
             allowed_tools=allowed_tools,
@@ -3826,6 +4029,7 @@ class RunEngine:
             clip_text=self._clip,
             argument_clues=argument_clues,
             capability_context=capability_context,
+            language_kernel_context=language_kernel_context,
         )
 
     @staticmethod
@@ -3912,6 +4116,20 @@ class RunEngine:
             add("image_generate")
         if re.search(r"\b(image|photo|picture|screenshot|logo)\b", lowered):
             add("image_search")
+        if re.search(
+            r"\b(top\s+)?(?:gainers?|losers?|movers?|most\s+active|market\s+movers?)\b",
+            lowered,
+        ) and re.search(r"\b(stock|stocks|ticker|tickers|market|markets|today|latest|current)\b", lowered):
+            add("alpha_vantage_movers")
+        if re.search(
+            r"\b(finance|financial|snapshot|stock|stocks|ticker|tickers|quote|price|fundamental|fundamentals|"
+            r"earnings|revenue|market\s+cap|valuation|sentiment|analyst|analysis|report)\b",
+            lowered,
+        ):
+            add("finance_snapshot")
+            add("alpha_vantage_quote")
+            add("alpha_vantage_overview")
+            add("alpha_vantage_news")
         if re.search(r"\b(remember|memory|previously|earlier|recall)\b", lowered):
             add("query_memory")
             add("rag_search")
@@ -3923,7 +4141,10 @@ class RunEngine:
             r"\b(recent|previous|prior|last|earlier|past|our|the)\b[\w\s]{0,20}\b(chat|conversation|conversations|message|messages|discussion|thread|history)\b",
             lowered,
         ) or re.search(
-            r"\bwhat did (?:we|i|you)\b|\b(chat|conversation) history\b|\bread (?:the )?(?:recent |last )?(?:chat|conversation)\b",
+            r"\bwhat did (?:we|i|you)\b|\bwhat (?:were|was) (?:we|i|you)\b[\w\s]{0,16}\b(?:talking|chat(?:t)?ing|discussing)\b|"
+            r"\b(?:you|u)\s+(?:forgot|lost|missed)\b[\w\s]{0,24}\b(?:chat|conversation|context|thread|talking|chat(?:t)?ing|discussing)\b|"
+            r"\b(?:we|you|i)\s+were\b[\w\s]{0,12}\b(?:talking|chat(?:t)?ing|discussing)\b|"
+            r"\b(chat|conversation) history\b|\bread (?:the )?(?:recent |last )?(?:chat|conversation)\b",
             lowered,
         ):
             add("query_memory")
@@ -4003,9 +4224,39 @@ class RunEngine:
         return messages
 
     @staticmethod
+    def _should_use_lean_response_context(
+        *,
+        user_message: str,
+        effective_objective: str,
+        workflow_shape: str,
+        tool_results: list[dict[str, Any]],
+        selected_tools: list[str],
+        current_facts: Optional[list[tuple[str, str, str]]],
+        continuation_state: dict[str, Any],
+        plan_steps: Optional[list[dict[str, Any]]],
+        session_history: list[dict[str, Any]],
+    ) -> bool:
+        if tool_results or selected_tools or current_facts or continuation_state or plan_steps:
+            return False
+        if len(session_history or []) > 2:
+            return False
+        text = f"{user_message}\n{effective_objective}".lower()
+        if len(text) > 360:
+            return False
+        if workflow_shape in {"source_collection", "research_report", "coding_change", "memory_correction"}:
+            return False
+        if re.search(
+            r"\b(search|fetch|research|analy[sz]e|compare|latest|today|current|news|price|stock|stocks|"
+            r"quote|finance|financial|fundamental|weather|near me|remember|memory|file|code|implement|fix)\b",
+            text,
+        ):
+            return False
+        return True
+
+    @staticmethod
     def _extract_answer_patch(tool_results: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
         for item in reversed(tool_results or []):
-            if item.get("tool_name") != "shopping_advice":
+            if item.get("tool_name") not in {"shopping_advice", "finance_snapshot"}:
                 continue
             try:
                 content = json.loads(str(item.get("content") or "{}"))
@@ -4014,7 +4265,10 @@ class RunEngine:
             if isinstance(content, dict) and isinstance(content.get("answer_patch"), dict):
                 return {
                     "verified_urls": content.get("verified_urls") or [],
+                    "source_urls": content.get("answer_patch", {}).get("source_urls") or content.get("source_urls") or [],
                     "warnings": content.get("warnings") or [],
+                    "provider": content.get("provider"),
+                    "symbol": content.get("symbol"),
                     **content["answer_patch"],
                 }
         return None
@@ -4176,6 +4430,86 @@ class RunEngine:
                     ledger=run_ledger,
                     outcome=outcome,
                     path="deterministic_governor",
+                )
+            return
+        current_turn = self._message_count(session_id, request.owner_id)
+        compression_mode = str(os.getenv("SHOVSOS_LLM_COMPRESSION_MODE", "adaptive") or "adaptive")
+        try:
+            compression_interval = int(os.getenv("SHOVSOS_LLM_COMPRESSION_INTERVAL", "6") or "6")
+        except ValueError:
+            compression_interval = 6
+        should_compress_with_llm = should_run_llm_memory_compression(
+            request.user_message,
+            assistant_response,
+            is_first_exchange=is_first_exchange,
+            deterministic_fact_count=len(deterministic_keyed_facts or []),
+            void_count=len(deterministic_voids or []),
+            candidate_signal_count=len(stance_signals or []),
+            turn=current_turn,
+            interval=max(0, compression_interval),
+            mode=compression_mode,
+        )
+        if not should_compress_with_llm:
+            commit_plan = self._context_governor.build_memory_commit_plan(
+                user_message=request.user_message,
+                tool_results=tool_results,
+                deterministic_keyed_facts=deterministic_keyed_facts,
+                deterministic_voids=deterministic_voids,
+                current_facts=current_facts,
+                existing_candidate_signals=existing_candidate_signals,
+                existing_candidate_context=existing_candidate_context,
+                new_candidate_signals=stance_signals,
+                current_turn=current_turn,
+            )
+            self._trace_memory_commit_plan(
+                request=request,
+                run_id=run_id,
+                plan=commit_plan,
+                conversation_tension=conversation_tension,
+                memory_packet=memory_packet,
+                path="adaptive_deterministic_governor",
+            )
+            self._trace(
+                request=request,
+                run_id=run_id,
+                event_type="llm_compression_skipped",
+                data={
+                    "reason": "adaptive_gate",
+                    "mode": compression_mode,
+                    "turn": current_turn,
+                    "interval": compression_interval,
+                    "deterministic_fact_count": len(deterministic_keyed_facts or []),
+                    "void_count": len(deterministic_voids or []),
+                    "candidate_signal_count": len(stance_signals or []),
+                },
+            )
+            outcome = await self._context_governor.apply_memory_commit(
+                sessions=self.sessions,
+                session_id=session_id,
+                owner_id=request.owner_id,
+                agent_id=request.agent_id,
+                turn=current_turn,
+                run_id=run_id,
+                user_message=request.user_message,
+                assistant_response=assistant_response,
+                plan=commit_plan,
+                current_context=current_context,
+                planned_locus_id=planned_locus_id,
+            )
+            if outcome.indexed_fact_keys:
+                self._trace(
+                    request=request,
+                    run_id=run_id,
+                    event_type="facts_indexed",
+                    data={"facts": list(outcome.indexed_fact_keys), "context_lines": outcome.context_lines},
+                )
+            if run_ledger is not None:
+                self._record_memory_outcome(
+                    request=request,
+                    run_id=run_id,
+                    ledger=run_ledger,
+                    outcome=outcome,
+                    path="adaptive_deterministic_governor",
                 )
             return
         maybe_result = context_engine.compress_exchange(

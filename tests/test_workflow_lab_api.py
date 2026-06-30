@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from api.main import app
 from api.workflow_lab import (
     WorkflowRunStore,
+    build_custom_workflow_definition,
     execute_live_workflow_run,
     get_workflow_definition,
     make_workflow_lab_router,
@@ -133,6 +134,69 @@ def test_workflow_runs_are_durable(tmp_path):
     assert reloaded["workflow_id"] == "local_recommendation_v1"
     assert len(reloaded["events"]) >= 5
     assert reloaded["result"]["output_schema"]["type"] == "ranked_local_options"
+
+
+def test_custom_workflow_definition_can_be_created_and_run(tmp_path):
+    store = WorkflowRunStore(str(tmp_path / "workflow_runs.db"))
+    definition = build_custom_workflow_definition(
+        {
+            "label": "Receipt Checker",
+            "description": "Check receipt photos and summarize questionable charges.",
+            "policy": "react",
+            "tools": ["query_memory"],
+            "input_fields": ["question", "image_count"],
+            "output_fields": ["answer", "visible_details", "uncertainties"],
+        }
+    )
+    store.save_workflow_definition(definition, owner_id="owner-custom")
+
+    catalog = workflow_catalog(store=store, owner_id="owner-custom")
+    assert any(item["id"] == definition.id for item in catalog["workflows"])
+
+    record = start_workflow_run(
+        definition.id,
+        {"input": {"question": "What is on this receipt?", "image_count": 1}},
+        store=store,
+    )
+
+    assert record["status"] == "completed"
+    assert record["definition"]["id"] == definition.id
+    assert record["result"]["output_schema"]["fields"] == ["answer", "visible_details", "uncertainties"]
+
+
+def test_workflow_lab_api_creates_custom_workflow_and_runs_it(tmp_path):
+    store = WorkflowRunStore(str(tmp_path / "workflow_runs.db"))
+    test_app = FastAPI()
+    test_app.include_router(make_workflow_lab_router(store=store, default_model="fake:model"))
+    client = TestClient(test_app)
+
+    created = client.post(
+        "/workflow-lab/workflows",
+        json={
+            "label": "Store Price Watch",
+            "description": "Compare a product across stores and return a compact table.",
+            "tools": ["web_search", "web_fetch"],
+            "input_fields": ["product", "location", "stores"],
+            "output_fields": ["best_option", "prices", "source_urls"],
+        },
+    )
+
+    assert created.status_code == 200
+    workflow = created.json()["workflow"]
+    assert workflow["id"].startswith("store_price_watch")
+    assert workflow["custom"] is True or workflow["id"]
+
+    catalog = client.get("/workflow-lab/catalog")
+    assert any(item["id"] == workflow["id"] for item in catalog.json()["workflows"])
+
+    run = client.post(
+        f"/workflow-lab/workflows/{workflow['id']}/runs",
+        json={"input": {"product": "chair", "location": "Toronto", "stores": "Walmart"}},
+    )
+    assert run.status_code == 200
+    status = client.get(run.json()["status_url"])
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
 
 
 class FakeRunEngine:

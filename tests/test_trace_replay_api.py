@@ -109,6 +109,33 @@ def test_trace_run_replay_assembles_run_state():
         run_id=run_id,
         owner_id=owner_id,
     )
+    trace_store.append_event(
+        "default",
+        session_id,
+        "run_ledger",
+        {
+            "version": "run-ledger-v1",
+            "objective": "Investigate wigglebudget.com.",
+            "language_kernel": {
+                "version": "language-kernel-v1",
+                "ui_run_map": {
+                    "version": "agent-native-run-map-v1",
+                    "next_focus": "response",
+                    "sections": [
+                        {"id": "objective", "label": "Objective", "status": "active", "count": 1},
+                        {"id": "plan", "label": "Plan", "status": "active", "count": 1},
+                        {"id": "tools", "label": "Tools", "status": "active", "count": 1},
+                        {"id": "evidence", "label": "Evidence", "status": "active", "count": 1},
+                        {"id": "memory", "label": "Memory", "status": "not_recorded", "count": 0},
+                        {"id": "verification", "label": "Verification", "status": "passed", "count": 0},
+                        {"id": "response", "label": "Response", "status": "allowed", "count": 1},
+                    ],
+                },
+            },
+        },
+        run_id=run_id,
+        owner_id=owner_id,
+    )
 
     with TestClient(app) as client:
         response = client.get(
@@ -132,6 +159,17 @@ def test_trace_run_replay_assembles_run_state():
     assert payload["evidence"][0]["item_id"] == "working_evidence"
     assert payload["evidence"][0]["provenance"]["selected_count"] == 1
     assert payload["artifacts"][0]["artifact_type"] == "assistant_response"
+    assert payload["operator_story"]["source"] == "language_kernel"
+    assert [lane["id"] for lane in payload["operator_story"]["lanes"]] == [
+        "objective",
+        "plan",
+        "tools",
+        "evidence",
+        "memory",
+        "verification",
+        "response",
+    ]
+    assert payload["operator_story"]["next_best_action"] == "Next focus: response"
 
 
 def test_trace_run_replay_requires_owner_match():

@@ -42,6 +42,7 @@ from run_engine import RunEngineRequest
 def setup_voice_routes(app: FastAPI, *, run_engine, profile_manager) -> None:
     """Register voice WebSocket endpoint."""
 
+    @app.websocket("/api/ws/voice")
     @app.websocket("/ws/voice")
     async def voice_endpoint(ws: WebSocket):
         await ws.accept()

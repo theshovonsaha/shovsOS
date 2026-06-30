@@ -10,7 +10,7 @@ forcing the engine module to load too.
 
 from __future__ import annotations
 
-__all__ = ["RunEngine", "RunEngineRequest"]
+__all__ = ["RunEngine", "RunEngineRequest", "build_kernel_snapshot"]
 
 
 def __getattr__(name: str):
@@ -20,4 +20,7 @@ def __getattr__(name: str):
     if name == "RunEngineRequest":
         from run_engine.types import RunEngineRequest
         return RunEngineRequest
+    if name == "build_kernel_snapshot":
+        from run_engine.language_kernel import build_kernel_snapshot
+        return build_kernel_snapshot
     raise AttributeError(f"module 'run_engine' has no attribute {name!r}")

@@ -7810,6 +7810,17 @@ body,
   border-left: 3px solid rgba(247, 200, 111, 0.86);
 }
 
+.trace-lane-card.kernel-map-card {
+  min-height: 112px;
+  background:
+    linear-gradient(180deg, rgba(98, 214, 200, 0.035), transparent),
+    rgba(255, 255, 255, 0.024);
+}
+
+.trace-lane-card.kernel-map-card.state-idle {
+  border-left: 3px solid rgba(172, 190, 214, 0.2);
+}
+
 .trace-lane-index {
   color: rgba(232, 241, 251, 0.42);
   font-family: var(--mono);
@@ -9422,6 +9433,13 @@ body,
   line-height: 1.45;
 }
 
+.workflow-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 .workflow-lab-grid {
   display: grid;
   grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
@@ -9682,6 +9700,74 @@ body,
   line-height: 1.5;
 }
 
+.workflow-create-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.workflow-create-intro {
+  padding: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 10px;
+  background: rgba(248, 250, 252, 0.78);
+}
+
+.workflow-create-intro strong {
+  display: block;
+  color: var(--text-main, #172033);
+  font-size: 15px;
+}
+
+.workflow-create-intro p {
+  margin: 5px 0 0;
+  color: var(--text-muted, #64748b);
+  line-height: 1.45;
+}
+
+.workflow-create-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.workflow-create-grid label {
+  display: grid;
+  gap: 7px;
+  color: var(--text-muted, #64748b);
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.workflow-create-grid .span-2 {
+  grid-column: 1 / -1;
+}
+
+.workflow-create-grid input,
+.workflow-create-grid select,
+.workflow-create-grid textarea {
+  width: 100%;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 10px;
+  padding: 10px 11px;
+  background: rgba(255, 255, 255, 0.86);
+  color: var(--text-main, #172033);
+  font: inherit;
+  font-size: 13px;
+  text-transform: none;
+}
+
+.workflow-create-grid textarea {
+  min-height: 92px;
+  resize: vertical;
+  line-height: 1.45;
+}
+
+.workflow-create-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .workflow-schema-grid pre,
 .workflow-api-panel pre {
   max-height: 280px;
@@ -9804,6 +9890,7 @@ body,
   .workflow-summary-row,
   .workflow-run-controls,
   .workflow-builder-grid,
+  .workflow-create-grid,
   .workflow-detail-grid,
   .workflow-schema-grid,
   .workflow-result-grid,
@@ -9908,6 +9995,7 @@ body,
 .workflow-result-grid div,
 .workflow-step-timeline button,
 .workflow-step-detail,
+.workflow-create-intro,
 .workflow-event-row,
 .workflow-empty,
 .workflow-error,
@@ -9978,6 +10066,10 @@ body,
   color: var(--lab-text);
 }
 
+.workflow-create-intro strong {
+  color: var(--lab-text);
+}
+
 .harness-compare-score-row span,
 .harness-trace-summary span,
 .harness-run-map-step span,
@@ -10000,7 +10092,10 @@ body,
 
 .harness-run-box textarea,
 .workflow-run-panel textarea,
-.workflow-run-controls select {
+.workflow-run-controls select,
+.workflow-create-grid input,
+.workflow-create-grid select,
+.workflow-create-grid textarea {
   border-color: var(--lab-border);
   background: rgba(8, 12, 18, 0.72);
   color: var(--lab-text);
@@ -10008,9 +10103,17 @@ body,
 
 .harness-run-box textarea:focus,
 .workflow-run-panel textarea:focus,
-.workflow-run-controls select:focus {
+.workflow-run-controls select:focus,
+.workflow-create-grid input:focus,
+.workflow-create-grid select:focus,
+.workflow-create-grid textarea:focus {
   border-color: var(--lab-border-strong);
   outline: none;
+}
+
+.workflow-create-intro p,
+.workflow-create-grid label {
+  color: var(--lab-muted);
 }
 
 .workflow-schema-grid pre,

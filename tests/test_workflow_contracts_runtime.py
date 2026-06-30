@@ -147,6 +147,57 @@ def test_workflow_contract_updates_from_tool_results_without_new_entity_drift():
     assert updated.completion_gate.final_answer_allowed is False
 
 
+def test_workflow_contract_counts_only_actual_fetch_calls_not_links_inside_pages():
+    contract = infer_workflow_contract(
+        "Search top 3 stocks separately and collect 3 URLs for each, fetch all 9 URLs.",
+        allowed_tools=["web_search", "web_fetch"],
+    )
+    contract = replace(
+        contract,
+        entity_locks=[
+            EntityLock(value="ROKU", entity_type="ticker", source="morningstar", status="locked"),
+            EntityLock(value="TBN", entity_type="ticker", source="morningstar", status="locked"),
+            EntityLock(value="SENEA", entity_type="ticker", source="morningstar", status="locked"),
+        ],
+    )
+
+    updated = update_contract_from_tool_results(
+        contract,
+        [
+            {
+                "tool_name": "web_search",
+                "success": True,
+                "arguments": {"query": "ROKU stock news June 13 2026"},
+                "content": "https://news.example/roku-1 https://news.example/roku-2 https://news.example/roku-3",
+            },
+            {
+                "tool_name": "web_search",
+                "success": True,
+                "arguments": {"query": "TBN stock news June 13 2026"},
+                "content": "https://news.example/tbn-1 https://news.example/tbn-2 https://news.example/tbn-3",
+            },
+            {
+                "tool_name": "web_search",
+                "success": True,
+                "arguments": {"query": "SENEA stock news June 13 2026"},
+                "content": "https://news.example/senea-1 https://news.example/senea-2 https://news.example/senea-3",
+            },
+            {
+                "tool_name": "web_fetch",
+                "success": True,
+                "arguments": {"url": "https://news.example/roku-1"},
+                "content": "Fetched page linking https://news.example/tbn-1 https://news.example/senea-1",
+            },
+        ],
+        tool_turn=6,
+        max_tool_turns=15,
+    )
+
+    assert updated.metadata["fetched_url_count"] == 1
+    assert "total_fetched_urls" in updated.completion_gate.missing_slots
+    assert updated.completion_gate.final_answer_allowed is False
+
+
 def test_ledger_phase_packet_exposes_workflow_contract_and_attention():
     request = RunEngineRequest(
         session_id="contract-packet",

@@ -161,6 +161,7 @@ const HUMAN_EVENT_LABELS: Record<string, string> = {
   prompt_components: 'Prompt Built',
   assistant_response: 'Answer Ready',
   route_decision: 'Route Selected',
+  turn_relation: 'Turn Relation',
   control_policy: 'Control Policy',
   policy_selected: 'Policy Selected',
   policy_violation: 'Policy Violation',
@@ -240,6 +241,8 @@ function humanStageLabel(eventType: string): string {
       return 'Tension Check';
     case 'route_decision':
       return 'Routing';
+    case 'turn_relation':
+      return 'Context Relation';
     default:
       return humanizeTraceEvent(eventType);
   }

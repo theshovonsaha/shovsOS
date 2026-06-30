@@ -15,11 +15,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Literal, Optional
+from config.config import cfg
 
 TaskStatus = Literal["pending", "in_progress", "completed"]
 TaskPriority = Literal["low", "medium", "high"]
 
-_DEFAULT_DB_PATH = "session_tasks.db"
+_DEFAULT_DB_PATH = cfg.SESSION_TASKS_DB
 
 
 @dataclass
@@ -37,7 +38,7 @@ class SessionTaskTracker:
         self._tasks_by_session: dict[str, list[Task]] = {}
         self._meta_by_session: dict[str, dict] = {}
         self._lock = RLock()
-        self._db_path = db_path or _DEFAULT_DB_PATH
+        self._db_path = str(Path(db_path or _DEFAULT_DB_PATH).expanduser().resolve())
         self._db_lock = threading.Lock()
         try:
             self._init_db()

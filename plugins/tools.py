@@ -41,6 +41,7 @@ import httpx
 
 from engine.direct_fact_policy import normalize_memory_predicate
 from plugins.tool_registry import Tool, ToolRegistry
+from plugins.finance_alpha_vantage import ALPHA_VANTAGE_TOOLS
 from plugins.tools_web import (
     WEB_FETCH_TOOL as CANONICAL_WEB_FETCH_TOOL,
     WEB_SEARCH_TOOL as CANONICAL_WEB_SEARCH_TOOL,
@@ -3087,6 +3088,7 @@ ALL_TOOLS = [
     WEB_FETCH_BATCH_TOOL,
     SOURCE_COVERAGE_TOOL,
     SHOPPING_ADVICE_TOOL,
+    *ALPHA_VANTAGE_TOOLS,
     IMAGE_SEARCH_TOOL,
     IMAGE_GENERATE_TOOL,
     BASH_TOOL,

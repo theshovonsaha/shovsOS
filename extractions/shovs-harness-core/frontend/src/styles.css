@@ -258,6 +258,47 @@ textarea {
   text-transform: uppercase;
 }
 
+.backendStatus {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #eef5f8;
+  border: 1px solid #d6e5eb;
+}
+
+.backendStatus strong {
+  color: #1c657d;
+  text-transform: uppercase;
+  font-size: 0.78rem;
+}
+
+.backendStatus span {
+  color: #526273;
+  line-height: 1.4;
+}
+
+.backendStatus.ready {
+  background: #eef8f4;
+  border-color: #cce7db;
+}
+
+.backendStatus.error {
+  background: #fff1ef;
+  border-color: #efd0cc;
+}
+
+.backendStatus.error strong {
+  color: #9b3f39;
+}
+
+.card button[data-backend-run] {
+  width: 100%;
+  padding: 10px 12px;
+  font-weight: 750;
+}
+
 .decision.act strong {
   background: #eef4f8;
   color: #1c657d;

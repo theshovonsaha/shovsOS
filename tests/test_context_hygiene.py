@@ -6,7 +6,12 @@ import pytest
 from engine.context_engine import ContextEngine
 from engine.context_engine_v2 import ContextEngineV2
 from engine.context_engine_v3 import ContextEngineV3
-from engine.context_hygiene import is_low_value_social_turn, should_skip_memory_compression
+from engine.context_hygiene import (
+    has_durable_memory_signal,
+    is_low_value_social_turn,
+    should_run_llm_memory_compression,
+    should_skip_memory_compression,
+)
 
 
 def test_low_value_social_turn_detection_keeps_action_turns():
@@ -16,6 +21,41 @@ def test_low_value_social_turn_detection_keeps_action_turns():
     assert not is_low_value_social_turn("hello search Toronto sushi")
     assert not is_low_value_social_turn("continue")
     assert not is_low_value_social_turn("call me Shovon")
+
+
+def test_adaptive_llm_compression_policy_skips_ordinary_turns():
+    assert not should_run_llm_memory_compression(
+        "What is the capital of Japan?",
+        "Tokyo.",
+        turn=1,
+        interval=6,
+    )
+    assert should_run_llm_memory_compression(
+        "Remember that I prefer concise answers.",
+        "Got it.",
+        turn=1,
+        interval=6,
+    )
+    assert should_run_llm_memory_compression(
+        "What should we do next?",
+        "Here is a plan.",
+        deterministic_fact_count=1,
+        turn=1,
+        interval=6,
+    )
+    assert should_run_llm_memory_compression(
+        "Continue the discussion.",
+        "Done.",
+        turn=6,
+        interval=6,
+    )
+    assert not should_run_llm_memory_compression(
+        "Remember this.",
+        "Done.",
+        mode="off",
+        turn=1,
+    )
+    assert has_durable_memory_signal("Actually, update my preferred editor to VS Code.")
 
 
 @pytest.mark.asyncio

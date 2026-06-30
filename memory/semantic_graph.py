@@ -17,6 +17,7 @@ from collections import OrderedDict
 import numpy as np
 import httpx
 from datetime import datetime
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from config.config import cfg
 
@@ -26,8 +27,8 @@ class SemanticGraph:
     _embedding_cache: "OrderedDict[str, List[float]]" = OrderedDict()
     _cache_lock = threading.RLock()
 
-    def __init__(self, db_path: str = "memory_graph.db", embedding_model: Optional[str] = None):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None, embedding_model: Optional[str] = None):
+        self.db_path = str(Path(db_path or cfg.MEMORY_GRAPH_DB).expanduser().resolve())
         self.embedding_model = embedding_model or cfg.EMBED_MODEL
         self.embedding_timeout = float(getattr(cfg, "EMBEDDING_HTTP_TIMEOUT", 20.0))
         self.embedding_retries = max(0, int(getattr(cfg, "EMBEDDING_HTTP_RETRIES", 2)))
@@ -148,6 +149,7 @@ class SemanticGraph:
 
     def _init_db(self):
         """Initialize the SQLite schema."""
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.db_path) as conn:
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS loci (

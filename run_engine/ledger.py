@@ -249,6 +249,7 @@ class RunLedger:
     pass_graph_execution: Optional[PassGraphExecution] = None
     pass_graph_phase_marks: list[str] = field(default_factory=list)
     control_policy: Optional[ControlPolicy] = None
+    turn_relation: dict[str, Any] = field(default_factory=dict)
     locked_entities: list[dict[str, Any]] = field(default_factory=list)
     source_contract: dict[str, Any] = field(default_factory=dict)
     policy_violations: list[dict[str, Any]] = field(default_factory=list)
@@ -559,6 +560,17 @@ class RunLedger:
             data=policy.to_dict(),
         )
 
+    def set_turn_relation(self, relation: dict[str, Any], *, source: str = "turn_relation") -> None:
+        if not isinstance(relation, dict):
+            return
+        self.turn_relation = dict(relation)
+        self.append_event(
+            "turn_relation",
+            source=source,
+            status=str(relation.get("relation") or "classified"),
+            data=dict(relation),
+        )
+
     def lock_entities(
         self,
         entities: list[str],
@@ -844,6 +856,9 @@ class RunLedger:
     def to_phase_packet(self, phase: ContextPhase | str) -> dict[str, Any]:
         phase_value = phase.value if isinstance(phase, ContextPhase) else str(phase)
         attention = self.attention_for_phase(phase_value)
+        from run_engine.language_kernel import build_kernel_snapshot
+
+        language_kernel = build_kernel_snapshot(self, phase_value).to_dict()
         return {
             "version": self.version,
             "ledger_mode": self.ledger_mode,
@@ -866,6 +881,7 @@ class RunLedger:
             "pass_graph": self.pass_graph.to_dict() if self.pass_graph else None,
             "pass_graph_execution": self.pass_graph_execution.to_dict() if self.pass_graph_execution else None,
             "control_policy": self.control_policy.to_dict() if self.control_policy else None,
+            "turn_relation": dict(self.turn_relation or {}),
             "locked_entities": [dict(item) for item in self.locked_entities],
             "source_contract": dict(self.source_contract or {}),
             "policy_violations": [dict(item) for item in self.policy_violations],
@@ -873,6 +889,7 @@ class RunLedger:
             "completion_gate": self.completion_gate(),
             "missing_requirements": self.missing_requirements(),
             "runtime_attention": attention.to_dict(),
+            "language_kernel": language_kernel,
             "summary": {
                 "event_count": len(self.events),
                 "tool_calls": len(self.tool_calls),
@@ -916,6 +933,12 @@ class RunLedger:
             )
         if self.control_policy is not None:
             lines.append(self.control_policy.render())
+        if self.turn_relation:
+            lines.append(
+                "Turn relation: "
+                f"{self.turn_relation.get('relation')} "
+                f"({self.turn_relation.get('reason', 'no reason recorded')})"
+            )
         if self.locked_entities:
             lines.append("Locked entities:")
             for entity in self.locked_entities[:8]:

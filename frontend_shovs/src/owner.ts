@@ -1,10 +1,7 @@
 const OWNER_STORAGE_KEY = 'shovs_owner_id';
 
 function createOwnerId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `owner_${Date.now().toString(16)}_${Math.random().toString(16).slice(2, 10)}`;
+  return 'local-owner';
 }
 
 export function getOwnerId(): string {

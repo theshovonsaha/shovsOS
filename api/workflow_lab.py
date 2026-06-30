@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sqlite3
 import uuid
 from copy import deepcopy
@@ -95,6 +96,162 @@ class WorkflowDefinition:
             "steps": [step.to_dict() for step in self.steps],
             "tags": list(self.tags),
         }
+
+
+def _workflow_definition_from_dict(payload: dict[str, Any]) -> WorkflowDefinition:
+    runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+    output_schema = payload.get("output_schema") if isinstance(payload.get("output_schema"), dict) else {}
+    fields = output_schema.get("fields") if isinstance(output_schema.get("fields"), list) else []
+    steps_payload = payload.get("steps") if isinstance(payload.get("steps"), list) else []
+    steps = tuple(
+        WorkflowStepDefinition(
+            id=str(item.get("id") or f"step_{index + 1}"),
+            label=str(item.get("label") or f"Step {index + 1}"),
+            kind=str(item.get("kind") or "step"),
+            description=str(item.get("description") or ""),
+            consumes=tuple(str(value) for value in item.get("consumes", []) if str(value).strip())
+            if isinstance(item, dict) and isinstance(item.get("consumes"), list)
+            else (),
+            produces=tuple(str(value) for value in item.get("produces", []) if str(value).strip())
+            if isinstance(item, dict) and isinstance(item.get("produces"), list)
+            else (),
+            gates=tuple(str(value) for value in item.get("gates", []) if str(value).strip())
+            if isinstance(item, dict) and isinstance(item.get("gates"), list)
+            else (),
+        )
+        for index, item in enumerate(steps_payload)
+        if isinstance(item, dict)
+    )
+    return WorkflowDefinition(
+        id=str(payload.get("id") or ""),
+        label=str(payload.get("label") or "Custom Workflow"),
+        description=str(payload.get("description") or ""),
+        template=str(payload.get("template") or "custom_workflow_v1"),
+        policy=str(runtime.get("policy") or payload.get("policy") or "plan_execute"),
+        ledger_mode=str(runtime.get("ledger_mode") or payload.get("ledger_mode") or "ledger_enforced"),
+        context_mode=str(runtime.get("context_mode") or payload.get("context_mode") or "ladder"),
+        prompt_version=str(runtime.get("prompt_version") or payload.get("prompt_version") or "custom_contract_v1"),
+        risk_policy=str(runtime.get("risk_policy") or payload.get("risk_policy") or "evidence_first"),
+        tools=tuple(str(item).strip() for item in (payload.get("tools") or []) if str(item).strip()),
+        memory_policy=dict(payload.get("memory_policy") or {"read": [], "write": "explicit_user_preferences_only", "provenance_required": True}),
+        input_schema=dict(payload.get("input_schema") or {"query": "string"}),
+        output_schema={
+            "type": str(output_schema.get("type") or payload.get("output_type") or "custom_result"),
+            "fields": [str(item) for item in fields if str(item).strip()] or ["summary", "sources", "unresolved"],
+        },
+        steps=steps or COMMON_SOURCE_STEPS,
+        tags=tuple(str(item).strip() for item in (payload.get("tags") or ["custom"]) if str(item).strip()),
+    )
+
+
+def _slugify_workflow_id(label: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "_", str(label or "custom_workflow").lower()).strip("_")
+    if not base:
+        base = "custom_workflow"
+    if not base.endswith("_v1"):
+        base = f"{base}_v1"
+    return base[:80]
+
+
+def _list_from_text_or_array(value: Any, *, fallback: list[str]) -> list[str]:
+    if isinstance(value, list):
+        items = value
+    else:
+        items = re.split(r"[,\\n]+", str(value or ""))
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+    return cleaned or list(fallback)
+
+
+def build_custom_workflow_definition(payload: dict[str, Any], *, existing_ids: set[str] | None = None) -> WorkflowDefinition:
+    label = str(payload.get("label") or "Custom Workflow").strip() or "Custom Workflow"
+    workflow_id = str(payload.get("id") or "").strip() or _slugify_workflow_id(label)
+    existing = set(existing_ids or set())
+    if workflow_id in WORKFLOW_DEFINITIONS or workflow_id in existing:
+        workflow_id = f"{workflow_id}_{uuid.uuid4().hex[:6]}"
+    policy = str(payload.get("policy") or "plan_execute").strip()
+    if policy not in {"react", "plan_execute", "graph_harness"}:
+        policy = "plan_execute"
+    tools = _list_from_text_or_array(
+        payload.get("tools"),
+        fallback=["web_search", "web_fetch", "source_collect", "source_contract", "source_select", "query_memory"],
+    )
+    input_fields = _list_from_text_or_array(payload.get("input_fields"), fallback=["query"])
+    output_fields = _list_from_text_or_array(payload.get("output_fields"), fallback=["summary", "sources", "unresolved"])
+    use_case = str(payload.get("use_case") or payload.get("description") or "").strip()
+    steps = (
+        WorkflowStepDefinition(
+            id="intake",
+            label="Input",
+            kind="input",
+            description="Normalize external input into the workflow objective and constraints.",
+            consumes=("external_input",),
+            produces=("objective", "constraints"),
+        ),
+        WorkflowStepDefinition(
+            id="context",
+            label="Context",
+            kind="context",
+            description="Build a compact context ladder from active input, memory policy, and workflow contract.",
+            consumes=("objective",),
+            produces=("context_ladder",),
+            gates=("hide_stale_memory",),
+        ),
+        WorkflowStepDefinition(
+            id="plan",
+            label="Plan",
+            kind="prompt",
+            description="Select allowed tools and commit the next required action before execution.",
+            consumes=("context_ladder",),
+            produces=("plan", "next_required_action"),
+            gates=("allowed_tools_only",),
+        ),
+        WorkflowStepDefinition(
+            id="tools",
+            label="Tools",
+            kind="tool",
+            description="Execute allowed tools and store tool results as evidence references.",
+            consumes=("next_required_action",),
+            produces=("tool_results", "evidence_refs"),
+        ),
+        WorkflowStepDefinition(
+            id="verify",
+            label="Verify",
+            kind="verify",
+            description="Check completion gates and mark unresolved fields instead of guessing.",
+            consumes=("evidence_refs",),
+            produces=("verification",),
+            gates=("no_fake_evidence",),
+        ),
+        WorkflowStepDefinition(
+            id="response",
+            label="Response",
+            kind="response",
+            description="Return the configured output schema.",
+            consumes=("verification",),
+            produces=("result",),
+        ),
+    )
+    return WorkflowDefinition(
+        id=workflow_id,
+        label=label,
+        description=use_case or "Custom ShovsOS workflow.",
+        template=str(payload.get("template") or "custom_workflow_v1"),
+        policy=policy,
+        ledger_mode=str(payload.get("ledger_mode") or "ledger_enforced"),
+        context_mode=str(payload.get("context_mode") or "ladder"),
+        prompt_version=str(payload.get("prompt_version") or "custom_contract_v1"),
+        risk_policy=str(payload.get("risk_policy") or "evidence_first"),
+        tools=tuple(tools),
+        memory_policy={
+            "read": ["workflow_preferences"],
+            "write": str(payload.get("memory_write") or "explicit_user_preferences_only"),
+            "provenance_required": True,
+        },
+        input_schema={field: "string" for field in input_fields},
+        output_schema={"type": _slugify_workflow_id(label).removesuffix("_v1"), "fields": output_fields},
+        steps=steps,
+        tags=tuple(["custom", policy, *(str(payload.get("tags") or "").split())]),
+    )
 
 
 COMMON_SOURCE_STEPS = (
@@ -380,7 +537,70 @@ class WorkflowRunStore:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id ON workflow_events(run_id, event_index)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_runs_owner_id ON workflow_runs(owner_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workflow_definitions (
+                    workflow_id TEXT PRIMARY KEY,
+                    owner_id TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    definition_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_definitions_owner_id ON workflow_definitions(owner_id)")
             conn.commit()
+
+    def save_workflow_definition(self, definition: WorkflowDefinition, *, owner_id: str = "") -> dict[str, Any]:
+        now = _now()
+        existing = self.get_workflow_definition(definition.id)
+        created_at = str((existing or {}).get("created_at") or now)
+        payload = definition.to_dict()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO workflow_definitions
+                (workflow_id, owner_id, created_at, updated_at, definition_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (definition.id, owner_id, created_at, now, _json_dumps(payload)),
+            )
+            conn.commit()
+        return {"created_at": created_at, "updated_at": now, "definition": payload}
+
+    def list_workflow_definitions(self, *, owner_id: str = "") -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            if owner_id:
+                rows = conn.execute(
+                    "SELECT * FROM workflow_definitions WHERE owner_id IN ('', ?) ORDER BY created_at ASC",
+                    (owner_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM workflow_definitions ORDER BY created_at ASC").fetchall()
+        definitions: list[dict[str, Any]] = []
+        for row in rows:
+            payload = _json_loads(row["definition_json"], {})
+            if isinstance(payload, dict):
+                payload.setdefault("custom", True)
+                payload.setdefault("created_at", row["created_at"])
+                payload.setdefault("updated_at", row["updated_at"])
+                payload.setdefault("owner_id", row["owner_id"] or "")
+                definitions.append(payload)
+        return definitions
+
+    def get_workflow_definition(self, workflow_id: str) -> Optional[dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM workflow_definitions WHERE workflow_id = ?", (workflow_id,)).fetchone()
+        if row is None:
+            return None
+        payload = _json_loads(row["definition_json"], {})
+        if not isinstance(payload, dict):
+            return None
+        payload.setdefault("custom", True)
+        payload.setdefault("created_at", row["created_at"])
+        payload.setdefault("updated_at", row["updated_at"])
+        payload.setdefault("owner_id", row["owner_id"] or "")
+        return payload
 
     def create_run(
         self,
@@ -520,15 +740,26 @@ class WorkflowRunStore:
 DEFAULT_WORKFLOW_RUN_STORE = WorkflowRunStore()
 
 
-def list_workflow_definitions() -> list[dict[str, Any]]:
-    return [definition.to_dict() for definition in WORKFLOW_DEFINITIONS.values()]
+def list_workflow_definitions(*, store: WorkflowRunStore | None = None, owner_id: str = "") -> list[dict[str, Any]]:
+    definitions = [definition.to_dict() for definition in WORKFLOW_DEFINITIONS.values()]
+    if store is not None:
+        known = {item["id"] for item in definitions}
+        for custom in store.list_workflow_definitions(owner_id=owner_id):
+            if custom.get("id") not in known:
+                definitions.append(custom)
+                known.add(str(custom.get("id") or ""))
+    return definitions
 
 
-def get_workflow_definition(workflow_id: str) -> WorkflowDefinition:
+def get_workflow_definition(workflow_id: str, *, store: WorkflowRunStore | None = None) -> WorkflowDefinition:
     definition = WORKFLOW_DEFINITIONS.get(str(workflow_id or "").strip())
-    if definition is None:
-        raise KeyError(workflow_id)
-    return definition
+    if definition is not None:
+        return definition
+    if store is not None:
+        custom = store.get_workflow_definition(str(workflow_id or "").strip())
+        if custom:
+            return _workflow_definition_from_dict(custom)
+    raise KeyError(workflow_id)
 
 
 def _compact_input(payload: dict[str, Any]) -> str:
@@ -695,8 +926,8 @@ def start_workflow_run(
     store: WorkflowRunStore | None = None,
     status: str = "completed",
 ) -> dict[str, Any]:
-    definition = get_workflow_definition(workflow_id)
     store = store or DEFAULT_WORKFLOW_RUN_STORE
+    definition = get_workflow_definition(workflow_id, store=store)
     input_payload = _input_payload(payload)
     mode = str(payload.get("mode") or "deterministic_contract")
     record = store.create_run(
@@ -718,11 +949,11 @@ def start_workflow_run(
     return store.get_run(record["run_id"]) or record
 
 
-def workflow_catalog() -> dict[str, Any]:
+def workflow_catalog(*, store: WorkflowRunStore | None = None, owner_id: str = "") -> dict[str, Any]:
     return {
         "title": "Workflow Lab",
         "subtitle": "Compose ShovsOS features into typed agent workflows that external apps can run.",
-        "workflows": list_workflow_definitions(),
+        "workflows": list_workflow_definitions(store=store, owner_id=owner_id),
         "lifecycle": ["created", "queued", "running", "waiting", "failed", "completed"],
         "run_modes": ["deterministic_contract", "live_run_engine"],
         "api": {
@@ -956,13 +1187,30 @@ def make_workflow_lab_router(
     router = APIRouter(prefix="/workflow-lab", tags=["workflow-lab"])
 
     @router.get("/catalog")
-    async def catalog():
-        return workflow_catalog()
+    async def catalog(owner_id: str = ""):
+        return workflow_catalog(store=store, owner_id=owner_id)
+
+    @router.post("/workflows")
+    async def create_workflow(payload: dict[str, Any] = Body(default_factory=dict)):
+        payload = payload or {}
+        existing_ids = {item.get("id") for item in list_workflow_definitions(store=store)}
+        definition = build_custom_workflow_definition(payload, existing_ids={str(item) for item in existing_ids if item})
+        owner_id = str(payload.get("owner_id") or "")
+        saved = store.save_workflow_definition(definition, owner_id=owner_id)
+        workflow_payload = dict(saved["definition"])
+        workflow_payload["custom"] = True
+        return {
+            "workflow": workflow_payload,
+            "created_at": saved["created_at"],
+            "updated_at": saved["updated_at"],
+            "detail_url": f"/workflow-lab/workflows/{definition.id}",
+            "run_url": f"/workflow-lab/workflows/{definition.id}/runs",
+        }
 
     @router.get("/workflows/{workflow_id}")
     async def workflow_detail(workflow_id: str):
         try:
-            return get_workflow_definition(workflow_id).to_dict()
+            return get_workflow_definition(workflow_id, store=store).to_dict()
         except KeyError:
             raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -973,7 +1221,7 @@ def make_workflow_lab_router(
         payload: dict[str, Any] = Body(default_factory=dict),
     ):
         try:
-            definition = get_workflow_definition(workflow_id)
+            definition = get_workflow_definition(workflow_id, store=store)
         except KeyError:
             raise HTTPException(status_code=404, detail="Workflow not found")
         payload = payload or {}

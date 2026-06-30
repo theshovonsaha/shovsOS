@@ -37,6 +37,8 @@ _SOURCE_TOOLS = frozenset({
     "web_search", "web_fetch", "web_fetch_batch",
     "source_collect", "source_contract", "source_select",
     "source_next_action", "source_coverage",
+    "alpha_vantage_movers", "alpha_vantage_quote", "alpha_vantage_overview",
+    "alpha_vantage_news", "finance_snapshot",
 })
 
 # A research / request verb anywhere disables the memory & disclosure routes, so
@@ -77,7 +79,10 @@ _MEMORY_RECALL_RE = re.compile(
 _CONVERSATION_RECALL_RE = re.compile(
     r"\b(read|recall|summari[sz]e|show|recap)\b[\w\s]{0,20}\b(recent|last|previous|prior|our|the|this)\b"
     r"[\w\s]{0,12}\b(chat|conversation|conversations|messages|discussion|thread|history)\b|"
-    r"\bwhat did (?:we|i|you)\b|\b(chat|conversation)\s+history\b",
+    r"\bwhat did (?:we|i|you)\b|\bwhat (?:were|was) (?:we|i|you)\b[\w\s]{0,16}\b(?:talking|chat(?:t)?ing|discussing)\b|"
+    r"\b(?:you|u)\s+(?:forgot|lost|missed)\b[\w\s]{0,24}\b(?:chat|conversation|context|thread|talking|chat(?:t)?ing|discussing)\b|"
+    r"\b(?:we|you|i)\s+were\b[\w\s]{0,12}\b(?:talking|chat(?:t)?ing|discussing)\b|"
+    r"\b(chat|conversation)\s+history\b",
     re.IGNORECASE,
 )
 
